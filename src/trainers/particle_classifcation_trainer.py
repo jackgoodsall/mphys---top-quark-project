@@ -3,8 +3,11 @@ from lightning import tr
 from torchmetrics import Accuracy
 import torch
 import torch.nn as nn
-import matplitlib.pyplot as plt
+import matplotlib.pyplot as plt
 from pathlib import Path
+from lightning.pytorch.callbacks import EarlyStopping
+from dataclasses import field
+
 
 class BinaryClassifierTrainer(lightning.LightningModule):
     ### Lightning Module for training a binary classifier
@@ -16,9 +19,9 @@ class BinaryClassifierTrainer(lightning.LightningModule):
 
         self.accuracy_metric = Accuracy(task = "binary")
         self.train_loss_history = []
-        self.val_loss_history = []
-
         self.train_acc_history = []
+
+        self.val_loss_history = []
         self.val_acc_history = []
         
         self.save_hyperparameters(ignore = ["model"])
@@ -32,7 +35,8 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         inputs, targets = batch
         outputs = self(inputs)
         loss = self.loss_function(outputs, targets)
-        acc = self.accuracy_metric(outputs, targets)
+        preds = (outputs >= 0).long()
+        acc = self.accuracy_metric(preds, targets)
 
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('train_acc', acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -43,7 +47,8 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         inputs, targets = batch
         outputs = self(inputs)
         loss = self.loss_function(outputs, targets)
-        acc = self.accuracy_metric(outputs, targets)
+        preds = (outputs >= 0).long()
+        acc = self.accuracy_metric(preds, targets)
 
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -68,15 +73,6 @@ class BinaryClassifierTrainer(lightning.LightningModule):
     def loss_function(self, outputs, targets):
         return nn.BCEWithLogitsLoss()(outputs, targets)
     
-    def train_dataloader(self):
-        return train_loader
-    
-    def val_dataloader(self):
-        return validation_loader
-    
-    def test_dataloader(self):
-        return testing_loader
-
     def on_train_epoch_end(self):
 
         cm = self.trainer.callback_metrics
@@ -129,8 +125,8 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         plt.plot(self.val_acc_history, label="val")
         plt.legend()
         plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training and Validation Loss")
+        plt.ylabel("Accuracy (%)")
+        plt.title("Training and Validation Accuracy")
         plt.tight_layout()
         plt.savefig(fig_path, dpi=150)
         plt.close()
@@ -140,3 +136,29 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         train_acc = float(metrics.get("train_acc", torch.tensor(float("nan"))))
         print(f"Final validation accuracy: {val_acc:.3f}, train loss: {train_acc:.3f}")
 
+
+## Function to train a binary classifier
+def train_binary_classifier_model(
+        model,
+        data_module,
+        min_epoches = 10,
+        max_epoches= 100,
+        use_lr_finder = False,
+        use_early_stopping = True,
+        early_stopping_params = field(default_factory=dict),
+        logger = None
+    ):
+    callbacks = []
+    ## Uses default dict to ensure construction
+    if use_early_stopping:
+        callbacks.append(EarlyStopping(**early_stopping_params))
+
+    # Create Trainer
+    lightning_trainer = lightning.Trainer(
+        min_epochs=min_epoches,
+        max_epochs=max_epoches,
+        logger = logger
+    )
+    # Fit trainer
+    lightning_trainer.fit(model, datamodule=data_module)
+    return lightning_trainer
