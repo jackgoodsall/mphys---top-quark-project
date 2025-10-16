@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-
+import sys
 from typing import List
 
 class ParticleBinaryClassificaitionHead(nn.Module):
@@ -10,13 +10,16 @@ class ParticleBinaryClassificaitionHead(nn.Module):
                  p_dropout : float,
                  activation_function: F = F.relu,
                  return_logits: bool = True,
-                 n_classes: int = 1):
+                 n_classes: int = 1,
+                 *args,
+                 **kwargs):
         super().__init__()
         self.layer_sizes = [input_size] + hidden_sizes + [n_classes]
         self.linear_layers = nn.ModuleList([
             nn.Linear(in_size, out_size) for in_size, out_size in zip(self.layer_sizes[: -1 ], self.layer_sizes[1: ])
         ])
-        self.activation_function = activation_function
+        if activation_function == "relu":
+            self.activation_function = F.relu
         self.dropout = nn.Dropout(p_dropout)
         self.return_logits = return_logits
 
@@ -34,17 +37,25 @@ class ParticleTransformer(nn.Module):
                  embedding_size: int,
                  classifcation_head: nn.Module,
                  activation_function = F.gelu,
-                 nhead = 8,
-                 dim_feedforward = 2048,
+                 nhead = 2,
+                 dim_feedforward = 512,
                  with_cls_tkn: bool = True,
-                 num_layers = 6,
-                 dropout_p = 0.1,
+                 num_layers = 2,
+                 dropout_p = 0.3,
                  n_global_features: int = 0,
+                 *args,
+                 **kwargs
                  ):
         super().__init__()
         self.with_cls_tkn = with_cls_tkn
-
-        self.particle_linear_embedding = nn.Linear(n_input_features, embedding_size)
+        print(type(activation_function))
+        self.particle_linear_embedding = nn.Sequential(
+            nn.Linear(n_input_features, embedding_size//2),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
+            nn.LayerNorm(embedding_size//2),
+            nn.Linear(embedding_size//2, embedding_size),
+        )
         if n_global_features != 0:
             self.use_global = True
             self.global_linear_embedding = nn.Linear(n_global_features, embedding_size)
@@ -52,6 +63,7 @@ class ParticleTransformer(nn.Module):
             self.use_global = False
         if self.with_cls_tkn:
             self.cls_tkn = nn.Parameter(torch.rand(1, 1, embedding_size))
+
         self.transformer_layer = nn.TransformerEncoderLayer(
             embedding_size,
             nhead = nhead,
@@ -62,9 +74,7 @@ class ParticleTransformer(nn.Module):
         )
         self.transformer_block = nn.TransformerEncoder(self.transformer_layer,
                                                        num_layers = num_layers)
-        
         self.classificaiton_head = classifcation_head
-
     def forward(self, x) -> torch.Tensor:
 
         particle_features = x["particle_features"]          
@@ -74,7 +84,7 @@ class ParticleTransformer(nn.Module):
 
         cls_tok = None
         if self.with_cls_tkn:
-            cls_tok = self.cls_token.expand(B, -1, -1)              
+            cls_tok = self.cls_tkn.expand(B, -1, -1)              
 
         glob_tok = None
         if self.use_global:
@@ -83,28 +93,23 @@ class ParticleTransformer(nn.Module):
                 global_features = global_features.unsqueeze(1)      
             glob_tok = self.global_linear_embedding(global_features)  
 
-        # >>> The easy concat: build list, drop None, cat on seq dim (dim=1)
         tokens = [t for t in (cls_tok, part_tok, glob_tok) if t is not None]
-        src = torch.cat(tokens, dim=1)                                # [B, T, E]
+        src = torch.cat(tokens, dim=1)                               
 
         src_key_padding_mask = None
         if "particle_mask" in x:
-            pmask = x["particle_mask"].bool()                         # [B, Np]
+            pmask = x["particle_mask"].bool()    
+            B = pmask.size(0)                     
             masks = []
             if self.with_cls_tkn:
-                masks.append(torch.zeros(B, 1, dtype=torch.boole))
+                masks.append(pmask.new_zeros((B, 1)))      
             masks.append(pmask)
             if self.use_global:
-                if "global_mask" in x:
-                    gmask = x["global_mask"].bool()
-                    if gmask.dim() == 1:
-                        gmask = gmask.unsqueeze(1)
-                else:
-                    # assume globals are real tokens by default
-                    gmask = torch.zeros(B, glob_tok.size(1), dtype=torch.bool, device=pmask.device)
-                masks.append(gmask)
-            src_key_padding_mask = torch.cat(masks, dim=1)            # [B, T]
-
+                g_len = glob_tok.size(1)                                   
+                masks.append(pmask.new_zeros((B, g_len)))   
+            src_key_padding_mask = torch.cat(masks, dim=1)            
+        else:
+            src_key_padding_mask = None
         h = self.transformer_block(src, src_key_padding_mask=src_key_padding_mask)  
         ## Uses cls token if avaliable or mean pool across particles 
         pooled = h[:, 0] if self.with_cls_tkn else h.mean(dim=1)     

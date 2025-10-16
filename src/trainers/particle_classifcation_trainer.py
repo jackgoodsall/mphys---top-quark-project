@@ -1,29 +1,33 @@
 import lightning
-from lightning import tr
+from lightning import Trainer
 from torchmetrics import Accuracy
+from torchmetrics.classification import BinaryAccuracy
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from pathlib import Path
 from lightning.pytorch.callbacks import EarlyStopping
 from dataclasses import field
-
+from lightning.pytorch.strategies import FSDPStrategy
 
 class BinaryClassifierTrainer(lightning.LightningModule):
     ### Lightning Module for training a binary classifier
-    def __init__(self, model):
+    def __init__(self, model, config, *args, **kwargs):
         super(BinaryClassifierTrainer, self).__init__()
 
         self.model = model
-        self.lr =  0.0001
+        self.lr =  config.get("learning_rate", 1e-4)
+        self.weight_decay = config.get("weight_decay", 1e-4)
 
-        self.accuracy_metric = Accuracy(task = "binary")
+        self.accuracy_metric = BinaryAccuracy()
         self.train_loss_history = []
         self.train_acc_history = []
 
         self.val_loss_history = []
         self.val_acc_history = []
         
+        self.test_metrics = {}
+
         self.save_hyperparameters(ignore = ["model"])
     
     def forward(self, batch):
@@ -35,8 +39,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         inputs, targets = batch
         outputs = self(inputs)
         loss = self.loss_function(outputs, targets)
-        preds = (outputs >= 0).long()
-        acc = self.accuracy_metric(preds, targets)
+        acc = self.accuracy_metric(outputs, targets)
 
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('train_acc', acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -47,8 +50,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         inputs, targets = batch
         outputs = self(inputs)
         loss = self.loss_function(outputs, targets)
-        preds = (outputs >= 0).long()
-        acc = self.accuracy_metric(preds, targets)
+        acc = self.accuracy_metric(outputs, targets)
 
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -64,11 +66,27 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('test_acc', acc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
+        self.test_metrics["test_loss"] = loss
+        self.test_metrics["test_acc"] = acc
+
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr= self.lr, weight_decay = 10e-4)
-        return optimizer
+        optimizer = torch.optim.Adam(self.parameters(), 
+                                    lr= self.lr,
+                                    weight_decay = self.weight_decay)
+        schedular = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+        )
+        return {
+            "optimizer":optimizer,
+            "lr_schedular":{
+                "schedular"  : schedular,
+                "interval" : "epoch"
+
+            }
+            }
+    
     
     def loss_function(self, outputs, targets):
         return nn.BCEWithLogitsLoss()(outputs, targets)
@@ -103,7 +121,8 @@ class BinaryClassifierTrainer(lightning.LightningModule):
             self.val_loss_history.append(vl)
             self.val_acc_history.append(grab(["val_acc"]))
 
-    
+    def on_test_end(self):
+        return
     def on_train_end(self):
         out_dir = Path(self.trainer.logger.log_dir)
 
@@ -141,24 +160,31 @@ class BinaryClassifierTrainer(lightning.LightningModule):
 def train_binary_classifier_model(
         model,
         data_module,
-        min_epoches = 10,
-        max_epoches= 100,
+        config,
+        min_epoches = 1,
+        max_epoches= 2,
         use_lr_finder = False,
         use_early_stopping = True,
-        early_stopping_params = field(default_factory=dict),
-        logger = None
+        early_stopping_params = None,
+        logger = None,
+        *args,
+        **kwargs
     ):
     callbacks = []
     ## Uses default dict to ensure construction
     if use_early_stopping:
-        callbacks.append(EarlyStopping(**early_stopping_params))
-
+        if early_stopping_params:
+            callbacks.append(EarlyStopping(**early_stopping_params))
+        else:
+            callbacks.append(EarlyStopping(monitor = "val_loss"))
     # Create Trainer
     lightning_trainer = lightning.Trainer(
+        num_nodes = 1,
         min_epochs=min_epoches,
         max_epochs=max_epoches,
         logger = logger
     )
     # Fit trainer
+    model = BinaryClassifierTrainer(model, config)
     lightning_trainer.fit(model, datamodule=data_module)
     return lightning_trainer
