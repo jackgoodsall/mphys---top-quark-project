@@ -7,7 +7,9 @@ import h5py
 from torch.utils.data import random_split
 import torch
 from sklearn.compose import ColumnTransformer
-from ..data_utls.scalers import *
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from src.data_utls.scalers import *
 
 class TopMulitplicityClassifierDataSet(Dataset):
     ### Torch module for Dataset, allows easy dataloader creation
@@ -25,32 +27,37 @@ class TopMulitplicityClassifierDataSet(Dataset):
 
 
 class TopTensorDatasetFromH5py:
-    raw_file_name = "/kaggle/input/threetop4toph5py/raw_data"
-    processed_file_name =  "processed_data"
+    raw_file_name = "data/fourtopvsthree/rawh5pyfiles/fourtop3topall.h5"
+    processed_file_name =  "fourtop3topscaled.h5"
     def __init__(self):
         self._get_datas()
         self.scale_global_data()
         self.scale_particle_data()
         self.src_mask = np.all(np.isnan(self.particle_data), axis = -1)
         self.particle_data = np.nan_to_num(self.particle_data, nan = -1010)
-        
+        self._load_into_tensordataset()
+        self.split_data()
+        self._save_splits("FunctionalTransformedDataSplits")
+
     def scale_particle_data(self):
-        pt_indices = np.arange(0, 25*6, 6)
-        eta_indicies = pt_indices + 1
-        phi_indices = pt_indices + 2
-        mass_indices = pt_indices + 3 
-        pipeline = ColumnTransformer([
-            ("pt", LogScaler(), pt_indices),
-            ("eta", ArctanScaler(), eta_indicies)
-            ("phi", PhiTransformer, phi_indices),
-            ("mass", LogScaler(), mass_indices)
-        ], remainder="passthrough")
+        B, M, N = self.particle_data.shape
+        PT, ETA, PHI, MASS = 0, 1, 2, 3 
 
-        m, n = self.particle_data.shape[1] , self.particle_data.shape[2]
-        print(self.particle_data.shape)
-        data = self.particle_data.reshape(-1, m * n )
+        x = self.particle_data.copy()
 
-        self.particle_data = pipeline.fit_transform(data).reshape(-1, m, n + 1)
+        # Apply your scalers directly on slices (vectorized):
+        x[..., PT]   = LogScaler().fit_transform(x[..., PT].reshape(-1, 1)).reshape(B, M)
+        x[..., ETA]  = ArctanScaler().fit_transform(x[..., ETA].reshape(-1, 1)).reshape(B, M)
+        x[..., MASS] = LogScaler().fit_transform(x[..., MASS].reshape(-1, 1)).reshape(B, M)
+
+        # Phi expands to two features (e.g., sin/cos) – insert them right after PHI to preserve per-particle order
+        phi_out = PhiTransformer().fit_transform(x[..., PHI].reshape(-1, 1))  # shape (B*M, 2)
+        phi_out = phi_out.reshape(B, M, 2)
+
+        # Rebuild features with phi split in place
+        x = np.concatenate([x[..., :PHI], phi_out, x[..., PHI+1:]], axis=-1)  
+
+        self.particle_data = x
 
     def scale_global_data(self):
         scaler = StandardScaler()
@@ -63,9 +70,9 @@ class TopTensorDatasetFromH5py:
     
     def _load_file(self, file_name):
         with h5py.File(file_name, "r") as f:
-            part_data = np.array(f["particle_features"]["all"])
-            glob_data = np.array(f["global_data"]["all"])
-            targets = np.array(f["targets"]["all"])
+            part_data = np.array(f["particle_data"])
+            glob_data = np.array(f["global_features"])
+            targets = np.array(f["targets"])
         return part_data, glob_data, targets
         
     def _save_splits(self, stem: str, pad_value: float = -1010.0):
@@ -105,3 +112,4 @@ class TopTensorDatasetFromH5py:
                                                        self.src_mask, self.targets)
 
 top_dataset = TopTensorDatasetFromH5py()       
+top_dataset.train[0]
