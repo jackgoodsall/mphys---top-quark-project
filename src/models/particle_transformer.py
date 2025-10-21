@@ -8,9 +8,9 @@ class ParticleBinaryClassificaitionHead(nn.Module):
     def __init__(self, input_size: int,
                  hidden_sizes: List[int],
                  p_dropout : float,
-                 activation_function: F = F.relu,
-                 return_logits: bool = True,
-                 n_classes: int = 1,
+                 activation_function: str,
+                 return_logits: bool,
+                 n_classes: int,
                  *args,
                  **kwargs):
         super().__init__()
@@ -28,21 +28,21 @@ class ParticleBinaryClassificaitionHead(nn.Module):
             x = layer(x)
             x = self.activation_function(x)
             x = self.dropout(x)
-        if self.return_logits:
-            return self.linear_layers[-1](x)
-        return F.sigmoid(self.linear_layers[-1](x))
+        #if self.return_logits:
+        return self.linear_layers[-1](x)
+        #return F.sigmoid(self.linear_layers[-1](x))
 
 class ParticleTransformer(nn.Module):
     def __init__(self, n_input_features: int, 
                  embedding_size: int,
                  classifcation_head: nn.Module,
-                 activation_function = F.gelu,
-                 nhead = 2,
-                 dim_feedforward = 512,
-                 with_cls_tkn: bool = True,
-                 num_layers = 2,
-                 dropout_p = 0.3,
-                 n_global_features: int = 0,
+                 activation_function: str,
+                 nhead: int,
+                 dim_feedforward: int,
+                 with_cls_tkn: bool,
+                 num_layers: int,
+                 dropout_p: float,
+                 n_global_features: int,
                  *args,
                  **kwargs
                  ):
