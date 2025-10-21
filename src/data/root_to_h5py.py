@@ -13,6 +13,7 @@ import torch
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.utils.utils import  load_and_split_config
+
 config_file_path = "config/transformer_classifier_config.yaml"
 
 

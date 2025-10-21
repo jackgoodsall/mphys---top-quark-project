@@ -8,8 +8,12 @@ from torch.utils.data import random_split
 import torch
 from sklearn.compose import ColumnTransformer
 import sys
+from pathlib import Path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.data_utls.scalers import *
+from src.utils.utils import load_and_split_config
+
+config_file_path  = "config/transformer_classifier_config.yaml"
 
 class TopMulitplicityClassifierDataSet(Dataset):
     ### Torch module for Dataset, allows easy dataloader creation
@@ -28,6 +32,9 @@ class TopMulitplicityClassifierDataSet(Dataset):
 
 class TopTensorDatasetFromH5py:
     def __init__(self, config):
+
+        self.config = config
+
         self._get_datas()
         self.scale_global_data()
         self.scale_particle_data()
@@ -35,7 +42,7 @@ class TopTensorDatasetFromH5py:
         self.particle_data = np.nan_to_num(self.particle_data, nan = -1010)
         self._load_into_tensordataset()
         self.split_data()
-        self._save_splits("FunctionalTransformedDataSplits")
+        self._save_splits(self.config["processed_file_name"])
 
     def scale_particle_data(self):
         B, M, N = self.particle_data.shape
@@ -62,9 +69,10 @@ class TopTensorDatasetFromH5py:
         self.global_data = scaler.fit_transform(self.global_data.reshape(-1, 3)).reshape(-1, 1 , 3)
         
     def _get_datas(self):
+        raw_file_path = Path(self.config["raw_file_dir"] , self.config["raw_file_name"])
         (self.particle_data, 
         self.global_data,
-        self.targets) = self._load_file(self.raw_file_name)
+        self.targets) = self._load_file(raw_file_path)
     
     def _load_file(self, file_name):
         with h5py.File(file_name, "r") as f:
@@ -103,7 +111,9 @@ class TopTensorDatasetFromH5py:
                 f.attrs["class_weights"] = self.class_weights
             print(f"Saved {name} -> {out_path}")
 
-    def split_data(self, splits = [0.8, 0.1, 0.1]):
+    def split_data(self, splits = None):
+        if splits is None:
+            splits = self.config["split_sizes"]
         self.train, self.val, self.test = random_split(self.dataset, splits)
 
         idx = np.array(self.train.indices)
@@ -112,7 +122,7 @@ class TopTensorDatasetFromH5py:
         for label in labels:
             cls_weights.append(np.sum(self.targets[idx] == label) / len(self.train))
         self.class_weights = np.array(cls_weights)
-        print(self.class_weights)
+        
 
     def _load_into_tensordataset(self):
         self.dataset = TopMulitplicityClassifierDataSet(self.particle_data, self.global_data,
@@ -120,5 +130,7 @@ class TopTensorDatasetFromH5py:
 
 
 if __name__ == "__main__":
-top_dataset = TopTensorDatasetFromH5py()       
-top_dataset.train[0]
+    config = load_and_split_config(config_file_path)
+    config = config.data_pipeline["data_preprocessing"]
+    top_dataset = TopTensorDatasetFromH5py(config)       
+    
