@@ -27,9 +27,7 @@ class TopMulitplicityClassifierDataSet(Dataset):
 
 
 class TopTensorDatasetFromH5py:
-    raw_file_name = "data/fourtopvsthree/rawh5pyfiles/fourtop3topall.h5"
-    processed_file_name =  "fourtop3topscaled.h5"
-    def __init__(self):
+    def __init__(self, config):
         self._get_datas()
         self.scale_global_data()
         self.scale_particle_data()
@@ -102,14 +100,25 @@ class TopTensorDatasetFromH5py:
                 f.create_dataset("targets", data=y.astype(np.int64),
                                  compression="gzip", compression_opts=4, chunks=True)
                 f.attrs["pad_value"] = float(pad_value)
+                f.attrs["class_weights"] = self.class_weights
             print(f"Saved {name} -> {out_path}")
 
     def split_data(self, splits = [0.8, 0.1, 0.1]):
         self.train, self.val, self.test = random_split(self.dataset, splits)
-        print(self.train[0])
+
+        idx = np.array(self.train.indices)
+        labels = np.unique(self.targets[idx])
+        cls_weights = []
+        for label in labels:
+            cls_weights.append(np.sum(self.targets[idx] == label) / len(self.train))
+        self.class_weights = np.array(cls_weights)
+        print(self.class_weights)
+
     def _load_into_tensordataset(self):
         self.dataset = TopMulitplicityClassifierDataSet(self.particle_data, self.global_data,
                                                        self.src_mask, self.targets)
 
+
+if __name__ == "__main__":
 top_dataset = TopTensorDatasetFromH5py()       
 top_dataset.train[0]
