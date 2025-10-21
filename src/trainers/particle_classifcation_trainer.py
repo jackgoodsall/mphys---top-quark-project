@@ -109,7 +109,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
     
     
     def loss_function(self, outputs, targets):
-        return nn.BCEWithLogitsLoss(weight = self.class_weights)(outputs, targets)
+        return nn.BCEWithLogitsLoss(pos_weight = self.class_weights[1]/self.class_weights[0])(outputs, targets)
     
     def on_train_epoch_end(self):
 
@@ -272,8 +272,8 @@ def train_binary_classifier_model(
         model,
         data_module,
         config,
-        min_epoches = 1,
-        max_epoches= 1,
+        min_epoches,
+        max_epoches,
         use_lr_finder = False,
         use_early_stopping = True,
         early_stopping_params = None,
