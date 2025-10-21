@@ -28,6 +28,10 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         self.lr =  config.get("learning_rate", 1e-4)
         self.weight_decay = config.get("weight_decay", 1e-4)
 
+        self.class_weights = config.get("class_weights", None)
+        assert len(self.class_weights) == 2, "Class weights length must be number of classes"
+        self.class_weights = torch.Tensor(self.class_weights)
+
         self.accuracy_metric = BinaryAccuracy()
         self.train_loss_history = []
         self.train_acc_history = []
@@ -44,7 +48,6 @@ class BinaryClassifierTrainer(lightning.LightningModule):
     
     def forward(self, batch):
         return self.model(batch)
-
 
     def training_step(self, batch, batch_idx):
        
@@ -106,7 +109,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
     
     
     def loss_function(self, outputs, targets):
-        return nn.BCEWithLogitsLoss()(outputs, targets)
+        return nn.BCEWithLogitsLoss(weight = self.class_weights)(outputs, targets)
     
     def on_train_epoch_end(self):
 
@@ -163,7 +166,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
         fig = plt.figure()
         plt.hist(probs[targets == 1].cpu().numpy(), bins=40, alpha=0.6, label="pos (y=1)")
         plt.hist(probs[targets == 0].cpu().numpy(), bins=40, alpha=0.6, label="neg (y=0)")
-        plt.xlabel("Predicted probability (sigmoid(logit))")
+        plt.xlabel("Predicted probability")
         plt.ylabel("Count")
         plt.title("Test score distribution by class")
         plt.legend()
@@ -269,8 +272,8 @@ def train_binary_classifier_model(
         model,
         data_module,
         config,
-        min_epoches = 20,
-        max_epoches= 50,
+        min_epoches = 1,
+        max_epoches= 1,
         use_lr_finder = False,
         use_early_stopping = True,
         early_stopping_params = None,
