@@ -41,7 +41,7 @@ class ParticleTransformer(nn.Module):
                  dim_feedforward: int,
                  with_cls_tkn: bool,
                  num_layers: int,
-                 dropout_p: float,
+                 p_dropout: float,
                  n_global_features: int,
                  *args,
                  **kwargs
@@ -52,7 +52,7 @@ class ParticleTransformer(nn.Module):
         self.particle_linear_embedding = nn.Sequential(
             nn.Linear(n_input_features, embedding_size//2),
             nn.GELU(),
-            nn.Dropout(dropout_p),
+            nn.Dropout(p_dropout),
             nn.LayerNorm(embedding_size//2),
             nn.Linear(embedding_size//2, embedding_size),
         )
@@ -70,7 +70,7 @@ class ParticleTransformer(nn.Module):
             dim_feedforward = dim_feedforward,
             activation = activation_function,
             batch_first = True,
-            dropout = dropout_p
+            dropout = p_dropout
         )
         self.transformer_block = nn.TransformerEncoder(self.transformer_layer,
                                                        num_layers = num_layers)
