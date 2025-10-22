@@ -30,6 +30,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
 
         self.class_weights = config.get("class_weights", None)
         assert len(self.class_weights) == 2, "Class weights length must be number of classes"
+        
         self.class_weights = torch.Tensor(self.class_weights)
 
         self.accuracy_metric = BinaryAccuracy()
@@ -109,7 +110,7 @@ class BinaryClassifierTrainer(lightning.LightningModule):
     
     
     def loss_function(self, outputs, targets):
-        return nn.BCEWithLogitsLoss(pos_weight = self.class_weights[1]/self.class_weights[0])(outputs, targets)
+        return nn.BCEWithLogitsLoss(pos_weight = self.class_weights[0]/self.class_weights[1])(outputs, targets)
     
     def on_train_epoch_end(self):
 
@@ -272,8 +273,8 @@ def train_binary_classifier_model(
         model,
         data_module,
         config,
-        min_epoches,
-        max_epoches,
+        min_epochs,
+        max_epochs,
         use_lr_finder = False,
         use_early_stopping = True,
         early_stopping_params = None,
@@ -291,8 +292,8 @@ def train_binary_classifier_model(
     # Create Trainer
     lightning_trainer = lightning.Trainer(
         num_nodes = 1,
-        min_epochs=min_epoches,
-        max_epochs=max_epoches,
+        min_epochs=min_epochs,
+        max_epochs=max_epochs,
         logger = logger
     )
     # Fit trainer
