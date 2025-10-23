@@ -1,1 +1,9 @@
 /.transformer_env
+/src/data_utls
+/data/
+/lightning_logs/
+/checkpoints/
+gpu_test.py
+__pycache__/
+*.py[cod]
+*$py.class
