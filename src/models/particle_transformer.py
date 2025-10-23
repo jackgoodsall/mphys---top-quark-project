@@ -4,6 +4,8 @@ import torch
 import sys
 from typing import List
 
+from .components.attention_layers import ParticleAttentionBlock, ClassAttentionBlock
+
 class ParticleBinaryClassificaitionHead(nn.Module):
     def __init__(self, input_size: int,
                  hidden_sizes: List[int],
@@ -117,4 +119,36 @@ class ParticleTransformer(nn.Module):
         return self.classificaiton_head(pooled)
         
 
-            
+class ParTInteractionFormer(nn.Module):
+    def __init__(
+            self,
+            particle_embedder,
+            classifcation_head,
+            n_particle_blocks,
+            n_class_blocks,
+            embedded_dim,
+            n_heads,
+            p_dropout,
+    ):
+        
+        self.cls_tkn = nn.Parameter(torch.rand(1, 1, embedded_dim))
+        
+        
+
+    def forward(self, x):
+        part_features = x["particle_features"]
+        global_features = x["global_features"]
+        interaction_features = x["interaction_features"]
+        src_mask = x["src_mask"]
+
+        (input_sequence,
+        interaction_features)  = self.particle_embedder(part_features, 
+                                                        global_features, 
+                                                        interaction_features)
+
+        for particle_block in self.particle_blocks:
+            input_sequence = particle_block(input_sequence,interaction_features)
+        output = input_sequence
+
+        for class_block in self.class_blocks:
+            cls_tkn  = class_block()
