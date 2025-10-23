@@ -4,6 +4,13 @@
 /lightning_logs/
 /checkpoints/
 gpu_test.py
+
+
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+*.pyd
+*.pyc
+**/__pycache__/
+**/*.pyc
