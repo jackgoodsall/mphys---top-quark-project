@@ -77,6 +77,7 @@ class ParticleTransformer(nn.Module):
         self.transformer_block = nn.TransformerEncoder(self.transformer_layer,
                                                        num_layers = num_layers)
         self.classificaiton_head = classifcation_head
+
     def forward(self, x) -> torch.Tensor:
 
         particle_features = x["particle_features"]          
@@ -127,10 +128,14 @@ class ParTInteractionFormer(nn.Module):
             n_particle_blocks,
             n_class_blocks,
             embedded_dim,
-            n_heads,
             p_dropout,
     ):
-        
+        self.particle_embedder = particle_embedder
+        self.classification_head = classifcation_head
+
+        self.n_particle_blocks = n_particle_blocks
+        self.n_class_blocks = n_class_blocks
+
         self.cls_tkn = nn.Parameter(torch.rand(1, 1, embedded_dim))
         
         
