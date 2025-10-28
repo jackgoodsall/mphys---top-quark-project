@@ -2,6 +2,74 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 
+class DecoderAttentionBlock(nn.Module):
+    def __init__(self, d_model, n_heads, dim_feedforward, 
+                 p_dropout, activation):
+        super().__init__()
+        # --- Attention blocks ---
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=p_dropout, batch_first=True
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=p_dropout, batch_first=True
+        )
+
+        # --- Feedforward network ---
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        # --- Normalization and dropout ---
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(p_dropout)
+        self.dropout2 = nn.Dropout(p_dropout)
+        self.dropout3 = nn.Dropout(p_dropout)
+
+        # --- Activation function ---
+        if isinstance(activation, str):
+            if activation.lower() == "relu":
+                self.activation = F.relu
+            elif activation.lower() == "gelu":
+                self.activation = F.gelu
+            else:
+                raise ValueError(f"Unsupported activation {activation}")
+        else:
+            self.activation = activation  # custom callable
+
+    def forward(self, tgt, memory, 
+                tgt_mask = None, memory_mask = None,
+                tgt_key_mask_padding = None, memory_key_mask_padding = None):
+        # --- Self-attention (causal) ---
+        residual = x
+        x_sa, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_mask_padding,
+            need_weights=False,
+        )
+        x = self.norm1(residual + self.dropout1(x_sa))
+
+        residual = x
+        x_ca, _ = self.cross_attn(
+            query=x,
+            key=memory,
+            value=memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_mask_padding,
+            need_weights=False,
+        )
+        x = self.norm2(residual + self.dropout2(x_ca))
+
+        # --- Feed-forward network ---
+        residual = x
+        x_ff = self.linear2(self.dropout3(self.activation(self.linear1(x))))
+        x = self.norm3(residual + x_ff)
+        return x
+
+
 class ParticleAttentionBlock(nn.Module):
     """
     Implements the Particle Attention block decribed in the paper https://arxiv.org/abs/2202.03772 
@@ -78,3 +146,27 @@ class ClassAttentionBlock(nn.module):
         ## Attention
 
         self.ln1 = nn.LayerNorm(embedded_dim)
+
+
+        self.query_linear = nn.Linear(embedded_dim, embedded_dim)
+
+        ## Feedforward block
+        self.feed_forward_block = nn.Sequential(
+        nn.LayerNorm(self.embedded_dim),
+        nn.Linear(self.embedded_dim, self.feed_for_dim),
+        nn.GELU(),
+        nn.LayerNorm(self.feed_for_dim),
+        nn.Linear(self.feed_for_dim, self.embedded_dim),
+        )
+    
+    def forward(self, x, cls_tkn, src_mask = None):
+        inital_input = torch.concat((x, cls_tkn), axis = 1)
+        
+        q = self.query_linear(cls_tkn)
+
+        attention_scores = F.scaled_dot_product_attention( 
+            q, k, v, 
+            attn_mask = ,
+            dropout_p = self.attn_dropout,
+            is_causal = False)
+        raise NotImplementedError
