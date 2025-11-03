@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.data_utls.scalers import *
-from src.utils.utils import load_and_split_config
+from src.utils.utils import load_and_split_config, load_any_config
+from utils import apply_mask
 
 config_file_path  = "config/transformer_classifier_config.yaml"
 
@@ -34,41 +35,80 @@ class TopTensorDatasetFromH5py:
     def __init__(self, config):
 
         self.config = config
+        self.pad_value = config["pad_value"]
 
         self._get_datas()
-        self.scale_global_data()
-        self.scale_particle_data()
+        self._selection_cuts()
+
         self.src_mask = np.all(np.isnan(self.particle_data), axis = -1)
-        self.particle_data = np.nan_to_num(self.particle_data, nan = -1010)
+        
+
         self._load_into_tensordataset()
         self.split_data()
+
+        self.scale_global_data()
+        self.fit_scale_particle_data()
+        self.transform_scale_particle_data()
+        
+        self.particle_data = np.nan_to_num(self.particle_data, nan = self.pad_value)
         self._save_splits(self.config["processed_file_name"])
 
-    def scale_particle_data(self):
-        B, M, N = self.particle_data.shape
+    ## Function for any event selection cuts -> currently only implements abs(charge) == 2 
+    def _selection_cuts(self):
+        total_charge = np.sum( np.nan_to_num(self.particle_data[... , 4], nan = 0), axis = 1)
+        print(total_charge)
+        cut_events = np.where(abs(total_charge) == 2, True, False)
+        print(cut_events)
+
+        self.particle_data = self.particle_data[cut_events]
+        self.global_data = self.global_data[cut_events]
+        self.targets = self.targets[cut_events]
+
+    def fit_scale_particle_data(self):
+        B, M, N = self.particle_data[self.train.indices].shape
         PT, ETA, PHI, MASS = 0, 1, 2, 3 
 
-        x = self.particle_data.copy()
-
+        x = self.particle_data[self.train.indices].reshape(B * M, N)
+        mask_indicies = self.src_mask[self.train.indices].reshape(B* M)
+        x = x[~mask_indicies]
+        
         # Apply your scalers directly on slices (vectorized):
-        x[..., PT]   = LogScaler().fit_transform(x[..., PT].reshape(-1, 1)).reshape(B, M)
-        x[..., ETA]  = ArctanScaler().fit_transform(x[..., ETA].reshape(-1, 1)).reshape(B, M)
-        x[..., MASS] = LogScaler().fit_transform(x[..., MASS].reshape(-1, 1)).reshape(B, M)
+        self.pt_scaler   = LogScaler().fit(x[..., PT].reshape(-1, 1))
+        self.eta_scaler =    ArctanScaler().fit(x[..., ETA].reshape(-1, 1))
+        self.mass_scaler = LogScaler().fit(x[..., MASS].reshape(-1, 1))
+        self.phi_scaler = PhiTransformer().fit(x[..., PHI].reshape(-1, 1)) 
 
-        # Phi expands to two features (e.g., sin/cos) – insert them right after PHI to preserve per-particle order
-        phi_out = PhiTransformer().fit_transform(x[..., PHI].reshape(-1, 1))  # shape (B*M, 2)
-        phi_out = phi_out.reshape(B, M, 2)
+    def transform_scale_particle_data(self):
+        B, M, N = self.particle_data.shape
+        PT, ETA, PHI, MASS = 0, 1, 2, 3
+        
+        pt = self.particle_data[..., PT].reshape(B * M, 1)
+        eta = self.particle_data[..., ETA].reshape(B * M, 1)
+        phi = self.particle_data[..., PHI].reshape(B*M, 1)
+        mass = self.particle_data[..., MASS].reshape(B*M , 1)
+        rest = self.particle_data[..., MASS + 1 : ]
 
-        # Rebuild features with phi split in place
-        x = np.concatenate([x[..., :PHI], phi_out, x[..., PHI+1:]], axis=-1)  
+        scaled_pt = self.pt_scaler.transform(pt).reshape(B, M, 1)
+        scaled_eta = self.eta_scaler.transform(eta).reshape(B, M, 1)
+        scaled_phi = self.phi_scaler.transform(phi).reshape(B, M , 2)
+        scaled_mass = self.mass_scaler.transform(mass).reshape(B, M , 1)
 
-        self.particle_data = x
+        self.particle_data = np.concatenate((scaled_pt, scaled_eta, scaled_phi, scaled_mass,
+                                           rest), axis = 2 )
+        print(self.particle_data.shape)
 
     def scale_global_data(self):
+        """
+        Function to scale the global data
+        """
         scaler = StandardScaler()
         self.global_data = scaler.fit_transform(self.global_data.reshape(-1, 3)).reshape(-1, 1 , 3)
         
     def _get_datas(self):
+        """
+        Gets path from the file defined in the config.
+        Sets particle, global and target data of the object.
+        """
         raw_file_path = Path(self.config["raw_file_dir"] , self.config["raw_file_name"])
         (self.particle_data, 
         self.global_data,
@@ -122,15 +162,195 @@ class TopTensorDatasetFromH5py:
         for label in labels:
             cls_weights.append(np.sum(self.targets[idx] == label) / len(self.train))
         self.class_weights = np.array(cls_weights)
-        
+        print(self.class_weights)
 
     def _load_into_tensordataset(self):
         self.dataset = TopMulitplicityClassifierDataSet(self.particle_data, self.global_data,
                                                        self.src_mask, self.targets)
 
 
+class TopReconstructionDatasetFromH5:
+    def __init__(self, config):
+
+        ## Use the save information from the step prior for ease.
+        self.raw_file_config = config["root_dataset_prepper"]
+        raw_file_prefix_and_path = os.path.join(self.raw_file_config["save_path"],
+                                                 self.raw_file_config["save_file_prefix"])
+        self.preprocessing_config = config.get("preprocessing", None)
+        stream_size = self.preprocessing_config["stream_size"]
+        (train,  
+        val,
+        test) = (raw_file_prefix_and_path +"train.h5",
+                    raw_file_prefix_and_path + "val.h5",
+                    raw_file_prefix_and_path + "test.h5") 
+        
+
+        ## Temp is the filtered train set
+        temp_file = "temp_file.h5"
+        temp =  raw_file_prefix_and_path + temp_file
+        self.last_temp_idx = 0
+
+        self._init_transformers()
+
+        for file in (train, temp, val, test):
+            with h5py.File(file, "r") as read_file, h5py.File(temp_file, "w") as write_file:
+                file_len = read_file["jet"].shape[0]
+                ## Go through the batches
+                for i in range(0, file_len, stream_size):
+                    ## Read the batches
+                    jet_chunk = read_file["jet"][i: i + stream_size]
+                    event_chunk = read_file["event"][i: i + stream_size]
+                    targets_chunk = read_file["targets"][i: i + stream_size]
+                    print(targets_chunk.shape)
+                    ## Select top quarks 
+                    top_quark_selection = self._select_top_quarks(targets_chunk)
+                    targets_chunk = targets_chunk[top_quark_selection].reshape(-1, 2, 5)
+                    print(targets_chunk.shape)
+                    ## Get mask of events to cut
+                    mask = self._selection_cuts(
+                        jet_chunk,
+                        event_chunk,
+                        targets_chunk
+                    ).squeeze()
+                    print(mask.shape)
+                    ## Apply the mask using helper function
+                    jet_chunk, event_chunk, targets_chunk = apply_mask((jet_chunk, event_chunk, targets_chunk), mask)
+                    print(jet_chunk.shape, event_chunk.shape, targets_chunk.shape)
+                    if file == train:
+                        ## Transform and save temp data
+                        self._fit_transformers(jet_chunk, targets_chunk)
+                        self._temp_save_data(write_file, jet_chunk, event_chunk, targets_chunk)
+                    else:
+                        ## Transform and save data
+                        jet_chunk, targets_chunk = self._transform(jet_chunk, targets_chunk)
+                        self._save_data_chunks(write_file, jet_chunk, event_chunk, targets_chunk, is_temp = (file == temp))
+                        if file == temp:
+                            self.last_temp_idx += jet_chunk.shape[0]
+                
+    def _init_transformers(self):
+        self.jet_transformers = (
+            LogMinMaxScaler(),
+            ArctanScaler(),
+            PhiTransformer(),
+            LogMinMaxScaler(),
+            LogMinMaxScaler(),
+        )
+        self.target_transformers = (
+            LogMinMaxScaler(),
+            ArctanScaler(),
+            StandardScaler(),
+            LogMinMaxScaler()
+        )
+    
+    def _selection_cuts(self, 
+                        jet,
+                        event,
+                        target):
+        print(event.shape)
+        event_selection_mask = (event[:, 2] == 1).reshape(-1, 1)
+        return event_selection_mask
+    
+    def _select_top_quarks(
+            self,
+            target
+    ):
+        target_pid = target[..., 4]
+        print(target_pid.shape)
+        top_quark_mask = (abs(target_pid) == 6)
+        print(top_quark_mask.shape)
+        return top_quark_mask
+
+    def _fit_transformers(self, jet, targets):
+        
+        N, P, F = jet.shape
+        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
+        ## Remove pid information don't need it 
+        targets = targets[...,0:4]
+        jet = jet.reshape(N* P, F)
+        targets = targets.reshape(N * 2, 4)
+
+        jet_variables = (jet_pt,jet_et,jet_phi,jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
+        target_variables = (target_pt, target_et, target_phi, target_mass) = targets[:, pt], targets[:,eta],targets[:, phi], targets[:, mass]
+
+        for variable, transformation in zip(jet_variables, self.jet_transformers):
+            transformation.partial_fit(variable)
+            
+        for variable, transformation in zip(target_variables, self.target_transformers):
+            transformation.partial_fit(variable)
+    
+    def _save_data_chunks(self, file, jet_chunk, event_chunk, targets_chunk, is_temp):
+        if is_temp:
+            n0 = self.last_temp_idx
+            n1 = n0 + jet_chunk.shape[0]
+        else:
+            cur_len = file["jet"].shape[0]
+            n0, n1 = cur_len, cur_len + jet_chunk.shape[0]
+        
+        file["jet"][n0 : n1] = jet_chunk
+        file["event"][n0 : n1] = event_chunk
+        file["target"][n0 : n1] = targets_chunk
+
+
+    def _transform(self, jet, targets):
+
+        ## Same process of the fit transform function - get the in the right shape and seperate it.
+        N, P, F = jet.shape
+        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
+        ## Remove pid information don't need it 
+        targets = targets[...,0:5]
+        jet = jet.reshape(N* P, F)
+        targets = targets.reshape(N * 2, 4)
+        # Sepererate and store in a tuple for easy iteration
+        jet_variables = (jet_pt,jet_et,jet_phi,jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
+        target_variables = (target_pt, target_et, target_phi, jet_mass) = targets[:, pt], targets[:,eta],targets[:, phi], targets[:, mass]
+
+        jet_transformed = []
+        target_transformed = []
+
+        # Transformed the data and append to list
+        for variable, transformation in zip(jet_variables, self.jet_transformers):
+            jet_transformed.append(transformation.transform(variable).reshape(N, P, -1 ))
+        for variable, transformation in zip(target_variables, self.target_transformers):
+            target_transformed.append(transformation.transform(variable).reshape(N, P, -1))
+        
+        jet = np.concatenate(jet_transformed, axis = 1)
+        target = np.concatenate(target_transformed, axis = 1)
+
+        
+        return jet, target
+        
+        
+
+    
+
+    @staticmethod
+    def _create_datagroups(file):
+        ## Creates the following datasets in a h5py file object
+        file.create_dataset(
+            "jet",
+            shape = (0,0,0),
+            maxshape = (None, None,None)
+        )
+        file.create_dataset(
+            "event",
+            shape = (0,0,0),
+            maxshape = (None, None,None)
+        )
+        file.create_dataset(
+            "target",
+            shape = (0,0,0),
+            maxshape = (None, None,None)
+        )
+
+
+if __name__ == "__main__":
+    config = load_any_config("config/top_reconstruction_config.yaml")
+    top_reconstruction_dataset = TopReconstructionDatasetFromH5(config)
+
+""" 
+
 if __name__ == "__main__":
     config = load_and_split_config(config_file_path)
     config = config.data_pipeline["data_preprocessing"]
     top_dataset = TopTensorDatasetFromH5py(config)       
-    
+     """
