@@ -1,5 +1,9 @@
 import numpy as np
 
+
+def apply_mask(arrays, mask):
+    return (array[mask] for array in arrays)
+
 def calculate_interaction_features(
         particle_array,
         pad_value
@@ -19,3 +23,5 @@ def calculate_interaction_features(
                 
                 p1, eta1, phi1, m1 = j[:4]
                 p2, eta2, phi2, m2 = k[:4]
+
+                
