@@ -140,13 +140,15 @@ class TopAntiTopRegressionDataSetPrep:
         val_name = config["val_file_name"]
         test_name = config["test_file_name"]
         save_dir = config["save_path"]
+        save_name = config["save_file_prefix"]
         step_size = config.get("step_size", 50_000)
 
         os.makedirs(save_dir, exist_ok=True)
 
-        for name in (train_name, val_name, test_name):
+        for name, stage in zip((train_name, val_name, test_name),
+                               ("train", "val", "test")):
             root_file = os.path.join(root_path, name) + ".root"
-            h5_path = os.path.join(save_dir, name + ".h5")
+            h5_path = os.path.join(save_dir, save_name+  stage + ".h5")
             self._save_dataset(
                 h5_path,
                 self.parse_root_file(
