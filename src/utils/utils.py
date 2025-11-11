@@ -22,7 +22,7 @@ def load_and_split_config(config_input_file: str) -> BaseConfig:
     cfg = BaseConfig(**raw_config)
     return cfg
 
-def load_any_config(config_input_file: str) -> Dict[str: Any]:
+def load_any_config(config_input_file: str) -> Dict[str, Any]:
     with open(config_input_file, "r") as f:
         raw_config = yaml.safe_load(f)
     return raw_config

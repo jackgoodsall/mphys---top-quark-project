@@ -1,0 +1,27 @@
+model_parameters:
+
+
+data:
+  train:
+    batch_size:
+    num_workers:
+    persistent_workers:
+  validation:
+    batch_size:
+    num_workers:
+    persistent_workers:
+  test:
+    batch_size:
+    num_workers:
+    persistent_workers:
+
+train:
+  min_epoches:
+  max_epoches:
+  learning_rate:
+  weight_decay: 
+  early_stopping: 
+    logged_metric: 
+    patience: 
+  lr_schedular:
+    patience: 

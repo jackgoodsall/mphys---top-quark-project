@@ -79,20 +79,17 @@ class TopReconstruction(LightningDataModule):
         assert self.train_dataset is not None, "train_dataset not set (did setup() run?)"
         return DataLoader(self.train_dataset, batch_size=self.train_config["batch_size"], shuffle=self.train_config["shuffle"],
                           num_workers=self.train_config["num_workers"], pin_memory=self.train_config["pin_memory"],
-                          persistent_workers=self.num_workers > 0,
                           drop_last = True)
 
     def val_dataloader(self):
         assert self.val_dataset is not None, "val_dataset not set (did setup() run?)"
         return DataLoader(self.val_dataset, batch_size=self.val_config["batch_size"], shuffle=self.val_config["shuffle"],
-                          num_workers=self.val_config["num_workers"], pin_memory=self.val_config["pin_memory"],
-                          persistent_workers=self.num_workers > 0)
+                          num_workers=self.val_config["num_workers"], pin_memory=self.val_config["pin_memory"])
 
     def test_dataloader(self):
         assert self.test_dataset is not None, "test_dataset not set (did setup() run?)"
         return DataLoader(self.test_dataset, batch_size=self.test_config["batch_size"], shuffle=self.test_config["shuffle"],
-                          num_workers=self.test_config["num_workers"], pin_memory=self.test_config["pin_memory"],
-                          persistent_workers=self.num_workers > 0)
+                          num_workers=self.test_config["num_workers"], pin_memory=self.test_config["pin_memory"])
 
 
 

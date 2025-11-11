@@ -1,0 +1,79 @@
+model_parameters:
+  classifer_head:
+    input_size: 128
+    hidden_sizes: [64, 64,32]
+    p_dropout: 0.3
+    activation_function: relu
+    return_logits: True 
+    n_classes: 1
+  transformer:
+    n_input_features: 7
+    embedding_size: 128
+    classifcation_head: classifer_head
+    activation_function: gelu
+    nhead: 8
+    dim_feedforward: 512
+    with_cls_tkn: True
+    num_layers: 6
+    p_dropout: 0.3
+    n_global_features: 3
+    
+data:
+  train:
+    batch_size: 512
+    num_workers: 1
+    persistent_workers: True
+  validation:
+    batch_size: 1024
+    num_workers: 1
+    persistent_workers: True
+  test:
+    batch_size: 1024
+    num_workers: 1
+    persistent_workers: True
+
+train:
+  min_epochs: 5
+  max_epochs: 10
+  learning_rate: 0.00005
+  weight_decay: 0.001
+  class_weights: [0.19779801, 0.80220199]
+  early_stopping: 
+    logged_metric: "val_loss"
+    patience: 10
+  lr_schedular:
+    patience: 5
+
+
+data_pipeline:
+  root_to_h5py:
+    raw_data_dir:
+      "data/fourtopvsthree/rootfiles/"
+    max_particles:
+      25
+    particle_features:
+      ["_pt", "_eta", "_phi", "_mass"]
+    global_features:
+      ["met_met", "met_eta", "met_phi"]
+    signal_files: # Labeled 1
+      ["4top_2LSS_April18.root"]
+    background_files: # Labeled 0
+      [
+        "3tJ_LO_final.root", "3tWm_LO_final.root", "3tWp_LO_final.root"
+      ]
+    file_save_dir:
+      "data/fourtopvsthree/rawh5pyfiles"
+    file_save_name:
+      "fourtop3top_nocharge.h5"
+  data_preprocessing:
+    pad_value: -1010
+    raw_file_dir:
+      "data/fourtopvsthree/rawh5pyfiles/"
+    raw_file_name:  
+      "fourtop3topall.h5"
+    processed_file_dir:
+      "data/fourtopvsthree/processed_data"
+    processed_file_name:
+      "fourtop3top_2_charge_events_functional_transformed"
+    split_sizes:
+      [0.8, 0.1, 0.1]

@@ -2,7 +2,7 @@ import numpy as np
 
 
 def apply_mask(arrays, mask):
-    return (array[mask] for array in arrays)
+    return (array[mask, ...] for array in arrays)
 
 def calculate_interaction_features(
         particle_array,
@@ -25,3 +25,22 @@ def calculate_interaction_features(
                 p2, eta2, phi2, m2 = k[:4]
 
                 
+
+def calculate_energy_value(
+    array
+):
+    """
+    Takes in an array of shape (pt, eta, phi, M) and returns M
+    """
+    mass = array[3]
+    p = array[0] * np.cosh(array[1])
+    return mass*2 + p*2 
+
+
+def calulate_mass_value(
+        array
+):
+    """
+    Takes in an array of shape (pt, eta,phi,E) and returns M
+    """
+    pass

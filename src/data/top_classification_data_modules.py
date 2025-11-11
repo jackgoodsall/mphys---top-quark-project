@@ -32,7 +32,7 @@ class TopMultiplicityClassifierDataset(Dataset):
 
 
 class FourvsThreeTopDataModule(LightningDataModule):
-    def __init__(self, data_prefix: str = "data/processed_data_", batch_size: int = 512,
+    def __init__(self, data_prefix: str = "data/fourtopvsthree/processed_data/two_charge/fourtop3top_2_charge_events_functional_transformed_", batch_size: int = 512,
                  num_workers: int = 1, pin_memory: bool = True,
                  *args, **kwargs):
         super().__init__()

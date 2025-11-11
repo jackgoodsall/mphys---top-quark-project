@@ -37,9 +37,10 @@ class DecoderAttentionBlock(nn.Module):
         else:
             self.activation = activation  # custom callable
 
-    def forward(self, tgt, memory, 
+    def forward(self, x, memory, 
                 tgt_mask = None, memory_mask = None,
-                tgt_key_mask_padding = None, memory_key_mask_padding = None):
+                tgt_key_padding_mask = None, memory_key_padding_mask = None,
+                tgt_is_causal = None, memory_is_causal = None):
         # --- Self-attention (causal) ---
         residual = x
         x_sa, _ = self.self_attn(
@@ -47,7 +48,7 @@ class DecoderAttentionBlock(nn.Module):
             key=x,
             value=x,
             attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_mask_padding,
+            key_padding_mask=tgt_key_padding_mask,
             need_weights=False,
         )
         x = self.norm1(residual + self.dropout1(x_sa))
@@ -58,7 +59,7 @@ class DecoderAttentionBlock(nn.Module):
             key=memory,
             value=memory,
             attn_mask=memory_mask,
-            key_padding_mask=memory_key_mask_padding,
+            key_padding_mask=memory_key_padding_mask,
             need_weights=False,
         )
         x = self.norm2(residual + self.dropout2(x_ca))
@@ -127,8 +128,7 @@ class ParticleAttentionBlock(nn.Module):
         return residual
 
 
-
-class ClassAttentionBlock(nn.module):
+class ClassAttentionBlock(nn.Module):
     """
     Implements the class attention block desribed in the paper  https://arxiv.org/abs/2202.03772 
     """
@@ -160,7 +160,7 @@ class ClassAttentionBlock(nn.module):
         )
     
     def forward(self, x, cls_tkn, src_mask = None):
-        inital_input = torch.concat((x, cls_tkn), axis = 1)
+        """ inital_input = torch.concat((x, cls_tkn), axis = 1)
         
         q = self.query_linear(cls_tkn)
 
@@ -168,5 +168,5 @@ class ClassAttentionBlock(nn.module):
             q, k, v, 
             attn_mask = ,
             dropout_p = self.attn_dropout,
-            is_causal = False)
+            is_causal = False) """
         raise NotImplementedError

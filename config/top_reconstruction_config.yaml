@@ -1,0 +1,62 @@
+root_dataset_prepper:
+  root_path: "data/topquarkreconstruction/root_data"
+  save_path: "data/topquarkreconstruction/h5py_data"
+  train_file_name:  "ttbar_train"
+  val_file_name: "ttbar_val"
+  test_file_name: "ttbar_test"
+  save_file_prefix: "ttbar_h5py_raw_"
+
+
+preprocessing:
+  stream_size: 500000
+  save_path: "data/topquarkreconstruction/processed_data_E"
+  save_file_prefix: "ttbar_preprocessed_"
+
+data_modules:
+  input_path: data/topquarkreconstruction/processed_data_E
+  input_prefix: "ttbar_preprocessed_"
+
+  train:
+    batch_size: 1024
+    shuffle: True
+    num_workers: 4
+    pin_memory: True
+  test:
+    batch_size: 2024
+    shuffle: False
+    num_workers: 4
+    pin_memory: False
+  val:
+    batch_size: 2024
+    shuffle: False
+    num_workers: 4
+    pin_memory: False
+
+model_parameters:
+  particle_embedder:
+    n_input: 7
+    hidden_sizes: [64, 128]
+    embedding_size: 128
+    p_dropout: 0.1
+  
+  transformer:
+    embedding_size: 128
+    n_encoder_layers: 6
+    n_decoder_layers: 6
+    n_heads: 8
+    out_dimensions: 4
+    p_dropout: 0.1
+    dim_ff: 512
+
+  reverse_embedder:
+    n_input: 128
+    hidden_sizes: [256, 128]
+    output_size: 4
+    p_dropout: 0.1
+
+model_training:
+  learning_rate: 0.0001
+  weight_decay: 0.001
+
+model_artefacts:
+  reverse_target_transformers: "data/topquarkreconstruction/processed_data/target_transformed.joblib"
