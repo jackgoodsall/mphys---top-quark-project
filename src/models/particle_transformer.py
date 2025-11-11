@@ -3,8 +3,10 @@ import torch.nn.functional as F
 import torch
 import sys
 from typing import List
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from .components.attention_layers import ParticleAttentionBlock, ClassAttentionBlock
+from src.models.components.attention_layers import ParticleAttentionBlock, ClassAttentionBlock, DecoderAttentionBlock
 
 class ParticleBinaryClassificaitionHead(nn.Module):
     def __init__(self, input_size: int,
@@ -33,6 +35,7 @@ class ParticleBinaryClassificaitionHead(nn.Module):
         #if self.return_logits:
         return self.linear_layers[-1](x)
         #return F.sigmoid(self.linear_layers[-1](x))
+
 
 class ParticleTransformer(nn.Module):
     def __init__(self, n_input_features: int, 
@@ -130,6 +133,7 @@ class ParTInteractionFormer(nn.Module):
             embedded_dim,
             p_dropout,
     ):
+        super().__init__()
         self.particle_embedder = particle_embedder
         self.classification_head = classifcation_head
 
@@ -157,3 +161,172 @@ class ParTInteractionFormer(nn.Module):
 
         for class_block in self.class_blocks:
             cls_tkn  = class_block()
+
+
+class ParticleEmbedder(nn.Module):
+    def __init__(self,
+                 n_input,
+                 hidden_sizes,
+                 embedding_size,
+                 p_dropout):
+        super().__init__()
+
+        self.layer_sizes = [n_input] + hidden_sizes 
+        self.layers = nn.ModuleList()
+        for size_1, size_2 in zip(self.layer_sizes[:-1], self.layer_sizes[1:]):
+            self.layers.extend([ nn.LayerNorm(size_1), nn.Linear(size_1, size_2), nn.GELU(), nn.Dropout(p_dropout)])
+        self.layers.append(nn.Linear(size_2, embedding_size))
+        
+    def forward(self, X):
+
+        for layers in self.layers:
+            X = layers(X)
+        return X
+
+class ReverseEmbedder(nn.Module):
+    def __init__(self,
+                 n_input,
+                 hidden_sizes,
+                 output_size,
+                 p_dropout):
+        super().__init__()
+
+        self.layer_sizes = [n_input] + hidden_sizes 
+        self.layers = nn.ModuleList()
+        for size_1, size_2 in zip(self.layer_sizes[:-1], self.layer_sizes[1:]):
+            self.layers.extend([nn.LayerNorm(size_1), nn.Linear(size_1, size_2), nn.GELU(), nn.Dropout(p_dropout)])
+        self.layers.append(nn.Linear(size_2, output_size))
+        
+    def forward(self, X):
+
+        for layers in self.layers:
+            X = layers(X)
+        return X
+
+
+
+class ReconstructionTransformer(nn.Module):
+    def __init__(self,
+                 particle_embedder,
+                 reverse_embedder,
+                 embedding_size,
+                 n_encoder_layers,
+                 n_decoder_layers,
+                 n_heads,
+                 out_dimensions,
+                 dim_ff,
+                 p_dropout,
+                 activation_function = "gelu",
+                 ):
+        super().__init__()
+
+        self.particle_embedder = particle_embedder
+
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            embedding_size,
+            nhead = n_heads,
+            dim_feedforward = dim_ff,
+            activation = activation_function,
+            batch_first = True,
+            dropout = p_dropout
+        )
+
+        """ #self.decoder_layer = DecoderAttentionBlock(embedding_size,
+                                                   n_heads,
+                                                   dim_ff,
+                                                   p_dropout,
+                                                   activation_function)
+         """
+        self.decoder_layer = nn.TransformerDecoderLayer(
+            embedding_size, n_heads, dim_ff, p_dropout, activation = activation_function,
+            batch_first= True
+        )
+            
+
+
+        self.encoder_stack = nn.TransformerEncoder(self.encoder_layer, n_encoder_layers)
+        self.decoder_stack = nn.TransformerDecoder(self.decoder_layer, n_decoder_layers)
+
+        self.reverse_embedder = reverse_embedder
+
+        self.tgt_tokens = nn.Parameter(torch.rand((1, 2, embedding_size)) *0.02)
+
+
+
+    def forward(self, X):
+        
+        jet = X["jet"]
+        src_mask = X["src_mask"]
+        
+        jet_embedded = self.particle_embedder(jet)
+
+        B, N, F = jet_embedded.shape
+
+        tgt_tokens = self.tgt_tokens.expand(B, 2,F  )
+        tgt_tokens = torch.zeros((B, 2,
+                                  F)).to(jet.device)
+
+        jet_memory = self.encoder_stack(jet_embedded, src_key_padding_mask = src_mask)
+
+        decoded_tokens = self.decoder_stack(tgt_tokens, 
+                                            jet_memory,
+                                            memory_key_padding_mask =src_mask)
+        return self.reverse_embedder(decoded_tokens)
+
+
+
+class ReconstructionEncoderClassTokens(nn.Module):
+    def __init__(self,
+                 particle_embedder,
+                 reverse_embedder,
+                 embedding_size,
+                 n_encoder_layers,
+                 n_decoder_layers,
+                 n_heads,
+                 out_dimensions,
+                 dim_ff,
+                 p_dropout,
+                 activation_function = "gelu",
+                 ):
+        super().__init__()
+
+        self.particle_embedder = particle_embedder
+
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            embedding_size,
+            nhead = n_heads,
+            dim_feedforward = dim_ff,
+            activation = activation_function,
+            batch_first = True,
+            dropout = p_dropout
+        )
+ 
+        self.class_tokens = nn.Parameter(torch.rand(1, 2, embedding_size) * 0.01)
+            
+
+
+        self.encoder_stack = nn.TransformerEncoder(self.encoder_layer, n_encoder_layers)
+
+        self.reverse_embedder = reverse_embedder
+
+
+    def forward(self, X):
+        
+        jet = X["jet"]
+        src_mask = X["src_mask"]
+        
+        jet_embedded = self.particle_embedder(jet)
+        B, N, F = jet_embedded.shape
+
+        cls_tkns = self.class_tokens.expand(B, 2, F).to(jet.device)
+
+        empty_mask  = torch.zeros((B, 2)).to(jet.device)
+        src_mask = torch.concat((empty_mask, src_mask), axis = 1)
+
+
+        encoder_input = torch.concat((cls_tkns, jet_embedded), axis = 1)
+        encoder_output = self.encoder_stack(encoder_input, src_key_padding_mask = src_mask)
+        # Take first 2 tokens
+        decoded_tokens = encoder_output[:, :2 , :] 
+
+        return self.reverse_embedder(decoded_tokens)
