@@ -19,12 +19,15 @@ class DataConfig(BaseModel):
     train: Dict[str, Any]
     validation: Dict[str, Any]
     test: Dict[str, Any]
+
+
 ### Can add even further structued configs if want
 class BaseConfig(BaseModel):
     data: DataConfig
     model_parameters: Dict[str, Any]
     train: Dict[str, Any]
     data_pipeline: Dict[str, Any]
+
 
 def load_and_split_config(config_input_file: str) -> BaseConfig:
 
@@ -63,8 +66,34 @@ def reverse_transform_variables(
     parts = np.concatenate(parts, axis = 2)
     return parts
 
-import h5py
-import numpy as np
+def apply_invariant_flip(predicted: np.ndarray, targets: np.ndarray):
+    """
+    Apply the same set/permutation-invariant criterion as set_invariant_loss,
+    but in NumPy, to decide per event whether to flip the *predicted* particles.
+
+    Args:
+        predicted: (N, P, F) array
+        targets:   (N, P, F) array
+
+    Returns:
+        predicted_aligned: (N, P, F) predicted, with some events flipped along axis=1
+        flip_mask:         (N,) boolean array, True where we flipped
+    """
+    # Squared errors for original pairing
+    diff_orig = (predicted - targets) ** 2                          # (N, P, F)
+    diff_flip = (predicted - targets[:, ::-1, :]) ** 2              # (N, P, F)
+
+    # Reduce over non-batch dims (particles + features) → per-event loss
+    per_event_orig = diff_orig.mean(axis=(1, 2))                    # (N,)
+    per_event_flip = diff_flip.mean(axis=(1, 2))                    # (N,)
+
+    # If flipping targets gives lower loss, equivalently we should flip predicted
+    flip_mask = per_event_flip < per_event_orig                     # (N,)
+
+    predicted_aligned = predicted.copy()
+    predicted_aligned[flip_mask] = predicted_aligned[flip_mask, ::-1, :]
+
+    return predicted_aligned, flip_mask
 
 def load_top_targets_with_event_selection(
     original_data_file_path,
@@ -100,11 +129,11 @@ def load_top_targets_with_event_selection(
     fourvec = particles_sel[..., fourvec_slice]           # (N_sel, N_particles, 4)
 
     # Mask for top quarks
-    top_quark_mask = (abs(pid) == 6)                   # (N_sel, N_particles)
+    top_quark_mask = (abs(pid) == top_pids)                   # (N_sel, N_particles)
 
     # We assume exactly 2 tops per *selected* event:
     n_sel_events = particles_sel.shape[0]
-    tops = fourvec[top_quark_mask].reshape(n_sel_events, 2, 4)  # (N_sel, 2, 4)
+    fourvec = fourvec[top_quark_mask].reshape(n_sel_events, 2, 4)  # (N_sel, 2, 4)
     # fourvec → vector array (Cartesian)
     v = vector.array({
         "pt": fourvec[..., 0],
@@ -123,9 +152,6 @@ def load_top_targets_with_event_selection(
     fourvec_polar = np.stack((pt, eta, phi, E), axis=-1)
 
     return fourvec_polar
-
-
-
 
 def add_four_momenta(p1, p2, cord_sys="polar"):
     """
@@ -185,7 +211,8 @@ def plot_2d_histogram(
         n_bins,
         X_label,
         Y_label,
-        title
+        title,
+        fig_save_path
 ):  
     fig  = plt.figure()
     X_plot_range = (np.min(X), np.max(X))
@@ -213,7 +240,7 @@ def plot_2d_histogram(
     fig.text(  -0.05,    0.6, f"% Error: {perc_error * 100}", 
         va="center", ha="right")
     plt.tight_layout()
-    plt.show()
+    fig.savefig(fig_save_path / f"{title}.png")
 
 def cartesian_to_polar(fourvec, eps=1e-9):
     px = fourvec[:, 1]
@@ -235,7 +262,9 @@ def generate_reconstruction_report(
         report_file_dir,
         target_reverse_transformer_path,
         report_file_name = "reconstruction_report",
-        coordinate_system = "polar"):
+        coordinate_system = "polar",
+        raw_predict_file_path= "data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_test.h5",
+        pid = 6):
     
     if not Path(test_output_file_path).exists():
         raise FileNotFoundError(f"Test output file {test_output_file_path} does not exist")
@@ -247,9 +276,9 @@ def generate_reconstruction_report(
     
     reverse_transformers = joblib.load(target_reverse_transformer_path)
 
-    targets_transformed = load_top_targets_with_event_selection("../data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_test.h5")
+    targets_transformed = load_top_targets_with_event_selection(raw_predict_file_path, top_pids = pid)
     predicted_transformed = reverse_transform_variables(predicted, reverse_transformers)
-   
+    
     combined_targets = add_four_momenta(targets_transformed[:, 0, :], targets_transformed[:, 1, :], cord_sys= coordinate_system)
     combined_predicted = add_four_momenta(predicted_transformed[:, 0, :], predicted_transformed[:, 1, :], cord_sys= coordinate_system)
 
@@ -258,34 +287,38 @@ def generate_reconstruction_report(
         targets_transformed = cartesian_to_polar(targets_transformed.reshape(-1, 4)).reshape(-1,2,4)
         predicted_transformed = cartesian_to_polar(predicted_transformed.reshape(-1, 4)).reshape(-1,2,4)
 
+
+    predicted_transformed, _ = apply_invariant_flip(predicted_transformed, targets_transformed)
+
     plot_2d_histogram(targets_transformed[:, 0, 0], predicted_transformed[:, 0, 0],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 1 Pt Histogram")
+                        200, "Targets (GeV)", "Predicted (GeV)", "Top 1 Pt Histogram", report_file_dir)
+    
     plot_2d_histogram(targets_transformed[:, 0, 1], predicted_transformed[:, 0, 1],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 1 Eta Histogram")
+                        200, "Targets ", "Predicted ", "Top 1 Eta Histogram", report_file_dir)
     plot_2d_histogram(targets_transformed[:, 0, 2], predicted_transformed[:, 0, 2],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 1 Phi Histogram")
+                        200, "Targets", "Predicted", "Top 1 Phi Histogram", report_file_dir)
     plot_2d_histogram(targets_transformed[:, 0, 3], predicted_transformed[:, 0, 3],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 1 E Histogram")
+                        200, "Targets (GeV)", "Predicted(GeV)", "Top 1 E Histogram", report_file_dir)
     plot_2d_histogram(targets_transformed[:, 1, 0], predicted_transformed[:, 1, 0],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 2 Pt Histogram")
+                        200, "Targets (GeV)", "Predicted (GeV)", "Top 2 Pt Histogram", report_file_dir)
     plot_2d_histogram(targets_transformed[:, 1, 1], predicted_transformed[:, 1, 1],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 2 Eta Histogram")
+                        200, "Targets ", "Predicted ", "Top 2 Eta Histogram", report_file_dir)
     plot_2d_histogram(targets_transformed[:, 1, 2], predicted_transformed[:, 1, 2],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 2 Phi Histogram")
+                        200, "Targets ", "Predicted ", "Top 2 Phi Histogram", report_file_dir)
     plot_2d_histogram(targets_transformed[:, 1, 3], predicted_transformed[:, 1, 3],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Top 2 E Histogram")
+                        200, "Targets (GeV)", "Predicted (GeV)", "Top 2 E Histogram", report_file_dir)
     
     plot_2d_histogram(combined_targets[..., 0], combined_predicted[..., 0],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Combined Pt")
+                        200, "Targets (GeV)", "Predicted (GeV)", "Combined Pt", report_file_dir)
     plot_2d_histogram(combined_targets[..., 1], combined_predicted[..., 1],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Combined Et")
+                        200, "Targets ", "Predicted ", "Combined Et", report_file_dir)
     plot_2d_histogram(combined_targets[..., 2], combined_predicted[..., 2],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Combined Phi")
+                        200, "Targets ", "Predicted ", "Combined Phi", report_file_dir)
     plot_2d_histogram(combined_targets[..., 3], combined_predicted[..., 3],
-                        200, "Targets (GeV)", "Predicted (GeV)", "Combined E")
+                        200, "Targets (GeV)", "Predicted (GeV)", "Combined E", report_file_dir)
     
     plot_2d_histogram(combined_targets[..., 4], combined_predicted[..., 4],
-                          200, "Targets (GeV)", "Predicted (GeV)", "Combined Invariant mass")
+                          200, "Targets (GeV)", "Predicted (GeV)", "Combined Invariant mass", report_file_dir)
 
         
         
