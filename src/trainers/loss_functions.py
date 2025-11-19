@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch
 
 import torch
+import vector
 
 def set_invariant_loss(output: torch.Tensor, targets: torch.Tensor, reduction: str = "mean"):
     """
@@ -58,15 +59,14 @@ def W_boson_loss_function(
 
     # Per-event losses for each species (no reduction yet)
     top_loss_per_event = set_invariant_loss(
-        outputs["top"], targets["top"]
+        outputs["top"], targets["top"], reduction = "none"
     )
     W_loss_per_event = set_invariant_loss(
-        outputs["W"], targets["W"]
+        outputs["W"], targets["W"], reduction = "none"
     )
 
     # Weighted combination per event
-    combined_per_event = top_weight * top_loss_per_event + W_weight * W_loss_per_event
-
+    combined_per_event =  top_loss_per_event * top_weight + W_loss_per_event * W_weight
     # Final reduction
     if reduction == "mean":
         return combined_per_event.mean()
@@ -76,3 +76,25 @@ def W_boson_loss_function(
         return combined_per_event
     else:
         raise ValueError(f"Unknown reduction: {reduction}")
+
+def invariant_mass_loss_function(
+        output_kinematics,
+        target_invariant_mass,
+        reverse_output_transformers,
+        invariant_mass_scalers, 
+):
+    output_kinematics = output_kinematics.reshape(-1, 5)
+    output_kinematics = reverse_output_transformers.inverse_transform(output_kinematics).reshape(-1, 2, 4)
+    output_kinematics = vector.array(
+        {
+            "pt": output_kinematics[..., 0],
+            "eta": output_kinematics[..., 1],
+            "phi": output_kinematics[..., 2],
+            "energy": output_kinematics[..., 3],
+        }
+    )
+    invariant_mass = (output_kinematics[:, 0], output_kinematics[:, 1]).__module__
+
+    scaled_invariant_mass = (invariant_mass - invariant_mass_scalers[0]) / invariant_mass_scalers[1]
+
+    return nn.MSELoss()(scaled_invariant_mass, target_invariant_mass)
