@@ -5,7 +5,7 @@ import sys
 from typing import List
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
+import copy
 from src.models.components.attention_layers import ParticleAttentionBlock, ClassAttentionBlock, DecoderAttentionBlock
 
 class ParticleBinaryClassificaitionHead(nn.Module):
@@ -330,3 +330,179 @@ class ReconstructionEncoderClassTokens(nn.Module):
         decoded_tokens = encoder_output[:, :2 , :] 
 
         return self.reverse_embedder(decoded_tokens)
+
+
+class InteractionEmbedder(nn.Module):
+    def __init__(self,
+        input_features,
+        hidden_layers,
+        output_size,
+        p_dropout):
+        super().__init__()
+        hidden_sizes = [input_features] + hidden_layers 
+        self.layers =  nn.ModuleList([])
+        for size_1, size_2 in zip(hidden_sizes[:-1], hidden_sizes[1:]):
+            self.layers.extend([ nn.LayerNorm(size_1), nn.Conv1d(size_1, size_2, kernel_size=1), nn.GELU(), nn.Dropout(p_dropout)])
+        self.layers.append(nn.Conv1d(size_2, output_size, kernel_size=1))
+
+    def forward(self, x):
+        """
+        x: [B, N, N, input_features]
+        returns: [B, N, N, output_size]
+        """
+        B, N, M, F = x.shape  # F = input_features
+
+        # Flatten pair (i, j) and arrange for Conv1d: [B*N*M, C_in, L]
+        x = x.view(B * N * M, F)       # [B*N*M, F]
+        x = x.unsqueeze(-1)            # [B*N*M, F, 1]
+
+        for layer in self.layers:
+            if isinstance(layer, nn.LayerNorm):
+                # LayerNorm expects last dim = normalized_shape (channels)
+                # Current x: [B*N*M, C, 1] -> make channels last: [B*N*M, 1, C]
+                x = x.transpose(1, 2)  # [B*N*M, 1, C]
+                x = layer(x)
+                x = x.transpose(1, 2)  # back to [B*N*M, C, 1]
+            else:
+                x = layer(x)
+
+        # Remove length dim and reshape back to [B, N, N, output_size]
+        x = x.squeeze(-1)              # [B*N*M, output_size]
+        x = x.view(B, N, M, -1)        # [B, N, N, output_size]
+        return x.permute(0, 3, 1, 2)
+
+
+class ReconstructionInteractionTransformer(nn.Module):
+    def __init__(self,
+                 particle_embedder,
+                 interaction_embedder,
+                 reverse_embedder,
+                 embedding_size,
+                 n_encoder_layers,
+                 n_decoder_layers,
+                 n_heads,
+                 out_dimensions,
+                 dim_ff,
+                 p_dropout,
+                 activation_function = "gelu",
+                 ):
+        super().__init__()
+        self.particle_embedder = particle_embedder
+        self.interaction_embedder = interaction_embedder
+        self.reverse_embedder = reverse_embedder
+
+        self.encoder_stack = nn.ModuleList(
+            [ParticleAttentionBlock(embedding_size, dim_ff,
+                                    n_heads, p_dropout,pair_wise_dim=8) for _ in range(n_encoder_layers)]
+        )
+        self.decoder_layer = nn.TransformerDecoderLayer(
+            embedding_size, n_heads, dim_ff, p_dropout, activation = activation_function,
+            batch_first= True
+        )
+        self.decoder_stack = nn.TransformerDecoder(self.decoder_layer, n_decoder_layers)
+
+        self.tgt_tokens = nn.Parameter(torch.zeros(( 2,
+                                  embedding_size)))
+
+    def forward(self, X):
+        # Unpack
+        jet = X["jet"]
+        interactions = X["interactions"]
+        src_mask = X["src_mask"]
+
+        # Embed
+        jet = self.particle_embedder(jet)
+        interactions = self.interaction_embedder(interactions)
+        
+        B, N, F = jet.shape
+
+        tgt_tokens = self.tgt_tokens.expand(B, 2, F)
+
+
+
+        # Encode
+        for layer in self.encoder_stack:
+            memory = layer(jet, interactions)
+    
+        # Decorder  
+        decoded_tokens = self.decoder_stack(tgt_tokens, 
+                                            memory,
+                                            memory_key_padding_mask =src_mask)
+
+        # Regression
+        outputs = self.reverse_embedder(decoded_tokens)
+        return outputs
+        
+
+
+class ReconstructionPart(nn.Module):
+    def __init__(self,
+                 particle_embedder,
+                 interaction_embedder,
+                 reverse_embedder,
+                 embedding_size,
+                 n_encoder_layers,
+                 n_decoder_layers,
+                 n_heads,
+                 out_dimensions,
+                 dim_ff,
+                 p_dropout,
+                 activation_function = "gelu",
+                 reconstruct_Ws = False,
+                 ):
+        super().__init__()
+
+        self.reconstruct_Ws = reconstruct_Ws
+        self.particle_embedder = particle_embedder
+        self.interaction_embedder = interaction_embedder
+        self.reverse_embedder = reverse_embedder
+        self.w_boson = copy.deepcopy(reverse_embedder)
+
+        self.encoder_stack = nn.ModuleList(
+            [ParticleAttentionBlock(embedding_size, dim_ff,
+                                    n_heads, p_dropout,pair_wise_dim=8) for _ in range(n_encoder_layers)]
+        )
+        self.decoder_stack = nn.ModuleList([
+           ClassAttentionBlock(
+            embedding_size, n_heads, dim_ff, p_dropout
+        ) for _ in range(n_decoder_layers)])
+        self.particle_tokens = nn.Parameter(torch.rand(2, embedding_size) * 0.01)
+
+    def forward(self, X):
+        # Unpack
+        jet = X["jet"]
+        interactions = X["interactions"]
+        src_mask = X["src_mask"]
+
+        # Embed
+        jet = self.particle_embedder(jet)
+        interactions = self.interaction_embedder(interactions)
+        
+        B, N, F = jet.shape
+
+
+        cls_tkns = self.particle_tokens.expand(B, 2, self.particle_tokens.shape[-1])
+
+        # Encode
+        for layer in self.encoder_stack:
+            memory = layer(jet, interactions)
+    
+        # Decorder  
+        outputs = []
+        for layer in self.decoder_stack:
+
+            cls_tkns = layer(memory, 
+                                            cls_tkns,
+                                            src_mask =src_mask)
+            outputs.append(cls_tkns)
+            
+
+        # Regression
+        tops = self.reverse_embedder(outputs[-1])
+        if self.reconstruct_Ws:
+            W_bosons = self.w_boson(outputs[-2])
+            return {
+                "top":tops, 
+                "W":W_bosons
+            }
+        return tops
