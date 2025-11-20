@@ -239,6 +239,9 @@ def plot_2d_histogram(
         va="center", ha="right")
     fig.text(  -0.05,    0.6, f"% Error: {perc_error * 100}", 
         va="center", ha="right")
+    rsquared = 1 - np.sum((X- Y)**2)/np.sum((Y - np.mean(Y))**2)
+    fig.text(  -0.05,    0.65, f" R^2: {rsquared}", 
+        va="center", ha="right")
     plt.tight_layout()
     fig.savefig(fig_save_path / f"{title}.png")
 
@@ -311,14 +314,14 @@ def generate_reconstruction_report(
     plot_2d_histogram(combined_targets[..., 0], combined_predicted[..., 0],
                         200, "Targets (GeV)", "Predicted (GeV)", "Combined Pt", report_file_dir)
     plot_2d_histogram(combined_targets[..., 1], combined_predicted[..., 1],
-                        200, "Targets ", "Predicted ", "Combined Et", report_file_dir)
+                        200, "Targets ", "Predicted ", "Combined Eta", report_file_dir)
     plot_2d_histogram(combined_targets[..., 2], combined_predicted[..., 2],
                         200, "Targets ", "Predicted ", "Combined Phi", report_file_dir)
     plot_2d_histogram(combined_targets[..., 3], combined_predicted[..., 3],
                         200, "Targets (GeV)", "Predicted (GeV)", "Combined E", report_file_dir)
     
     plot_2d_histogram(combined_targets[..., 4], combined_predicted[..., 4],
-                          200, "Targets (GeV)", "Predicted (GeV)", "Combined Invariant mass", report_file_dir)
+                          200, "Targets (GeV)", "Predicted (GeV)", "Invariant mass", report_file_dir)
 
         
         
