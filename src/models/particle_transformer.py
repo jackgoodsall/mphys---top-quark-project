@@ -447,8 +447,10 @@ class ReconstructionPart(nn.Module):
                  out_dimensions,
                  dim_ff,
                  p_dropout,
+                 number_class_tokens,
                  activation_function = "gelu",
                  reconstruct_Ws = False,
+                 use_hungarian_matching = False,
                  ):
         super().__init__()
 
@@ -457,6 +459,8 @@ class ReconstructionPart(nn.Module):
         self.interaction_embedder = interaction_embedder
         self.reverse_embedder = reverse_embedder
         self.w_boson = copy.deepcopy(reverse_embedder)
+        self.number_class_tokens = number_class_tokens
+        self.use_hungarian_matching = use_hungarian_matching
 
         self.encoder_stack = nn.ModuleList(
             [ParticleAttentionBlock(embedding_size, dim_ff,
@@ -466,7 +470,7 @@ class ReconstructionPart(nn.Module):
            ClassAttentionBlock(
             embedding_size, n_heads, dim_ff, p_dropout
         ) for _ in range(n_decoder_layers)])
-        self.particle_tokens = nn.Parameter(torch.rand(2, embedding_size) * 0.01)
+        self.particle_tokens = nn.Parameter(torch.rand(number_class_tokens, embedding_size) * 0.01)
 
     def forward(self, X):
         # Unpack
@@ -481,7 +485,7 @@ class ReconstructionPart(nn.Module):
         B, N, F = jet.shape
 
 
-        cls_tkns = self.particle_tokens.expand(B, 2, self.particle_tokens.shape[-1])
+        cls_tkns = self.particle_tokens.expand(B, self.number_class_tokens, self.particle_tokens.shape[-1])
 
         # Encode
         for layer in self.encoder_stack:
@@ -500,6 +504,8 @@ class ReconstructionPart(nn.Module):
         # Regression
         tops = self.reverse_embedder(outputs[-1])
         if self.reconstruct_Ws:
+            if self.use_hungarian_matching:
+                return tops
             W_bosons = self.w_boson(outputs[-2])
             return {
                 "top":tops, 

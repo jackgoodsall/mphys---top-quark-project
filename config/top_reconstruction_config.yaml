@@ -1,22 +1,22 @@
 root_dataset_prepper:
   root_path: "data/topquarkreconstruction/root_data"
-  save_path: "data/topquarkreconstruction/h5py_data"
+  save_path: "data/topquarkreconstruction/fourtop_data"
   train_file_name:  "ttbar_train"
   val_file_name: "ttbar_val"
   test_file_name: "ttbar_test"
-  save_file_prefix: "ttbar_h5py_raw_"
+  save_file_prefix: ""
 
 
 preprocessing:
-  stream_size: 200000
-  save_path: "data/topquarkreconstruction/processed_data_interaction_with_W"
+  stream_size: 1000000
+  save_path: "data/topquarkreconstruction/test_set"
   save_file_prefix: "ttbar_preprocessed_"
 
 interactions: 
   True
-reconstruct_W:
-  hungarian: False
-  True
+reconstruct_W: True
+use_hungarian_matching: True
+  
 
 
 
@@ -57,11 +57,12 @@ model_parameters:
   transformer:
     embedding_size: 64
     n_encoder_layers: 8
-    n_decoder_layers: 2
+    n_decoder_layers: 4
     n_heads: 8
     out_dimensions: 5
     p_dropout: 0.1
     dim_ff: 256
+    number_class_tokens: 4
 
   reverse_embedder:
     n_input: 64

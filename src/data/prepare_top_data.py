@@ -562,7 +562,7 @@ class InteractionTopReconstructionDatasetFromH5:
                     if read == temp:
                         print(targets_chunk.shape)
                     top_quark_selection = self._select_top_quarks(targets_chunk)
-                    targets_chunk = targets_chunk[top_quark_selection].reshape(-1, 2, 5)
+                    targets_chunk = targets_chunk[top_quark_selection].reshape(-1, 4, 5)
                    
                     ## Get mask of events to cut
                     mask = self._selection_cuts(
@@ -627,7 +627,7 @@ class InteractionTopReconstructionDatasetFromH5:
         ## Remove pid information don't need it 
         targets = targets[...,0:4]
         jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 2, 4)
+        targets = targets.reshape(N * 4, 4)
 
         jet_variables = (jet_pt,jet_et,jet_phi,jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
         target_variables = (target_pt, target_et, target_phi, target_mass) = targets[:, pt], targets[:,eta],targets[:, phi], targets[:, mass]
@@ -675,7 +675,7 @@ class InteractionTopReconstructionDatasetFromH5:
         ## Remove pid information don't need it 
         targets = targets[...,0:4]
         jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 2, 4)
+        targets = targets.reshape(N * 4, 4)
         # Sepererate and store in a tuple for easy iteration
         jet_variables = (jet_pt,jet_et,jet_phi,
                          jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
@@ -689,7 +689,7 @@ class InteractionTopReconstructionDatasetFromH5:
         for variable, transformation in zip(jet_variables, self.jet_transformers):
             jet_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, P, -1 ))
         for variable, transformation in zip(target_variables, self.target_transformers):
-            target_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, 2, -1))
+            target_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, 4, -1))
         
         jet = np.concatenate(jet_transformed, axis = - 1)
         jet = np.concatenate((jet, jet_btag), axis = 2 )
@@ -732,8 +732,8 @@ class InteractionTopReconstructionDatasetFromH5:
         )
         target_ds = file.create_dataset(
             "targets",
-            shape = (0,2,Q),
-            maxshape = (None, 2,Q + 1),     
+            shape = (0,4,Q),
+            maxshape = (None, 4,Q + 1),     
             compression="gzip", 
             compression_opts=4,               
         )
@@ -831,6 +831,7 @@ class WBosonInteractionTopReconstructionDatasetFromH5:
 
     # -----------------------------
     # High-level file passes
+
     # -----------------------------
     def _fit_on_file(self, raw_path):
         """First pass on train file: fit transformers only, no writing."""
@@ -893,6 +894,7 @@ class WBosonInteractionTopReconstructionDatasetFromH5:
                 interaction_chunk = create_interaction_matrix(jet_chunk)
 
                 # Transform
+    
                 jet_chunk, top_targets_chunk, W_targets_chunk, interaction_chunk = self._transform(
                     jet_chunk,
                     top_targets_chunk,
@@ -954,7 +956,8 @@ class WBosonInteractionTopReconstructionDatasetFromH5:
         # Require exactly 2 tops and 2 Ws and pass base mask
         keep = (num_tops == 2) & (num_Ws == 2) & base_mask
 
- 
+        if not np.any(keep):
+            return None
 
         jet_chunk    = jet_chunk[keep]
         event_chunk  = event_chunk[keep]
@@ -1068,13 +1071,13 @@ class WBosonInteractionTopReconstructionDatasetFromH5:
     # -----------------------------
     # Padding & saving
     # -----------------------------
-    def _pad_and_src_mask(self, jet_chunk, interaction_chunk, pad_value=-99):
+    def _pad_and_src_mask(self, jet_chunk, interaction_chunk, pad_value=0):
         self.pad_value = pad_value
 
         src_mask = np.all(np.isnan(jet_chunk), axis=-1)
 
         jet_chunk = np.nan_to_num(jet_chunk, nan=pad_value)
-        interaction_chunk = np.nan_to_num(interaction_chunk, nan=-np.inf)
+        interaction_chunk = np.nan_to_num(interaction_chunk, nan=0)
 
         return jet_chunk, src_mask, interaction_chunk
 
@@ -1162,7 +1165,7 @@ class WBosonInteractionTopReconstructionDatasetFromH5:
 
 if __name__ == "__main__":
     config = load_any_config("config/top_reconstruction_config.yaml")
-    top_reconstruction_dataset = WBosonInteractionTopReconstructionDatasetFromH5(config)
+    top_reconstruction_dataset = InteractionTopReconstructionDatasetFromH5(config)
 
 """ 
 

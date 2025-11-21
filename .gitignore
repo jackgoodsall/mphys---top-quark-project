@@ -4,6 +4,7 @@
 /lightning_logs/
 /checkpoints/
 gpu_test.py
+Nov13/
 
 
 __pycache__/

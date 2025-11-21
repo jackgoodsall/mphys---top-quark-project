@@ -170,7 +170,7 @@ class ClassAttentionBlock(nn.Module):
         B, N, _ = x.shape
         inputs = torch.concat((x, cls_tkn), axis = 1)
         if src_mask is not None:
-            src_mask = torch.concat((src_mask, torch.zeros(B, 2).to(x.device)), axis = 1)
+            src_mask = torch.concat((src_mask, torch.zeros(B, cls_tkn.shape[1]).to(x.device)), axis = 1)
         attention_input = self.ln1(inputs)
         
         attention_scores, _ = self.attention(

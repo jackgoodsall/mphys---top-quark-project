@@ -46,7 +46,7 @@ def px_py_pz_from_pt_eta_phi(X):
     return px, py, pz
 
 
-def convert_polar_to_cartesian(
+def convert_polar_to_cartesian( 
     X,
     *,
     include_mass: bool = False,
@@ -85,11 +85,6 @@ def convert_polar_to_cartesian(
         Y = Y.copy()
         Y[bad] = pad_value
     return Y
-
-import numpy as np
-
-import numpy as np
-
 
 def delta_phi(phi1, phi2):
     """

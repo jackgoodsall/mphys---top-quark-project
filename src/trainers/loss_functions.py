@@ -5,6 +5,11 @@ import torch
 import vector
 
 
+from scipy.optimize import linear_sum_assignment
+import numpy as np
+
+import torch.nn.functional as F
+
 def logminmax_inverse_torch(x_scaled, logminmax, device):
     # logminmax is the fitted sklearn LogMinMaxScaler
     mean = torch.tensor(logminmax.scalar.mean_,  device=device, dtype=torch.float32)
@@ -147,3 +152,113 @@ def invariant_mass_loss(
     inv_mass_scaled = (torch.log1p(inv_mass) - mass_mean) / mass_std
 
     return torch.nn.functional.mse_loss(inv_mass_scaled.unsqueeze(-1), target_scaled_mass)
+
+import torch
+import itertools
+
+def hungarian_match_top_W(outputs, targets, reduction="mean"):
+    """
+    Batched permutation-based matching between outputs and targets (tops + Ws),
+    using all 4! permutations, fully vectorised.
+
+    Args
+    ----
+    outputs : torch.Tensor, shape (N, 4, F)
+        Network outputs per event.
+    targets : dict of torch.Tensor
+        {
+            "top": (N, 2, F),
+            "W":   (N, 2, F),
+        }
+    reduction : "mean" or "sum"
+        How to compute per-event MSE over the 4 objects.
+
+    Returns
+    -------
+    matched : dict
+        {
+            "top":  (N, 2, F),
+            "W":    (N, 2, F),
+            "loss": (N,),  # per-event optimal MSE
+        }
+    """
+
+    assert isinstance(outputs, torch.Tensor), "outputs must be a torch.Tensor"
+    assert isinstance(targets["top"], torch.Tensor)
+    assert isinstance(targets["W"], torch.Tensor)
+
+    device = outputs.device
+    dtype  = outputs.dtype
+
+    top = targets["top"].to(device=device, dtype=dtype)
+    W   = targets["W"].to(device=device, dtype=dtype)
+
+    N, P, F = outputs.shape
+    n_top = top.shape[1]
+    n_W   = W.shape[1]
+    assert P == n_top + n_W == 4, "This implementation assumes exactly 4 objects per event."
+
+    # Concatenate truth in fixed order: [top0, top1, W0, W1]
+    targets_cat = torch.cat([top, W], dim=1)           # (N, 4, F)
+
+    # All permutations of the 4 indices → (24, 4)
+    perms = torch.tensor(
+        list(itertools.permutations(range(P))),
+        device=device,
+        dtype=torch.long,
+    )   # (num_perm=24, 4)
+    num_perm = perms.shape[0]
+
+    # outputs: (N, 4, F)
+    # We want permuted outputs for each permutation and event:
+    # shape → (N, num_perm, 4, F)
+
+    # Expand outputs to (N, 1, 4, F)
+    outputs_exp = outputs.unsqueeze(1)                 # (N, 1, 4, F)
+    # Index for gather over dimension 2
+    perm_idx = perms.unsqueeze(0).unsqueeze(-1)        # (1, num_perm, 4, 1)
+    perm_idx = perm_idx.expand(N, num_perm, 4, F)      # (N, num_perm, 4, F)
+
+    # Broadcast outputs_exp along num_perm and gather
+    outputs_exp = outputs_exp.expand(N, num_perm, 4, F)        # (N, num_perm, 4, F)
+    outputs_perm = torch.gather(outputs_exp, 2, perm_idx)      # (N, num_perm, 4, F)
+
+    # Expand targets for broadcasting
+    targets_exp = targets_cat.unsqueeze(1)                     # (N, 1, 4, F)
+    targets_exp = targets_exp.expand(N, num_perm, 4, F)        # (N, num_perm, 4, F)
+
+    # Squared errors per object-feature-permutation
+    diff = outputs_perm - targets_exp                          # (N, num_perm, 4, F)
+    se   = diff**2                                             # (N, num_perm, 4, F)
+
+    if reduction == "mean":
+        # MSE per event per permutation
+        perm_loss = se.mean(dim=(2, 3))                        # (N, num_perm)
+    elif reduction == "sum":
+        perm_loss = se.sum(dim=(2, 3))                         # (N, num_perm)
+    else:
+        raise ValueError("reduction must be 'mean' or 'sum'")
+
+    # Best permutation index per event
+    best_perm_idx = perm_loss.argmin(dim=1)                    # (N,)
+
+    # Gather best permutation indices per event: shape (N, 4)
+    best_perm = perms[best_perm_idx]                           # (N, 4)
+
+    # Use best_perm to reorder outputs into target order for each event
+    # Make index tensor for gather over dim=1
+    gather_idx = best_perm.unsqueeze(-1).expand(N, P, F)       # (N, 4, F)
+    matched_all = torch.gather(outputs, 1, gather_idx)         # (N, 4, F)
+
+    # Split into tops and Ws according to target order
+    matched_top = matched_all[:, :n_top, :]                    # (N, 2, F)
+    matched_W   = matched_all[:, n_top:, :]                    # (N, 2, F)
+
+    # Per-event optimal loss
+    loss_per_event = perm_loss[torch.arange(N, device=device), best_perm_idx].mean()  # (N,)
+
+    return {
+        "top":  matched_top,
+        "W":    matched_W,
+        "loss": loss_per_event,
+    }
