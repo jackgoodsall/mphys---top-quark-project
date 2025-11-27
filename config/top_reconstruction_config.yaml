@@ -1,15 +1,15 @@
 root_dataset_prepper:
   root_path: "data/topquarkreconstruction/root_data"
-  save_path: "data/topquarkreconstruction/fourtop_data"
+  save_path: "data/topquarkreconstruction/h5py_data"
   train_file_name:  "ttbar_train"
   val_file_name: "ttbar_val"
   test_file_name: "ttbar_test"
-  save_file_prefix: ""
+  save_file_prefix: "ttbar_h5py_raw_"
 
 
 preprocessing:
-  stream_size: 1000000
-  save_path: "data/topquarkreconstruction/test_set"
+  stream_size: 200000
+  save_path: "data/topquarkreconstruction/reco_targets"
   save_file_prefix: "ttbar_preprocessed_"
 
 interactions: 
@@ -21,7 +21,7 @@ use_hungarian_matching: True
 
 
 data_modules:
-  input_path: data/topquarkreconstruction/processed_data_interaction_with_W
+  input_path: data/topquarkreconstruction/reco_targets
   input_prefix: "ttbar_preprocessed_"
 
   train:
