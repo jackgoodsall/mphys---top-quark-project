@@ -1,804 +1,413 @@
-import numpy as np 
-import pandas as pd
-import os
-from torch.utils.data import Dataset, random_split
-from sklearn.preprocessing import StandardScaler
+import numpy as np
 import h5py
-import torch
-from sklearn.compose import ColumnTransformer
-import sys
-from pathlib import Path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from src.data_utls.scalers import *
-from src.utils.utils import load_and_split_config, load_any_config
-from utils import apply_mask, calculate_energy_value, convert_polar_to_cartesian, create_interaction_matrix
-
-config_file_path  = "config/transformer_classifier_config.yaml"
 import joblib
+from pathlib import Path
+from abc import ABC, abstractmethod
+from typing import Tuple, Optional, Dict, Any
+import vector
+from tqdm import tqdm # <-- ADDED PROGRESS BAR IMPORT
+import awkward as ak
+import os
+import sys
+# Assuming these imports set up your environment and dependencies
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))) 
+
+from src.data_utls.scalers import LogMinMaxScaler, StandardScaler, PhiTransformer
+from src.utils.utils import load_any_config
+from utils import (
+    apply_mask,
+    calculate_energy_value,
+    convert_polar_to_cartesian,
+    create_interaction_matrix,
+)
+
+# --- TargetProcessor Definitions (Unchanged) ---
+
+class TargetProcessor(ABC):
+    """Abstract base for different target processing strategies."""
+
+    @abstractmethod
+    def get_target_count(self) -> int:
+        """Number of targets per event (e.g., 2 for tops, 4 for interaction)."""
+        pass
+
+    @abstractmethod
+    def init_target_transformers(self) -> tuple:
+        """Initialize target transformers."""
+        pass
+
+    @abstractmethod
+    def process_targets(self, targets_chunk: np.ndarray, is_temp: bool) -> Dict[str, np.ndarray]:
+        """Apply target-specific processing (energy calc, coordinate transform, etc.)."""
+        pass
+
+    @abstractmethod
+    def get_save_keys(self) -> list:
+        """Return list of dataset keys to save (e.g., ['targets'] or ['targets', 'W_targets'])."""
+        pass
+
+    @abstractmethod
+    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
+        """Reshape targets for this strategy."""
+        pass
 
 
+class SimpleTargetProcessor(TargetProcessor):
+    """Processes 2 top quarks with energy calculation."""
+
+    def get_target_count(self) -> int:
+        return 2
+
+    def init_target_transformers(self) -> tuple:
+        return (
+            LogMinMaxScaler(),
+            StandardScaler(),
+            StandardScaler(),
+            LogMinMaxScaler(),
+        )
+
+    def process_targets(self, targets_chunk: np.ndarray, is_temp: bool) -> Dict[str, np.ndarray]:
+        # targets_chunk is (B, 2, 5). Feature 3 is mass. Feature 4 is PDG ID (or similar placeholder).
+        if not is_temp:
+            targets_chunk[..., 3] = calculate_energy_value(targets_chunk[..., :])
+        return {"targets": targets_chunk}
+
+    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
+        return targets_chunk.reshape(-1, 2, 5)
+
+    def get_save_keys(self) -> list:
+        return ["targets"]
+
+
+class CartesianTargetProcessor(TargetProcessor):
+    """Processes 2 top quarks with polar-to-cartesian coordinate transformation."""
+
+    def get_target_count(self) -> int:
+        return 2
+
+    def init_target_transformers(self) -> tuple:
+        return (
+            LogMinMaxScaler(),
+            StandardScaler(),
+            StandardScaler(),
+            StandardScaler(),
+        )
+
+    def process_targets(self, targets_chunk: np.ndarray, is_temp: bool) -> Dict[str, np.ndarray]:
+        if not is_temp:
+            targets_chunk[..., :4] = convert_polar_to_cartesian(targets_chunk)
+        return {"targets": targets_chunk}
+
+    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
+        return targets_chunk.reshape(-1, 2, 5)
+
+    def get_save_keys(self) -> list:
+        return ["targets"]
+
+
+class InteractionTargetProcessor(TargetProcessor):
+    """Processes 4 targets with interaction matrix."""
+
+    def get_target_count(self) -> int:
+        return 4
+
+    def init_target_transformers(self) -> tuple:
+        return (
+            LogMinMaxScaler(),
+            StandardScaler(),
+            PhiTransformer(),
+            LogMinMaxScaler(),
+        )
+
+    def process_targets(self, targets_chunk: np.ndarray, is_temp: bool) -> Dict[str, np.ndarray]:
+        if not is_temp:
+            targets_chunk[..., 3] = calculate_energy_value(targets_chunk[..., :])
+        return {"targets": targets_chunk}
+
+    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
+        return targets_chunk.reshape(-1, 4, 5)
+
+    def get_save_keys(self) -> list:
+        return ["targets"]
+
+
+class WBosonTargetProcessor(TargetProcessor):
+    """Processes 2 tops and 2 W bosons separately."""
+
+    def __init__(self):
+        self.top_transformers = None
+        self.W_transformers = None
+
+    def get_target_count(self) -> int:
+        return 2  # Returns per target type (Tops and Ws)
+
+    def init_target_transformers(self) -> Tuple[tuple, tuple]:
+        # This returns the TOP transformers
+        top_trans = (
+            LogMinMaxScaler(),
+            StandardScaler(),
+            PhiTransformer(),
+            LogMinMaxScaler(),
+        )
+        # This returns the W transformers, initialized separately in TopReconstructionDatasetFromH5
+        W_trans = (
+            LogMinMaxScaler(),
+            StandardScaler(),
+            PhiTransformer(),
+            LogMinMaxScaler(),
+        )
+        self.top_transformers = top_trans
+        self.W_transformers = W_trans
+        return top_trans, W_trans # The main method expects a tuple of tuples
+
+    def process_targets(self, targets_dict: Dict[str, np.ndarray], is_temp: bool) -> Dict[str, np.ndarray]:
+        """Apply target-specific processing for both Tops and Ws."""
+        
+        # NOTE: targets_dict contains both "targets" (tops) and "W_targets" (Ws)
+        
+        # Process Tops
+        tops_chunk = targets_dict["targets"]
+        #if not is_temp:
+            # Assume feature 3 is mass (placeholder), calculate energy
+            #tops_chunk[..., 3] = calculate_energy_value(tops_chunk[..., :])
+        targets_dict["targets"] = tops_chunk
+
+        # Process Ws
+        W_chunk = targets_dict["W_targets"]
+        #if not is_temp:
+            # Assume feature 3 is mass (placeholder), calculate energy
+            #W_chunk[..., 3] = calculate_energy_value(W_chunk[..., :])
+        targets_dict["W_targets"] = W_chunk
+
+        return targets_dict
+
+    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
+        # This method is not used directly by the main processor for this class, 
+        # as targets_dict is handled directly. Leaving the original return for consistency.
+        return targets_chunk.reshape(-1, 2, 5)
+
+    def get_save_keys(self) -> list:
+        return ["targets", "W_targets"]
+
+# --- InteractionProcessor Definitions (Unchanged) ---
+
+class InteractionProcessor(ABC):
+    """Abstract base for interaction matrix handling."""
+
+    @abstractmethod
+    def needs_interaction(self) -> bool:
+        pass
+
+    @abstractmethod
+    def init_interaction_transformer(self):
+        pass
+
+
+class NoInteractionProcessor(InteractionProcessor):
+    def needs_interaction(self) -> bool:
+        return False
+
+    def init_interaction_transformer(self):
+        return None
+
+
+class WithInteractionProcessor(InteractionProcessor):
+    def needs_interaction(self) -> bool:
+        return True
+
+    def init_interaction_transformer(self):
+        return LogMinMaxScaler()
+
+
+# --- TargetExtractor Definitions (Unchanged for Truth) ---
+
+class TargetExtractor(ABC):
+    """Abstract base for different target extraction strategies."""
+
+    @abstractmethod
+    def extract_targets(
+        self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
+    ) -> Dict[str, np.ndarray]: # Changed return type to Dict[str, np.ndarray] for W_targets
+        """Extract targets from data. Returns dictionary of targets."""
+        pass
+
+
+class TruthTargetExtractor(TargetExtractor):
+    """Extracts targets directly from truth information."""
+
+    def extract_targets(
+        self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Simply return tops as 'targets'."""
+        top_quark_mask = np.abs(targets_chunk[..., 4]) == 6
+        extracted = targets_chunk[top_quark_mask]
+        
+        # Truth data often contains all particles, but for simplicity, we only extract tops here
+        # For full truth extraction including Ws, this would need complex masking/sorting.
+        # We assume the standard case returns only Tops unless Ws are explicitly matched/extracted.
+        return {"targets": extracted}
+
+
+# --- Optimized and Extended ReconstructedTargetExtractor (Crucial Changes) ---
+import numpy as np
+import vector
+from typing import Dict, Any, Tuple
+
+class ReconstructedTargetExtractor:
+    """
+    Reconstructs targets (Tops and W bosons) from jets using a fully 
+    VECTORIZED grouped reduction approach (no Python loop over events).
+    """
+
+    def __init__(self, tag_top1: np.ndarray = None, tag_top2: np.ndarray = None,
+                 tag_W1: np.ndarray = None, tag_W2: np.ndarray = None):
+        # Set default truth-matching tags
+        self.tag_top1 = tag_top1 if tag_top1 is not None else np.array([1, 2, 3])
+        self.tag_top2 = tag_top2 if tag_top2 is not None else np.array([4, 5, 6])
+        self.tag_W1 = tag_W1 if tag_W1 is not None else np.array([2, 3])
+        self.tag_W2 = tag_W2 if tag_W2 is not None else np.array([5, 6])
+        
+        # Define tasks as a list of (tags, array_name, index) for simplified loop placement
+        self.reco_tasks = [
+            (self.tag_top1, "tops", 0),  
+            (self.tag_top2, "tops", 1),  
+            (self.tag_W1, "Ws", 0),      
+            (self.tag_W2, "Ws", 1),      
+        ]
+
+    def extract_targets(
+        self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """
+        Reconstruct top quarks and W bosons by summing truth-matched jets 
+        using fully vectorized NumPy Grouped Array Reduction (np.bincount).
+        
+        Args:
+            jet_chunk (np.ndarray): Input jet array (B, P, F) where F includes 
+                                    pt, eta, phi, mass, and truthmatch tag (index 6).
+            targets_chunk (np.ndarray): Input truth targets (unused for reconstruction, 
+                                        but included for method signature consistency).
+
+        Returns:
+            Dict[str, np.ndarray]: Dictionary containing {"targets": reco_tops_full, 
+                                                         "W_targets": reco_Ws_full}.
+        """
+        B, P, F = jet_chunk.shape
+        
+        # --- 1. Prepare Flattened Inputs (B*P jets) ---
+        
+        jet_tags = jet_chunk[..., 6] # Tags (float/int)
+        
+        # Create a single vector array for ALL jets (B*P elements)
+        flat_jets_vec = vector.zip({
+            "pt": jet_chunk[..., 0].flatten(),
+            "eta": jet_chunk[..., 1].flatten(),
+            "phi": jet_chunk[..., 2].flatten(),
+            "energy": jet_chunk[..., 3].flatten(),
+        })
+        
+        # Create a group index for every jet (The event ID, 0 to B-1)
+        event_indices = np.repeat(np.arange(B), P) # Shape (B*P,)
+        flat_tags = jet_tags.flatten()
+        
+        # Convert to Cartesian (Px, Py, Pz, E) for accurate linear summation
+        flat_px = flat_jets_vec.px.to_numpy()
+        flat_py = flat_jets_vec.py.to_numpy()
+        flat_pz = flat_jets_vec.pz.to_numpy()
+        flat_E = flat_jets_vec.energy.to_numpy()
+        
+        # Initialize the output arrays (B events, 2 particles, 4 features: pt, eta, phi, mass)
+        reco_tops = np.zeros((B, 2, 4), dtype=np.float32)
+        reco_Ws = np.zeros((B, 2, 4), dtype=np.float32)
+        
+        # --- 2. Vectorized Reconstruction Loop (Over 4 Target Types) ---
+        
+        for tags, target_type, idx in self.reco_tasks:
+            
+            # 2a. Mask: Select jets matched to the current target 
+            tag_mask = np.isin(flat_tags, tags)
+            
+            # 2b. Filter: Select only the indices for matched jets
+            matched_indices = event_indices[tag_mask]
+            
+            if matched_indices.size == 0:
+                continue
+            
+            # 2c. Grouped Reduction (np.bincount)
+            # Sum Cartesian components (Px, Py, Pz, E) grouped by event ID
+            sum_px = np.bincount(matched_indices, weights=flat_px[tag_mask], minlength=B)
+            sum_py = np.bincount(matched_indices, weights=flat_py[tag_mask], minlength=B)
+            sum_pz = np.bincount(matched_indices, weights=flat_pz[tag_mask], minlength=B)
+            sum_E = np.bincount(matched_indices, weights=flat_E[tag_mask], minlength=B)
+            
+            # 2d. Reconstruct the resulting 4-vector from the summed components
+            reco_cartesian = vector.zip({
+                "px": sum_px, 
+                "py": sum_py, 
+                "pz": sum_pz, 
+                "E": sum_E
+            })
+            
+            # 2e. Convert back to Polar coordinates (pt, eta, phi, mass)
+            reco_pteta_mass = np.stack([
+                reco_cartesian.pt.to_numpy(),
+                reco_cartesian.eta.to_numpy(),
+                reco_cartesian.phi.to_numpy(),
+                reco_cartesian.E.to_numpy(),
+            ], axis=-1) # Shape (B, 4)
+            
+            # 2f. Placement: Store the result in the correct output array and index
+            if target_type == "tops":
+                reco_tops[:, idx, :] = reco_pteta_mass
+            else: # target_type == "Ws"
+                reco_Ws[:, idx, :] = reco_pteta_mass
+
+        # --- 3. Final Output Formatting ---
+        
+        # Append the 5th column (placeholder ID/PDG=0) for consistency with the rest of the pipeline
+        reco_tops_full = np.concatenate([reco_tops, np.full((B, 2, 1), 0, dtype=np.float32)], axis=-1)
+        reco_Ws_full = np.concatenate([reco_Ws, np.full((B, 2, 1), 0, dtype=np.float32)], axis=-1)
+        
+        return {"targets": reco_tops_full, "W_targets": reco_Ws_full}
+
+# --- TopReconstructionDatasetFromH5 (Core Logic) ---
 
 class TopReconstructionDatasetFromH5:
-    def __init__(self, config):
+    """Unified dataset preprocessor for top reconstruction variants."""
 
-        ## Use the save information from the step prior for ease.
-        self.raw_file_config = config["root_dataset_prepper"]
-        self.preprocessing_config = config.get("preprocessing", None)
-
-
-        raw_file_prefix_and_path = os.path.join(self.raw_file_config["save_path"],
-                                                 self.raw_file_config["save_file_prefix"])
-        
-
-        save_dir = Path(self.preprocessing_config["save_path"])
-        save_file_prefix_and_path = os.path.join(self.preprocessing_config["save_path"],
-                                                 self.preprocessing_config["save_file_prefix"])
-        
-    
-        stream_size = self.preprocessing_config["stream_size"]
-
-        
-
-        (raw_train,  
-        raw_val,
-        raw_test) = (raw_file_prefix_and_path +"train.h5",
-                    raw_file_prefix_and_path + "val.h5",
-                    raw_file_prefix_and_path + "test.h5") 
-        
-
-        (save_train,
-         save_val,
-         save_test) = (
-                save_file_prefix_and_path +"train.h5",
-                save_file_prefix_and_path + "val.h5",
-                save_file_prefix_and_path + "test.h5"
-         )
-
-        ## Temp is the filtered train set
-        temp_file = "temp_file.h5"
-        temp =  save_file_prefix_and_path + temp_file
-        self.last_temp_idx = 0
-
-        temp_exits = Path(temp)
-        temp_exits.touch(exist_ok= True)
-        print(temp_exits)
-        self._init_transformers()
-
-        read_file_order = (raw_train, temp, raw_val, raw_test)
-        write_file_order = (temp, save_train, save_val, save_test)
-
-        for read, write in zip(read_file_order, write_file_order) :
-            with h5py.File(read, "r") as read_file, h5py.File(write, "w") as write_file:
-                if write == save_train:
-                    joblib.dump(self.target_transformers, save_dir / "target_transforms.joblib")
-                file_len = read_file["jet"].shape[0]
-                TopReconstructionDatasetFromH5._create_datagroups(write_file)
-                ## Go through the batches
-                for i in range(0, file_len, stream_size):
-                    ## Read the batches
-                    jet_chunk = read_file["jet"][i: i + stream_size]
-                    event_chunk = read_file["event"][i: i + stream_size]
-                    targets_chunk = read_file["targets"][i: i + stream_size]
-          
-                    ## Select top quarks 
-                    if read == temp:
-                        print(targets_chunk.shape)
-                    top_quark_selection = self._select_top_quarks(targets_chunk)
-                    targets_chunk = targets_chunk[top_quark_selection].reshape(-1, 2, 5)
-                    if read != temp:
-                        targets_chunk[..., 3] = calculate_energy_value(targets_chunk[..., :])
-                    ## Get mask of events to cut
-                    mask = self._selection_cuts(
-                        jet_chunk,
-                        event_chunk,
-                        targets_chunk
-                    ).squeeze()
-
-                    ## Apply the mask using helper function
-                    jet_chunk, event_chunk, targets_chunk = apply_mask((jet_chunk, event_chunk, targets_chunk), mask)
-
-                    if read == raw_train:
-                        ## Transform and save temp data
-                        self._fit_transformers(jet_chunk, targets_chunk)
-                        self._save_data_chunks(write_file, jet_chunk, event_chunk, jet_chunk[..., 0],targets_chunk)
-                    else:
-                        ## Transform and save data
-                        jet_chunk, targets_chunk = self._transform(jet_chunk, targets_chunk)
-                        jet_chunk, src_mask_chunk = self._pad_and_src_mask(jet_chunk)
-                        self._save_data_chunks(write_file, jet_chunk, event_chunk,src_mask_chunk ,targets_chunk)
-                        if read == temp:
-                            self.last_temp_idx += jet_chunk.shape[0]
-                
-    def _init_transformers(self):
-        self.jet_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler(),
-            LogMinMaxScaler(),
-        )
-        self.target_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            StandardScaler(),
-            LogMinMaxScaler()
-        )
-    
-    def _selection_cuts(self, 
-                        jet,
-                        event,
-                        target):
-        event_selection_mask = (event[:, 2] == 1).reshape(-1, 1)
-        return event_selection_mask
-    
-    def _select_top_quarks(
-            self,
-            target
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        target_processor: TargetProcessor,
+        interaction_processor: InteractionProcessor = None,
+        target_extractor: TargetExtractor = None,
     ):
-        target_pid = target[..., 4]
-        top_quark_mask = (abs(target_pid) == 6)
-        return top_quark_mask
-
-    def _fit_transformers(self, jet, targets):
-        
-        N, P, F = jet.shape
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-        ## Remove pid information don't need it 
-        targets = targets[...,0:4]
-        jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 2, 4)
-
-        jet_variables = (jet_pt,jet_et,jet_phi,jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
-        target_variables = (target_pt, target_et, target_phi, target_mass) = targets[:, pt], targets[:,eta],targets[:, phi], targets[:, mass]
-
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-            
-        for variable, transformation in zip(target_variables, self.target_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-    
-    def _save_data_chunks(self, file, jet_chunk, event_chunk,src_mask_chunk, targets_chunk):
-
-        jet_ds = file["jet"]
-        event_ds = file["event"]
-        target_ds = file["targets"]
-        src_ds = file["src_mask"]
-        _, N, F = jet_chunk.shape
-        _, M, P = targets_chunk.shape
-        print(src_mask_chunk.shape)
-        cur_len = file["jet"].shape[0]
-        n0, n1 = cur_len, cur_len + jet_chunk.shape[0]
-
-        jet_ds.resize((n1 , N, F))
-        src_ds.resize((n1 , N))
-        event_ds.resize((n1 , 3) )
-        target_ds.resize((n1 , M, P))
-        
-        jet_ds[n0 : n1] = jet_chunk.astype("float32")
-        src_ds[n0 : n1] = src_mask_chunk.astype("float32")
-        event_ds[n0 : n1] = event_chunk.astype("float32")
-        target_ds[n0 : n1] = targets_chunk.astype("float32")
-
-
-    def _transform(self, jet, targets):
-        
-        ## Same process of the fit transform function - get the in the right shape and seperate it.
-        N, P, F = jet.shape
-        jet_btag = jet[..., 5 ].reshape(N, P, 1)
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-        ## Remove pid information don't need it 
-        targets = targets[...,0:4]
-        jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 2, 4)
-        # Sepererate and store in a tuple for easy iteration
-        jet_variables = (jet_pt,jet_et,jet_phi,
-                         jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
-        target_variables = (target_pt, target_et, 
-                            target_phi, target_mass) = targets[:, pt], targets[:,eta], targets[:, phi], targets[:, mass]
-        
-        jet_transformed = []
-        target_transformed = []
-
-        # Transformed the data and append to list
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            jet_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, P, -1 ))
-        for variable, transformation in zip(target_variables, self.target_transformers):
-            target_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, 2, -1))
-        
-        jet = np.concatenate(jet_transformed, axis = - 1)
-        jet = np.concatenate((jet, jet_btag), axis = 2 )
-        target = np.concatenate(target_transformed, axis = -1)
-
-        
-        return jet, target
-        
-    def _pad_and_src_mask(self, jet_chunk, pad_value  = -99):
-        self.pad_value = pad_value
-
-        src_mask = np.all(np.isnan(jet_chunk), axis = -1)
-        
-        jet_chunk = np.nan_to_num(jet_chunk, pad_value)
-
-        return jet_chunk, src_mask
-    
-
-    @staticmethod
-    def _create_datagroups(file):
-        ## Creates the following datasets in a h5py file object
-        jet_ds = file.create_dataset(
-            "jet",
-            shape = (0,0,0),
-            maxshape = (None, None,None),
-             compression="gzip",                
-            compression_opts=4,  
-        )
-        event_ds = file.create_dataset(
-            "event",
-            shape = (0,0),        
-            compression="gzip",                
-            compression_opts=4,   
-            maxshape = (None, None)
-        )
-        target_ds = file.create_dataset(
-            "targets",
-            shape = (0,0,0),
-            maxshape = (None, None,None),     
-            compression="gzip", 
-            compression_opts=4,               
-        )
-        file.create_dataset(
-            "src_mask",
-            shape = (0,0),
-            maxshape = (None,None),         
-            compression="gzip",                 
-            compression_opts=4,   
-        )
-
-
-class CartesianTopReconstructionDatasetFromH5:
-    def __init__(self, config):
-
-        ## Use the save information from the step prior for ease.
         self.raw_file_config = config["root_dataset_prepper"]
         self.preprocessing_config = config.get("preprocessing", None)
+        self.target_processor = target_processor
+        self.interaction_processor = interaction_processor or NoInteractionProcessor()
+        self.target_extractor = target_extractor or TruthTargetExtractor()
 
-
-        raw_file_prefix_and_path = os.path.join(self.raw_file_config["save_path"],
-                                                 self.raw_file_config["save_file_prefix"])
-        
-
-        save_dir = Path(self.preprocessing_config["save_path"])
-        save_file_prefix_and_path = os.path.join(self.preprocessing_config["save_path"],
-                                                 self.preprocessing_config["save_file_prefix"])
-        
-    
-        stream_size = self.preprocessing_config["stream_size"]
-
-        
-
-        (raw_train,  
-        raw_val,
-        raw_test) = (raw_file_prefix_and_path +"train.h5",
-                    raw_file_prefix_and_path + "val.h5",
-                    raw_file_prefix_and_path + "test.h5") 
-        
-
-        (save_train,
-         save_val,
-         save_test) = (
-                save_file_prefix_and_path +"train.h5",
-                save_file_prefix_and_path + "val.h5",
-                save_file_prefix_and_path + "test.h5"
-         )
-
-        ## Temp is the filtered train set
-        temp_file = "temp_file.h5"
-        temp =  save_file_prefix_and_path + temp_file
-        self.last_temp_idx = 0
-
-        temp_exits = Path(temp)
-        temp_exits.touch(exist_ok= True)
-        print(temp_exits)
-        self._init_transformers()
-
-        read_file_order = (raw_train, temp, raw_val, raw_test)
-        write_file_order = (temp, save_train, save_val, save_test)
-
-        for read, write in zip(read_file_order, write_file_order) :
-            with h5py.File(read, "r") as read_file, h5py.File(write, "w") as write_file:
-                if write == save_train:
-                    joblib.dump(self.target_transformers, save_dir / "target_transforms.joblib")
-                file_len = read_file["jet"].shape[0]
-                TopReconstructionDatasetFromH5._create_datagroups(write_file)
-                ## Go through the batches
-                for i in range(0, file_len, stream_size):
-                    ## Read the batches
-                    jet_chunk = read_file["jet"][i: i + stream_size]
-                    event_chunk = read_file["event"][i: i + stream_size]
-                    targets_chunk = read_file["targets"][i: i + stream_size]
-          
-                    ## Select top quarks 
-                    if read == temp:
-                        print(targets_chunk.shape)
-                    top_quark_selection = self._select_top_quarks(targets_chunk)
-                    targets_chunk = targets_chunk[top_quark_selection].reshape(-1, 2, 5)
-                    if read != temp:
-                        targets_chunk[..., :4] = convert_polar_to_cartesian(targets_chunk)
-                    ## Get mask of events to cut
-                    mask = self._selection_cuts(
-                        jet_chunk,
-                        event_chunk,
-                        targets_chunk
-                    ).squeeze()
-
-                    ## Apply the mask using helper function
-                    jet_chunk, event_chunk, targets_chunk = apply_mask((jet_chunk, event_chunk, targets_chunk), mask)
-
-                    if read == raw_train:
-                        ## Transform and save temp data
-                        self._fit_transformers(jet_chunk, targets_chunk)
-                        self._save_data_chunks(write_file, jet_chunk, event_chunk, jet_chunk[..., 0],targets_chunk)
-                    else:
-                        ## Transform and save data
-                        jet_chunk, targets_chunk = self._transform(jet_chunk, targets_chunk)
-                        jet_chunk, src_mask_chunk = self._pad_and_src_mask(jet_chunk)
-                        self._save_data_chunks(write_file, jet_chunk, event_chunk,src_mask_chunk ,targets_chunk)
-                        if read == temp:
-                            self.last_temp_idx += jet_chunk.shape[0]
-                
-    def _init_transformers(self):
-        self.jet_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler(),
-            LogMinMaxScaler(),
-        )
-        self.target_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            StandardScaler(),
-            StandardScaler()
-        )
-    
-    def _selection_cuts(self, 
-                        jet,
-                        event,
-                        target):
-        event_selection_mask = (event[:, 2] == 1).reshape(-1, 1)
-        return event_selection_mask
-    
-    def _select_top_quarks(
-            self,
-            target
-    ):
-        target_pid = target[..., 4]
-        top_quark_mask = (abs(target_pid) == 6)
-        return top_quark_mask
-
-    def _fit_transformers(self, jet, targets):
-        
-        N, P, F = jet.shape
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-        ## Remove pid information don't need it 
-        targets = targets[...,0:4]
-        jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 2, 4)
-
-        jet_variables = (jet_pt,jet_et,jet_phi,jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
-        target_variables = (target_pt, target_et, target_phi, target_mass) = targets[:, pt], targets[:,eta],targets[:, phi], targets[:, mass]
-
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-            
-        for variable, transformation in zip(target_variables, self.target_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-    
-    def _save_data_chunks(self, file, jet_chunk, event_chunk,src_mask_chunk, targets_chunk):
-
-        jet_ds = file["jet"]
-        event_ds = file["event"]
-        target_ds = file["targets"]
-        src_ds = file["src_mask"]
-        _, N, F = jet_chunk.shape
-        _, M, P = targets_chunk.shape
-        print(src_mask_chunk.shape)
-        cur_len = file["jet"].shape[0]
-        n0, n1 = cur_len, cur_len + jet_chunk.shape[0]
-
-        jet_ds.resize((n1 , N, F))
-        src_ds.resize((n1 , N))
-        event_ds.resize((n1 , 3) )
-        target_ds.resize((n1 , M, P))
-        
-        jet_ds[n0 : n1] = jet_chunk.astype("float32")
-        src_ds[n0 : n1] = src_mask_chunk.astype("float32")
-        event_ds[n0 : n1] = event_chunk.astype("float32")
-        target_ds[n0 : n1] = targets_chunk.astype("float32")
-
-
-    def _transform(self, jet, targets):
-        
-        ## Same process of the fit transform function - get the in the right shape and seperate it.
-        N, P, F = jet.shape
-        jet_btag = jet[..., 5 ].reshape(N, P, 1)
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-        ## Remove pid information don't need it 
-        targets = targets[...,0:4]
-        jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 2, 4)
-        # Sepererate and store in a tuple for easy iteration
-        jet_variables = (jet_pt,jet_et,jet_phi,
-                         jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
-        target_variables = (target_pt, target_et, 
-                            target_phi, target_mass) = targets[:, pt], targets[:,eta], targets[:, phi], targets[:, mass]
-        
-        jet_transformed = []
-        target_transformed = []
-
-        # Transformed the data and append to list
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            jet_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, P, -1 ))
-        for variable, transformation in zip(target_variables, self.target_transformers):
-            target_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, 2, -1))
-        
-        jet = np.concatenate(jet_transformed, axis = - 1)
-        jet = np.concatenate((jet, jet_btag), axis = 2 )
-        target = np.concatenate(target_transformed, axis = -1)
-
-        
-        return jet, target
-        
-    def _pad_and_src_mask(self, jet_chunk, pad_value  = -99):
-        self.pad_value = pad_value
-
-        src_mask = np.all(np.isnan(jet_chunk), axis = -1)
-        
-        jet_chunk = np.nan_to_num(jet_chunk, pad_value)
-
-        return jet_chunk, src_mask
-    
-
-    @staticmethod
-    def _create_datagroups(file):
-        ## Creates the following datasets in a h5py file object
-        jet_ds = file.create_dataset(
-            "jet",
-            shape = (0,0,0),
-            maxshape = (None, None,None),
-             compression="gzip",                
-            compression_opts=4,  
-        )
-        event_ds = file.create_dataset(
-            "event",
-            shape = (0,0),        
-            compression="gzip",                
-            compression_opts=4,   
-            maxshape = (None, None)
-        )
-        target_ds = file.create_dataset(
-            "targets",
-            shape = (0,0,0),
-            maxshape = (None, None,None),     
-            compression="gzip", 
-            compression_opts=4,               
-        )
-        file.create_dataset(
-            "src_mask",
-            shape = (0,0),
-            maxshape = (None,None),         
-            compression="gzip",                 
-            compression_opts=4,   
-        )
-
-
-class InteractionTopReconstructionDatasetFromH5:
-    def __init__(self, config):
-
-        ## Use the save information from the step prior for ease.
-        self.raw_file_config = config["root_dataset_prepper"]
-        self.preprocessing_config = config.get("preprocessing", None)
-
-
-        raw_file_prefix_and_path = os.path.join(self.raw_file_config["save_path"],
-                                                 self.raw_file_config["save_file_prefix"])
-        
-
-        save_dir = Path(self.preprocessing_config["save_path"])
-        save_file_prefix_and_path = os.path.join(self.preprocessing_config["save_path"],
-                                                 self.preprocessing_config["save_file_prefix"])
-        
-    
-        stream_size = self.preprocessing_config["stream_size"]
-
-        
-
-        (raw_train,  
-        raw_val,
-        raw_test) = (raw_file_prefix_and_path +"train.h5",
-                    raw_file_prefix_and_path + "val.h5",
-                    raw_file_prefix_and_path + "test.h5") 
-        
-
-        (save_train,
-         save_val,
-         save_test) = (
-                save_file_prefix_and_path +"train.h5",
-                save_file_prefix_and_path + "val.h5",
-                save_file_prefix_and_path + "test.h5"
-         )
-        Path(self.preprocessing_config["save_path"]).mkdir(exist_ok = True)
-        ## Temp is the filtered train set
-        temp_file = "temp_file.h5"
-        temp =  save_file_prefix_and_path + temp_file
-        self.last_temp_idx = 0
-
-        temp_exits = Path(temp)
-        temp_exits.touch(exist_ok= True)
-        print(temp_exits)
-        self._init_transformers()
-
-        read_file_order = (raw_train, temp, raw_val, raw_test)
-        write_file_order = (temp, save_train, save_val, save_test)
-
-        for read, write in zip(read_file_order, write_file_order) :
-            with h5py.File(read, "r") as read_file, h5py.File(write, "w") as write_file:
-                if write == save_train:
-                    joblib.dump(self.target_transformers, save_dir / "target_transforms.joblib")
-                
-                file_len, N, P = read_file["jet"].shape
-                _ , M, Q = read_file["targets"].shape
-                
-                self._create_datagroups(write_file, file_len, N, M, P, Q)
-                ## Go through the batches
-                for i in range(0, file_len, stream_size):
-                    ## Read the batches
-                    jet_chunk = read_file["jet"][i: i + stream_size]
-                    event_chunk = read_file["event"][i: i + stream_size]
-                    targets_chunk = read_file["targets"][i: i + stream_size]
-                    if read == temp:
-                        interaction_chunk = read_file["interactions"][i: i + stream_size]
-                    ## Select top quarks 
-                    if read == temp:
-                        print(targets_chunk.shape)
-                    top_quark_selection = self._select_top_quarks(targets_chunk)
-                    targets_chunk = targets_chunk[top_quark_selection].reshape(-1, 4, 5)
-                   
-                    ## Get mask of events to cut
-                    mask = self._selection_cuts(
-                        jet_chunk,
-                        event_chunk,
-                        targets_chunk
-                    ).squeeze()
-
-                    ## Apply the mask using helper function
-                    jet_chunk, event_chunk, targets_chunk = apply_mask((jet_chunk, event_chunk, targets_chunk), mask)
-                    if read != temp:
-                        targets_chunk[..., 3] = calculate_energy_value(targets_chunk[..., :])
-                        interaction_chunk = create_interaction_matrix(jet_chunk)
-                    if read == raw_train:
-                        ## Transform and save temp data
-                        self._fit_transformers(jet_chunk, targets_chunk, interaction_chunk)
-                        self._save_data_chunks(write_file, jet_chunk, interaction_chunk,event_chunk, jet_chunk[..., 0],targets_chunk)
-                    else:
-                        ## Transform and save data
-                        jet_chunk, targets_chunk, interaction_chunk = self._transform(jet_chunk, targets_chunk, interaction_chunk)
-                        jet_chunk, src_mask_chunk, interaction_chunk = self._pad_and_src_mask(jet_chunk, interaction_chunk)
-                        self._save_data_chunks(write_file, jet_chunk, interaction_chunk,event_chunk,src_mask_chunk ,targets_chunk)
-                        if read == temp:
-                            self.last_temp_idx += jet_chunk.shape[0]
-                
-    def _init_transformers(self):
-        self.jet_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler(),
-            LogMinMaxScaler(),
-        )
-        self.target_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler()
-        )
-
-        self._interaction_transformers = LogMinMaxScaler()
-    
-    def _selection_cuts(self, 
-                        jet,
-                        event,
-                        target):
-        event_selection_mask = (event[:, 2] == 1).reshape(-1, 1)
-        return event_selection_mask
-    
-    def _select_top_quarks(
-            self,
-            target
-    ):
-        target_pid = target[..., 4]
-        top_quark_mask = (abs(target_pid) == 6)
-        return top_quark_mask
-
-    def _fit_transformers(self, jet, targets, interactions):
-        
-        N, P, F = jet.shape
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-        ## Remove pid information don't need it 
-        targets = targets[...,0:4]
-        jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 4, 4)
-
-        jet_variables = (jet_pt,jet_et,jet_phi,jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
-        target_variables = (target_pt, target_et, target_phi, target_mass) = targets[:, pt], targets[:,eta],targets[:, phi], targets[:, mass]
-
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-            
-        for variable, transformation in zip(target_variables, self.target_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-
-        self._interaction_transformers.partial_fit(interactions.reshape(N * P * P, -1))
-
-    def _save_data_chunks(self, file, jet_chunk, interaction_chunk,event_chunk,src_mask_chunk, targets_chunk):
-
-        jet_ds = file["jet"]
-        event_ds = file["event"]
-        target_ds = file["targets"]
-        src_ds = file["src_mask"]
-        interaction_ds = file["interactions"]
-
-        _, N, F = jet_chunk.shape
-        _, M, P = targets_chunk.shape
-        print(src_mask_chunk.shape)
-        cur_len = file["jet"].shape[0]
-        n0, n1 = cur_len, cur_len + jet_chunk.shape[0]
-
-        jet_ds.resize((n1,) + jet_chunk.shape[ 1:])
-        src_ds.resize((n1 ,) + src_ds.shape[1:])
-        event_ds.resize((n1 , 3) )
-        target_ds.resize((n1 , M, P))
-        interaction_ds.resize((n1, N, N, 4))
-        
-        jet_ds[n0 : n1] = jet_chunk.astype("float32")
-        src_ds[n0 : n1] = src_mask_chunk.astype("float32")
-        event_ds[n0 : n1] = event_chunk.astype("float32")
-        target_ds[n0 : n1] = targets_chunk.astype("float32")
-        interaction_ds[n0 : n1] = interaction_chunk.astype("float32")
-
-    def _transform(self, jet, targets, interactions):
-        
-        ## Same process of the fit transform function - get the in the right shape and seperate it.
-        N, P, F = jet.shape
-        jet_btag = jet[..., 5 ].reshape(N, P, 1)
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-        ## Remove pid information don't need it 
-        targets = targets[...,0:4]
-        jet = jet.reshape(N* P, F)
-        targets = targets.reshape(N * 4, 4)
-        # Sepererate and store in a tuple for easy iteration
-        jet_variables = (jet_pt,jet_et,jet_phi,
-                         jet_mass,jet_e) = jet[:, pt], jet[:, eta],jet[:, phi], jet[:, mass], jet[:, e]
-        target_variables = (target_pt, target_et, 
-                            target_phi, target_mass) = targets[:, pt], targets[:,eta], targets[:, phi], targets[:, mass]
-        
-        jet_transformed = []
-        target_transformed = []
-
-        # Transformed the data and append to list
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            jet_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, P, -1 ))
-        for variable, transformation in zip(target_variables, self.target_transformers):
-            target_transformed.append(transformation.transform(variable.reshape(-1, 1)).reshape(N, 4, -1))
-        
-        jet = np.concatenate(jet_transformed, axis = - 1)
-        jet = np.concatenate((jet, jet_btag), axis = 2 )
-        target = np.concatenate(target_transformed, axis = -1)
-
-        interactions = self._interaction_transformers.transform(interactions.reshape(N * P * P, -1)).reshape(N, P, P, -1)
-
-        
-        return jet, target, interactions
-        
-    def _pad_and_src_mask(self, jet_chunk,interaction_chunk, pad_value  = -99):
-        self.pad_value = pad_value
-
-        src_mask = np.all(np.isnan(jet_chunk), axis = -1)
-        
-        jet_chunk = np.nan_to_num(jet_chunk, pad_value)
-        interaction_chunk = np.nan_to_num(interaction_chunk, -np.inf)
-
-        return jet_chunk, src_mask, interaction_chunk
-    
-
-    def _create_datagroups(self, file, *args):
-        ## Creates the following datasets in a h5py file object
-        file_len, N, M, P, Q = args
-
-
-        jet_ds = file.create_dataset(
-            "jet",
-            shape = (0,N,P),
-            maxshape = (None, N, 7),
-             compression="gzip",                
-            compression_opts=4,  
-        )
-        event_ds = file.create_dataset(
-            "event",
-            shape = (0,0),        
-            compression="gzip",                
-            compression_opts=4,   
-            maxshape = (None, None)
-        )
-        target_ds = file.create_dataset(
-            "targets",
-            shape = (0,4,Q),
-            maxshape = (None, 4,Q + 1),     
-            compression="gzip", 
-            compression_opts=4,               
-        )
-        interaction_ds = file.create_dataset(
-            "interactions",
-            shape = (0,N,N,4),
-            maxshape = (None, N, N, 4),
-            compression = "gzip",
-            compression_opts = 4,
-        )
-        file.create_dataset(
-            "src_mask",
-            shape = (0,N),
-            maxshape = (None,N),         
-            compression="gzip",                 
-            compression_opts=4,   
-        )
-
-
-class WBosonInteractionTopReconstructionDatasetFromH5:
-    def __init__(self, config):
-
-        self.raw_file_config = config["root_dataset_prepper"]
-        self.preprocessing_config = config.get("preprocessing", None)
-
-        raw_file_prefix_and_path = os.path.join(
+        self.raw_file_prefix_and_path = self._construct_path(
             self.raw_file_config["save_path"],
             self.raw_file_config["save_file_prefix"],
         )
-
-        save_dir = Path(self.preprocessing_config["save_path"])
-        save_file_prefix_and_path = os.path.join(
+        self.save_dir = Path(self.preprocessing_config["save_path"])
+        self.save_file_prefix_and_path = self._construct_path(
             self.preprocessing_config["save_path"],
             self.preprocessing_config["save_file_prefix"],
         )
-
         self.stream_size = self.preprocessing_config["stream_size"]
 
-        self.raw_train = raw_file_prefix_and_path + "train.h5"
-        self.raw_val   = raw_file_prefix_and_path + "val.h5"
-        self.raw_test  = raw_file_prefix_and_path + "test.h5"
-
-        self.save_train = save_file_prefix_and_path + "train.h5"
-        self.save_val   = save_file_prefix_and_path + "val.h5"
-        self.save_test  = save_file_prefix_and_path + "test.h5"
-
-        Path(self.preprocessing_config["save_path"]).mkdir(exist_ok=True)
-
         self._init_transformers()
+        self._process_pipeline()
 
-        # 1) Fit transformers on train only
-        self._fit_on_file(self.raw_train)
+    @staticmethod
+    def _construct_path(base_path: str, prefix: str) -> str:
+        return f"{base_path}/{prefix}"
 
-        # Save transformers (tops and Ws separately)
-        joblib.dump(self.target_transformers, save_dir / "target_transforms.joblib")
-        joblib.dump(self.W_target_transformers, save_dir / "W_target_transforms.joblib")
-
-        # 2) Transform and save train/val/test
-        self._transform_file(self.raw_train, self.save_train)
-        self._transform_file(self.raw_val,   self.save_val)
-        self._transform_file(self.raw_test,  self.save_test)
-
-    # -----------------------------
-    # Init and selection logic
-    # -----------------------------
+    # ... _init_transformers and _process_pipeline are unchanged ...
+    # (Leaving them out for brevity, assuming they are in the class)
     def _init_transformers(self):
         self.jet_transformers = (
             LogMinMaxScaler(),
@@ -807,370 +416,536 @@ class WBosonInteractionTopReconstructionDatasetFromH5:
             LogMinMaxScaler(),
             LogMinMaxScaler(),
         )
-        # Top quark targets
-        self.target_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler(),
+        
+        is_WBoson_processor = isinstance(self.target_processor, WBosonTargetProcessor)
+        
+        if is_WBoson_processor:
+            top_trans, W_trans = self.target_processor.init_target_transformers()
+            self.target_transformers = top_trans
+            self.W_target_transformers = W_trans
+        else:
+            self.target_transformers = self.target_processor.init_target_transformers()
+            self.W_target_transformers = None
+        
+        self.invariant_mass_transformer = LogMinMaxScaler()
+
+        if self.interaction_processor.needs_interaction():
+            self.interaction_transformers = (
+                self.interaction_processor.init_interaction_transformer()
+            )
+
+    def _process_pipeline(self):
+        """Main processing pipeline: fit, then transform."""
+        raw_train = f"{self.raw_file_prefix_and_path}train.h5"
+        
+        # Fit on training data only
+        self._fit_transformers_from_file(raw_train)
+
+        # Save transformers
+        self.save_dir.mkdir(exist_ok=True, parents=True)
+        joblib.dump(
+            self.target_transformers,
+            self.save_dir / "target_transforms.joblib",
         )
-        # W boson targets – same structure but independent instances
-        self.W_target_transformers = (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler(),
+        if self.W_target_transformers is not None:
+             joblib.dump(
+                self.W_target_transformers,
+                self.save_dir / "W_target_transforms.joblib",
+            )
+        joblib.dump(
+            self.invariant_mass_transformer,
+            self.save_dir / "invariant_mass_transform.joblib",
         )
 
-        self._interaction_transformers = LogMinMaxScaler()
+        # Transform and save all splits
+        file_pairs = [
+            (raw_train, f"{self.save_file_prefix_and_path}train.h5"),
+            (f"{self.raw_file_prefix_and_path}val.h5", f"{self.save_file_prefix_and_path}val.h5"),
+            (f"{self.raw_file_prefix_and_path}test.h5", f"{self.save_file_prefix_and_path}test.h5"),
+        ]
 
-    def _selection_cuts(self, jet, event, target):
-        # Currently: require event[:, 2] == 1
-        event_selection_mask = (event[:, 2] == 1).reshape(-1)
-        return event_selection_mask
+        for raw_file, save_file in file_pairs:
+            self._transform_and_save_file(raw_file, save_file)
 
-    # -----------------------------
-    # High-level file passes
 
-    # -----------------------------
-    def _fit_on_file(self, raw_path):
-        """First pass on train file: fit transformers only, no writing."""
+    # ----------------------------------------------------------------------
+    # 1. CORE PROCESSING METHODS (Refactored)
+    # ----------------------------------------------------------------------
+
+    def _fit_transformers_from_file(self, raw_path: str):
+        """Fit all transformers on raw training file (with TQDM progress)."""
+        print(f"Fitting transformers on {raw_path}...")
         with h5py.File(raw_path, "r") as f:
-            jets    = f["jet"]
-            events  = f["event"]
-            targets = f["targets"]
+            file_len = f["jet"].shape[0]
+            
+            for i in tqdm(
+                range(0, file_len, self.stream_size),
+                desc="Fitting Chunks",
+                unit="chunk"
+            ):
+                jet_chunk = f["jet"][i : i + self.stream_size]
+                event_chunk = f["event"][i : i + self.stream_size]
+                targets_chunk = f["targets"][i : i + self.stream_size] # raw truth targets
 
-            file_len = jets.shape[0]
+                # Extract targets (truth or reconstructed) into a dictionary
+                targets_dict = self.target_extractor.extract_targets(jet_chunk, targets_chunk)
+                
+                # --- Step 1: Separate and Process Tops/Ws ---
+                tops_chunk = targets_dict["targets"]
+                ws_chunk = targets_dict.get("W_targets", None) # Get Ws if they exist
 
-            for i in range(0, file_len, self.stream_size):
-                jet_chunk    = jets[i: i + self.stream_size]
-                event_chunk  = events[i: i + self.stream_size]
-                targets_chunk = targets[i: i + self.stream_size]
+                if isinstance(self.target_processor, WBosonTargetProcessor):
+                    # Process both tops and Ws
+                    processed_dict = self.target_processor.process_targets(targets_dict, is_temp=True)
+                    tops_chunk = processed_dict["targets"]
+                    ws_chunk = processed_dict["W_targets"]
+                else:
+                    # Process tops only (W_targets remain None or extracted as is)
+                    tops_only = self.target_processor.process_targets(tops_chunk, is_temp=True)
+                    tops_chunk = tops_only["targets"]
 
-                # Select valid events and extract tops + Ws
-                selection = self._select_events_and_targets(jet_chunk, event_chunk, targets_chunk)
-                if selection is None:
-                    continue
+                # --- Step 2: Apply Selection Cuts ---
+                # Pass separated chunks to selection cuts
+                mask = self._selection_cuts_separate(jet_chunk, event_chunk, tops_chunk, ws_chunk)
+                
+                # --- Step 3: Apply Masking ---
+                # Pass separated chunks to apply_mask
+                arrays_to_mask = [jet_chunk, event_chunk, tops_chunk]
+                if ws_chunk is not None:
+                    arrays_to_mask.append(ws_chunk)
+                
+                masked_chunks = apply_mask(tuple(arrays_to_mask), mask)
+                
+                # Assign masked results back
+                jet_chunk, event_chunk, tops_chunk = masked_chunks[0:3]
+                if ws_chunk is not None:
+                    ws_chunk = masked_chunks[3]
+                
+                # --- Step 4: Reconstruct targets_dict for subsequent methods ---
+                targets_dict = {"targets": tops_chunk}
+                if ws_chunk is not None:
+                    targets_dict["W_targets"] = ws_chunk
 
-                jet_chunk, event_chunk, top_targets_chunk, W_targets_chunk = selection
+                # Calculate invariant mass of ttbar system
+                invariant_masses = self._calculate_ttbar_invariant_mass(targets_dict)
 
-                # Compute energies
-                top_targets_chunk[..., 3] = calculate_energy_value(top_targets_chunk[..., :])
-                W_targets_chunk[..., 3]   = calculate_energy_value(W_targets_chunk[..., :])
+                interaction_chunk = (
+                    create_interaction_matrix(jet_chunk)
+                    if self.interaction_processor.needs_interaction()
+                    else None
+                )
 
-                # Interactions from jets
-                interaction_chunk = create_interaction_matrix(jet_chunk)
+                self._fit_transformers(jet_chunk, targets_dict, invariant_masses, interaction_chunk)
 
-                # Fit transformers
-                self._fit_transformers(jet_chunk, top_targets_chunk, W_targets_chunk, interaction_chunk)
 
-    def _transform_file(self, raw_path, save_path):
-        """Second pass (or first for val/test): transform and write out."""
-        with h5py.File(raw_path, "r") as read_file, h5py.File(save_path, "w") as write_file:
-            jets    = read_file["jet"]
-            events  = read_file["event"]
-            targets = read_file["targets"]
-
-            file_len = jets.shape[0]
+    def _transform_and_save_file(self, raw_path: str, save_path: str):
+        """Transform and save a complete file (with TQDM progress)."""
+        print(f"Transforming and saving {raw_path} to {save_path}...")
+        with h5py.File(raw_path, "r") as read_f, h5py.File(save_path, "w") as write_f:
+            file_len = read_f["jet"].shape[0]
             datasets_created = False
 
-            for i in range(0, file_len, self.stream_size):
-                jet_chunk    = jets[i: i + self.stream_size]
-                event_chunk  = events[i: i + self.stream_size]
-                targets_chunk = targets[i: i + self.stream_size]
+            for i in tqdm(
+                range(0, file_len, self.stream_size),
+                desc=f"Processing {raw_path.split('/')[-1]}",
+                unit="chunk"
+            ):
+                jet_chunk = read_f["jet"][i : i + self.stream_size]
+                event_chunk = read_f["event"][i : i + self.stream_size]
+                targets_chunk = read_f["targets"][i : i + self.stream_size]
 
-                # Select valid events and extract tops + Ws
-                selection = self._select_events_and_targets(jet_chunk, event_chunk, targets_chunk)
-                if selection is None:
+                # Extract targets (truth or reconstructed) into a dictionary
+                targets_dict = self.target_extractor.extract_targets(jet_chunk, targets_chunk)
+                
+                # --- Step 1: Separate and Process Tops/Ws ---
+                tops_chunk = targets_dict["targets"]
+                ws_chunk = targets_dict.get("W_targets", None)
+
+                if isinstance(self.target_processor, WBosonTargetProcessor):
+                    processed_dict = self.target_processor.process_targets(targets_dict, is_temp=False)
+                    tops_chunk = processed_dict["targets"]
+                    ws_chunk = processed_dict["W_targets"]
+                else:
+                    tops_only = self.target_processor.process_targets(tops_chunk, is_temp=False)
+                    tops_chunk = tops_only["targets"]
+                    
+                # --- Step 2: Apply Selection Cuts ---
+                mask = self._selection_cuts_separate(jet_chunk, event_chunk, tops_chunk, ws_chunk)
+                
+                # --- Step 3: Apply Masking ---
+                arrays_to_mask = [jet_chunk, event_chunk, tops_chunk]
+                if ws_chunk is not None:
+                    arrays_to_mask.append(ws_chunk)
+                
+                masked_chunks = apply_mask(tuple(arrays_to_mask), mask)
+                
+                # Assign masked results back
+                jet_chunk, event_chunk, tops_chunk = masked_chunks[0:3]
+                if ws_chunk is not None:
+                    ws_chunk = masked_chunks[3]
+
+                # --- Step 4: Reconstruct targets_dict for subsequent methods ---
+                targets_dict = {"targets": tops_chunk}
+                if ws_chunk is not None:
+                    targets_dict["W_targets"] = ws_chunk
+
+                # Calculate invariant mass of ttbar system
+                invariant_masses = self._calculate_ttbar_invariant_mass(targets_dict)
+
+                interaction_chunk = (
+                    create_interaction_matrix(jet_chunk)
+                    if self.interaction_processor.needs_interaction()
+                    else None
+                )
+
+                # --- Step 5: Transformation ---
+                jet_chunk, targets_dict, invariant_masses, interaction_chunk = self._transform_separate(
+                    jet_chunk, tops_chunk, ws_chunk, invariant_masses, interaction_chunk
+                )
+                
+                # Check for empty chunk after selection/transformation
+                if jet_chunk.shape[0] == 0:
                     continue
-
-                jet_chunk, event_chunk, top_targets_chunk, W_targets_chunk = selection
-
-                # Compute energies
-                top_targets_chunk[..., 3] = calculate_energy_value(top_targets_chunk[..., :])
-                W_targets_chunk[..., 3]   = calculate_energy_value(W_targets_chunk[..., :])
-
-                # Interactions
-                interaction_chunk = create_interaction_matrix(jet_chunk)
-
-                # Transform
-    
-                jet_chunk, top_targets_chunk, W_targets_chunk, interaction_chunk = self._transform(
-                    jet_chunk,
-                    top_targets_chunk,
-                    W_targets_chunk,
-                    interaction_chunk,
+                    
+                jet_chunk, src_mask, interaction_chunk = self._pad_and_src_mask(
+                    jet_chunk, interaction_chunk
                 )
 
-                # Pad and src_mask
-                jet_chunk, src_mask_chunk, interaction_chunk = self._pad_and_src_mask(
-                    jet_chunk,
-                    interaction_chunk,
-                )
-
-                # Create datasets on first non-empty chunk
                 if not datasets_created:
-                    self._create_datagroups(
-                        write_file,
+                    self._create_datagroups_separate(
+                        write_f,
                         jet_chunk.shape,
                         event_chunk.shape,
-                        top_targets_chunk.shape,
-                        W_targets_chunk.shape,
-                        interaction_chunk.shape,
+                        targets_dict,
+                        interaction_chunk.shape if interaction_chunk is not None else None,
                     )
                     datasets_created = True
 
-                # Save chunk
                 self._save_data_chunks(
-                    write_file,
+                    write_f,
                     jet_chunk,
-                    interaction_chunk,
                     event_chunk,
-                    src_mask_chunk,
-                    top_targets_chunk,
-                    W_targets_chunk,
+                    src_mask,
+                    targets_dict, # targets_dict is still required here for dynamic keys
+                    invariant_masses,
+                    interaction_chunk,
                 )
 
-    # -----------------------------
-    # Event-wise selection
-    # -----------------------------
-    def _select_events_and_targets(self, jet_chunk, event_chunk, targets_chunk):
-        """
-        Take raw chunk (B, ...) and:
-          - apply event-level cuts
-          - require exactly 2 tops (PID ±6) and 2 Ws (PID ±24) per event
-          - return filtered jets/events and (tops, Ws) as (B', 2, Q)
-        """
-  
+    # ----------------------------------------------------------------------
+    # 2. HELPER METHODS (Modified)
+    # ----------------------------------------------------------------------
 
-        pid = targets_chunk[..., 4]  # (B, M)
-        top_mask = np.abs(pid) == 6
-        W_mask   = np.abs(pid) == 24
+    def _selection_cuts_separate(
+        self, 
+        jet: np.ndarray, 
+        event: np.ndarray, 
+        tops: np.ndarray, 
+        Ws: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """Apply event selection cuts using separate target arrays."""
+        
+        # Require event[:, 2] == 1
+        event_mask = (event[:, 2] == 1)
+        
+        # Filter out events with no valid targets (all zeros from reconstruction)
+        has_valid_targets = np.ones(jet.shape[0], dtype=bool)
+        
+        # Check Tops
+        valid_tops = np.any(tops[..., 0:4] != 0, axis=(1, 2)) # Check the 4-vector features
+        has_valid_targets = has_valid_targets & valid_tops
+        
+        # Check Ws if present
+        if Ws is not None:
+            valid_Ws = np.any(Ws[..., 0:4] != 0, axis=(1, 2))
+            has_valid_targets = has_valid_targets & valid_Ws
+        
+        return event_mask & has_valid_targets
 
-        num_tops = top_mask.sum(axis=1)  # (B,)
-        num_Ws   = W_mask.sum(axis=1)    # (B,)
-
-        # Base event cuts
-        base_mask = self._selection_cuts(jet_chunk, event_chunk, targets_chunk)  # (B,)
-
-        # Require exactly 2 tops and 2 Ws and pass base mask
-        keep = (num_tops == 2) & (num_Ws == 2) & base_mask
-
-        if not np.any(keep):
-            return None
-
-        jet_chunk    = jet_chunk[keep]
-        event_chunk  = event_chunk[keep]
-        targets_chunk = targets_chunk[keep]
-        top_mask     = top_mask[keep]
-        W_mask       = W_mask[keep]
-
-        Q = targets_chunk.shape[-1]
-
-        # Extract tops and Ws per event; 2 of each per event => safe reshape
-        top_targets_chunk = targets_chunk[top_mask].reshape(-1, 2, Q)
-        W_targets_chunk   = targets_chunk[W_mask].reshape(-1, 2, Q)
-
-        return jet_chunk, event_chunk, top_targets_chunk, W_targets_chunk
-
-    # -----------------------------
-    # Fitting and transforming
-    # -----------------------------
-    def _fit_transformers(self, jet, top_targets, W_targets, interactions):
+    def _transform_separate(
+        self,
+        jet: np.ndarray,
+        tops: np.ndarray,
+        Ws: Optional[np.ndarray],
+        invariant_masses: np.ndarray,
+        interactions: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], np.ndarray, Optional[np.ndarray]]:
+        """Transform data using separate target arrays."""
         N, P, F = jet.shape
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
+        num_transformed_jet_features = len(self.jet_transformers) 
+        
+        # 1. Transform jets (Unchanged logic)
+        jet_transformed_list = []
+        for i, transformer in enumerate(self.jet_transformers):
+            var = jet[..., i]
+            transformed_var = transformer.transform(var.reshape(-1, 1)).reshape(N, P, -1)
+            jet_transformed_list.append(transformed_var)
+            
+        jet_transformed_array = np.concatenate(jet_transformed_list, axis=-1)
+        non_transformed_jets = jet[..., num_transformed_jet_features:]
+        jet = np.concatenate((jet_transformed_array, non_transformed_jets), axis=-1)
 
-        # Remove pid (assumed last) from targets
-        top_targets = top_targets[..., 0:4]
-        W_targets   = W_targets[..., 0:4]
 
-        jet_flat        = jet.reshape(N * P, F)
-        top_flat        = top_targets.reshape(N * 2, 4)
-        W_flat          = W_targets.reshape(N * 2, 4)
-        interactions_flat = interactions.reshape(N * P * P, -1)
+        # 2. Transform Top targets (tops)
+        M_targets = tops.shape[1]
+        targets_4vec = tops[..., 0:4]
+        targets_flat = targets_4vec.reshape(-1, 4)
+        
+        targets_transformed_list = []
+        for i, transformer in enumerate(self.target_transformers):
+            var = targets_flat[:, i]
+            transformed_var = transformer.transform(var.reshape(-1, 1)).reshape(N, M_targets, -1)
+            targets_transformed_list.append(transformed_var)
+            
+        targets_transformed_4vec = np.concatenate(targets_transformed_list, axis=-1)
+        non_4vec_targets = tops[..., 4:]
+        tops_transformed = np.concatenate((targets_transformed_4vec, non_4vec_targets), axis=-1)
 
-        jet_variables = (jet_pt, jet_et, jet_phi, jet_mass, jet_e) = (
-            jet_flat[:, pt], jet_flat[:, eta], jet_flat[:, phi], jet_flat[:, mass], jet_flat[:, e]
+
+        # 3. Transform W targets if present (Ws)
+        Ws_transformed = None
+        if Ws is not None and self.W_target_transformers is not None:
+            M_W_targets = Ws.shape[1]
+            W_targets_4vec = Ws[..., 0:4]
+            W_targets_flat = W_targets_4vec.reshape(-1, 4)
+
+            W_targets_transformed_list = []
+            for i, transformer in enumerate(self.W_target_transformers):
+                var = W_targets_flat[:, i]
+                transformed_var = transformer.transform(var.reshape(-1, 1)).reshape(N, M_W_targets, -1)
+                W_targets_transformed_list.append(transformed_var)
+                
+            W_targets_transformed_4vec = np.concatenate(W_targets_transformed_list, axis=-1)
+            non_4vec_W_targets = Ws[..., 4:]
+            Ws_transformed = np.concatenate((W_targets_transformed_4vec, non_4vec_W_targets), axis=-1)
+
+
+        # 4. Transform invariant masses (Unchanged logic)
+        invariant_masses_transformed = self.invariant_mass_transformer.transform(
+            invariant_masses.reshape(-1, 1)
+        ).reshape(-1)
+
+        # 5. Transform interactions (Unchanged logic)
+        interactions_transformed = interactions
+        if interactions is not None and self.interaction_processor.needs_interaction():
+            interactions_flat = interactions.reshape(-1, 1)
+            interactions_transformed = self.interaction_transformers.transform(
+                interactions_flat
+            ).reshape(N, P, P, -1)
+            
+        # Reconstruct targets_dict for return consistency
+        targets_dict = {"targets": tops_transformed}
+        if Ws_transformed is not None:
+            targets_dict["W_targets"] = Ws_transformed
+
+
+        return jet, targets_dict, invariant_masses_transformed, interactions_transformed
+
+    # ... _create_datagroups and _save_data_chunks are unchanged ...
+    # (They must remain in the class, using the reconstructed targets_dict for dynamic HDF5 keys)
+    def _create_datagroups_separate(
+        self,
+        file: h5py.File,
+        jet_shape: Tuple,
+        event_shape: Tuple,
+        targets_dict: Dict[str, np.ndarray], # targets_dict is needed here
+        interaction_shape: Optional[Tuple] = None,
+    ):
+        """Create HDF5 dataset groups."""
+        _, N_jets, jet_features = jet_shape
+        _, event_features = event_shape
+
+        file.create_dataset(
+            "jet", shape=(0, N_jets, jet_features -1 ), maxshape=(None, N_jets, jet_features -1), compression="gzip", compression_opts=4,
         )
-        top_variables = (top_pt, top_et, top_phi, top_mass) = (
-            top_flat[:, pt], top_flat[:, eta], top_flat[:, phi], top_flat[:, mass]
+        file.create_dataset(
+            "event", shape=(0, event_features), maxshape=(None, event_features), compression="gzip", compression_opts=4,
         )
-        W_variables = (W_pt, W_et, W_phi, W_mass) = (
-            W_flat[:, pt], W_flat[:, eta], W_flat[:, phi], W_flat[:, mass]
-        )
-
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-
-        for variable, transformation in zip(top_variables, self.target_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-
-        for variable, transformation in zip(W_variables, self.W_target_transformers):
-            transformation.partial_fit(variable.reshape(-1, 1))
-
-        self._interaction_transformers.partial_fit(interactions_flat)
-
-    def _transform(self, jet, top_targets, W_targets, interactions):
-        N, P, F = jet.shape
-        jet_btag = jet[..., 5].reshape(N, P, 1)  # keep btag unscaled
-        pt, eta, phi, mass, e = 0, 1, 2, 3, 4
-
-        # Remove pid from targets
-        top_targets = top_targets[..., 0:4]
-        W_targets   = W_targets[..., 0:4]
-
-        jet_flat        = jet.reshape(N * P, F)
-        top_flat        = top_targets.reshape(N * 2, 4)
-        W_flat          = W_targets.reshape(N * 2, 4)
-        interactions_flat = interactions.reshape(N * P * P, -1)
-
-        jet_variables = (jet_pt, jet_et, jet_phi, jet_mass, jet_e) = (
-            jet_flat[:, pt], jet_flat[:, eta], jet_flat[:, phi], jet_flat[:, mass], jet_flat[:, e]
-        )
-        top_variables = (top_pt, top_et, top_phi, top_mass) = (
-            top_flat[:, pt], top_flat[:, eta], top_flat[:, phi], top_flat[:, mass]
-        )
-        W_variables = (W_pt, W_et, W_phi, W_mass) = (
-            W_flat[:, pt], W_flat[:, eta], W_flat[:, phi], W_flat[:, mass]
+        file.create_dataset(
+            "src_mask", shape=(0, N_jets), maxshape=(None, N_jets), compression="gzip", compression_opts=4,
         )
 
-        jet_transformed = []
-        top_transformed = []
-        W_transformed   = []
-
-        # Transform jet variables
-        for variable, transformation in zip(jet_variables, self.jet_transformers):
-            jet_transformed.append(
-                transformation.transform(variable.reshape(-1, 1)).reshape(N, P, -1)
+        # Create target datasets dynamically based on keys in targets_dict
+        for key, targets in targets_dict.items():
+            _, M, Q = targets.shape
+            file.create_dataset(
+                key, shape=(0, M, Q), maxshape=(None, M, Q), compression="gzip", compression_opts=4,
             )
 
-        # Transform top targets
-        for variable, transformation in zip(top_variables, self.target_transformers):
-            top_transformed.append(
-                transformation.transform(variable.reshape(-1, 1)).reshape(N, 2, -1)
+        # Create invariant mass dataset
+        file.create_dataset(
+            "inv_mass", shape=(0,), maxshape=(None,), compression="gzip", compression_opts=4,
+        )
+
+        # Create interaction dataset if needed
+        if interaction_shape is not None:
+            _, N, N, interaction_features = interaction_shape
+            file.create_dataset(
+                "interactions", shape=(0, N, N, interaction_features), maxshape=(None, N, N, interaction_features), compression="gzip", compression_opts=4,
             )
 
-        # Transform W targets
-        for variable, transformation in zip(W_variables, self.W_target_transformers):
-            W_transformed.append(
-                transformation.transform(variable.reshape(-1, 1)).reshape(N, 2, -1)
-            )
+    def _save_data_chunks(
+        self,
+        file: h5py.File,
+        jet_chunk: np.ndarray,
+        event_chunk: np.ndarray,
+        src_mask_chunk: np.ndarray,
+        targets_dict: Dict[str, np.ndarray], # targets_dict is needed here
+        invariant_masses: np.ndarray,
+        interaction_chunk: Optional[np.ndarray] = None,
+    ):
+        """Save data chunks to HDF5."""
+        cur_len = file["jet"].shape[0]
+        n0, n1 = cur_len, cur_len + jet_chunk.shape[0]
 
-        jet = np.concatenate(jet_transformed, axis=-1)
-        jet = np.concatenate((jet, jet_btag), axis=2)  # append btag
+        file["jet"].resize((n1,) + file["jet"].shape[1:])
+        file["event"].resize((n1,) + file["event"].shape[1:])
+        file["src_mask"].resize((n1,) + file["src_mask"].shape[1:])
+        file["inv_mass"].resize((n1,))
 
-        top_target = np.concatenate(top_transformed, axis=-1)
-        W_target   = np.concatenate(W_transformed, axis=-1)
+        file["jet"][n0:n1] = jet_chunk[... , :-1].astype("float32")
+        file["event"][n0:n1] = event_chunk.astype("float32")
+        file["src_mask"][n0:n1] = src_mask_chunk.astype("float32")
+        file["inv_mass"][n0:n1] = invariant_masses.astype("float32")
 
-        interactions = self._interaction_transformers.transform(
-            interactions_flat
-        ).reshape(N, P, P, -1)
+        # Save all target types (tops, Ws, etc.)
+        for key, targets in targets_dict.items():
+            file[key].resize((n1,) + file[key].shape[1:])
+            file[key][n0:n1] = targets.astype("float32")
 
-        return jet, top_target, W_target, interactions
+        if interaction_chunk is not None:
+            file["interactions"].resize((n1,) + file["interactions"].shape[1:])
+            file["interactions"][n0:n1] = interaction_chunk.astype("float32")
 
-    # -----------------------------
-    # Padding & saving
-    # -----------------------------
-    def _pad_and_src_mask(self, jet_chunk, interaction_chunk, pad_value=0):
-        self.pad_value = pad_value
+# ... (other utility methods remain unchanged) ...
+    def _calculate_ttbar_invariant_mass(self, targets_dict: Dict[str, np.ndarray]) -> np.ndarray:
+        """
+        Calculate invariant mass of ttbar system (sum of two tops) using 
+        vectorized operations by zipping arrays in their (B, 2) shape.
+        """
+        tops = targets_dict["targets"]  # Shape (B, 2, 5)
+        B = tops.shape[0]
+        
 
-        src_mask = np.all(np.isnan(jet_chunk), axis=-1)
+        # 2. Extract components (Shape: B, 2)
+        pt = tops[:, :, 0]
+        eta = tops[:, :, 1]
+        phi = tops[:, :, 2]
+        # Note: Use 'mass' here, as the input array uses the Polar basis.
+        energy = tops[:, :, 3] 
 
+        # 3. Zip directly in the (B, 2) structure
+        # The 'vector' library is smart enough to structure the resulting VectorArray
+        # into B events, each containing a list of 2 4-vectors.
+        all_tops_vec = vector.zip({
+            "pt": pt,
+            "eta": eta,
+            "phi": phi,
+            "energy": energy,
+        })
+        # all_tops_vec now has the structure ak.Array[B * 2 * {pt, eta, phi, mass}]
+        
+        # 4. Sum the two tops for each event
+        # This element-wise addition sums top 0 and top 1 across all B events.
+        ttbar_4vec = all_tops_vec[:, 0] + all_tops_vec[:, 1]
+        # ttbar_4vec now has the structure ak.Array[B * {pt, eta, phi, mass}] (the summed ttbar system)
+        
+        # 5. Extract mass and apply mask
+        invariant_masses = ttbar_4vec.mass.to_numpy()
+        
+        return invariant_masses.astype(np.float32)
+
+    def _pad_and_src_mask(
+        self, jet_chunk: np.ndarray, interaction_chunk: Optional[np.ndarray] = None, pad_value: float = 0
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Pad and create source mask."""
+        src_mask = np.all(jet_chunk[..., 0:len(self.jet_transformers)] == 0, axis=-1)
         jet_chunk = np.nan_to_num(jet_chunk, nan=pad_value)
-        interaction_chunk = np.nan_to_num(interaction_chunk, nan=0)
+
+        if interaction_chunk is not None:
+            interaction_chunk = np.nan_to_num(interaction_chunk, nan=0)
 
         return jet_chunk, src_mask, interaction_chunk
 
-    def _create_datagroups(self, file, jet_shape, event_shape, top_shape, W_shape, interaction_shape):
-        """
-        jet_shape         = (B, N_jets, jet_features)
-        event_shape       = (B, event_features)
-        top_shape / W_shape = (B, 2, target_features)
-        interaction_shape = (B, N_jets, N_jets, interaction_features)
-        """
-        _, N_jets, jet_features      = jet_shape
-        _, event_features            = event_shape
-        _, M_targets, target_features = top_shape
-        _, _, _, interaction_features = interaction_shape
 
-        file.create_dataset(
-            "jet",
-            shape=(0, N_jets, jet_features),
-            maxshape=(None, N_jets, jet_features),
-            compression="gzip",
-            compression_opts=4,
-        )
-        file.create_dataset(
-            "event",
-            shape=(0, event_features),
-            maxshape=(None, event_features),
-            compression="gzip",
-            compression_opts=4,
-        )
-        file.create_dataset(
-            "targets",  # tops
-            shape=(0, M_targets, target_features),
-            maxshape=(None, M_targets, target_features),
-            compression="gzip",
-            compression_opts=4,
-        )
-        file.create_dataset(
-            "W_targets",  # Ws
-            shape=(0, M_targets, target_features),
-            maxshape=(None, M_targets, target_features),
-            compression="gzip",
-            compression_opts=4,
-        )
-        file.create_dataset(
-            "interactions",
-            shape=(0, N_jets, N_jets, interaction_features),
-            maxshape=(None, N_jets, N_jets, interaction_features),
-            compression="gzip",
-            compression_opts=4,
-        )
-        file.create_dataset(
-            "src_mask",
-            shape=(0, N_jets),
-            maxshape=(None, N_jets),
-            compression="gzip",
-            compression_opts=4,
-        )
+        # --- Transformer methods ---
+    def _fit_transformers(
+        self,
+        jet: np.ndarray,
+        targets_dict: Dict[str, np.ndarray],
+        invariant_masses: np.ndarray,
+        interactions: Optional[np.ndarray] = None,
+    ):
+        """Fit transformers on data."""
+        N, P, F = jet.shape
+        num_transformed_jet_features = len(self.jet_transformers) 
 
-    def _save_data_chunks(self, file, jet_chunk, interaction_chunk,
-                          event_chunk, src_mask_chunk, targets_chunk, W_targets_chunk):
+        # 1. Fit jet transformers
+        jet_flat = jet[..., 0:num_transformed_jet_features].reshape(-1, num_transformed_jet_features)
+        for i, transformer in enumerate(self.jet_transformers):
+            var = jet_flat[:, i]
+            valid_mask = var != 0
+            # Ensure array is not empty before fitting
+            if var[valid_mask].size > 0:
+                transformer.partial_fit(var[valid_mask].reshape(-1, 1))
 
-        jet_ds         = file["jet"]
-        event_ds       = file["event"]
-        target_ds      = file["targets"]
-        W_target_ds    = file["W_targets"]
-        src_ds         = file["src_mask"]
-        interaction_ds = file["interactions"]
+        # 2. Fit Top target transformers
+        targets = targets_dict["targets"]
+        targets_4vec = targets[..., 0:4]
+        targets_flat = targets_4vec.reshape(-1, 4)
+        
+        for i, transformer in enumerate(self.target_transformers):
+            var = targets_flat[:, i]
+            valid_mask = var != 0
+            if var[valid_mask].size > 0:
+                transformer.partial_fit(var[valid_mask].reshape(-1, 1))
 
-        cur_len = jet_ds.shape[0]
-        n0, n1 = cur_len, cur_len + jet_chunk.shape[0]
+        # 3. Fit W target transformers
+        if "W_targets" in targets_dict and self.W_target_transformers is not None:
+            W_targets = targets_dict["W_targets"]
+            W_targets_4vec = W_targets[..., 0:4]
+            W_targets_flat = W_targets_4vec.reshape(-1, 4)
 
-        jet_ds.resize((n1,) + jet_ds.shape[1:])
-        event_ds.resize((n1,) + event_ds.shape[1:])
-        target_ds.resize((n1,) + target_ds.shape[1:])
-        W_target_ds.resize((n1,) + W_target_ds.shape[1:])
-        interaction_ds.resize((n1,) + interaction_ds.shape[1:])
-        src_ds.resize((n1,) + src_ds.shape[1:])
+            for i, transformer in enumerate(self.W_target_transformers):
+                var = W_targets_flat[:, i]
+                valid_mask = var != 0
+                if var[valid_mask].size > 0:
+                    transformer.partial_fit(var[valid_mask].reshape(-1, 1))
 
-        jet_ds[n0:n1]         = jet_chunk.astype("float32")
-        event_ds[n0:n1]       = event_chunk.astype("float32")
-        target_ds[n0:n1]      = targets_chunk.astype("float32")
-        W_target_ds[n0:n1]    = W_targets_chunk.astype("float32")
-        interaction_ds[n0:n1] = interaction_chunk.astype("float32")
-        src_ds[n0:n1]         = src_mask_chunk.astype("float32")
+        # 4. Fit invariant mass transformer
+        valid_mass_mask = invariant_masses != 0
+        if invariant_masses[valid_mass_mask].size > 0:
+            self.invariant_mass_transformer.partial_fit(invariant_masses[valid_mass_mask].reshape(-1, 1))
 
+        # 5. Fit interaction transformer
+        if interactions is not None and self.interaction_processor.needs_interaction():
+            interactions_flat = interactions.flatten()
+            valid_int_mask = interactions_flat != 0
+            if interactions_flat[valid_int_mask].size > 0:
+                self.interaction_transformers.partial_fit(interactions_flat[valid_int_mask].reshape(-1, 1))
+
+# Usage examples:
 if __name__ == "__main__":
-    config = load_any_config("config/top_reconstruction_config.yaml")
-    top_reconstruction_dataset = InteractionTopReconstructionDatasetFromH5(config)
+    # NOTE: This part requires a valid 'config/top_reconstruction_config.yaml'
+    # and local files/directories set up for execution.
+    try:
+        config = load_any_config("config/top_reconstruction_config.yaml")
 
-""" 
+        # ============================================
+        # Option 3: Reconstructed Tops AND W Bosons (Full System)
+        # ============================================
+        print("\n--- Processing Reconstructed Tops and W Bosons ---")
+        dataset3 = TopReconstructionDatasetFromH5(
+            config,
+            WBosonTargetProcessor(), # Processor handles both Tops and Ws
+            WithInteractionProcessor(),
+            target_extractor=ReconstructedTargetExtractor(
+                tag_top1=np.array([1, 2, 3]),
+                tag_top2=np.array([4, 5, 6]),
+                tag_W1=np.array([2, 3]),
+                tag_W2=np.array([5, 6]),
+            ),
+        )
 
-if __name__ == "__main__":
-    config = load_and_split_config(config_file_path)
-    config = config.data_pipeline["data_preprocessing"]
-    top_dataset = TopTensorDatasetFromH5py(config)       
-     """
+    except FileNotFoundError as e:
+        print(f"\n[ERROR] Configuration or data file not found: {e}")
+        print("Please ensure 'config/top_reconstruction_config.yaml' and the HDF5 data files exist.")
