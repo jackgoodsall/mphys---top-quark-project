@@ -226,10 +226,10 @@ class TopandWReconstuctionDataModule(LightningDataModule):
         with h5py.File(path, "r") as f:
             jet = f["jet"][()]   # load to memory
             src_mask = f["src_mask"][()]
-            targ = f["targets"][()]
+            targ = f["targets"][()][..., :-1]
             interactions = f["interactions"][()]
-            w_targets = f["W_targets"][()]
-            inv_mass = f["invariant_mass"][()]
+            w_targets = f["W_targets"][()][..., :-1]
+            inv_mass = f["inv_mass"][()].reshape(-1, 1)
         ds = ParTWDataset(jet, interactions ,src_mask, targ, w_targets, inv_mass)
         return ds
 
