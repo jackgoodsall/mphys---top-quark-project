@@ -28,6 +28,7 @@ class TopAntiTopRegressionDataSetPrep:
         "jet_e",
         "jet_m",
         "jet_bTag",
+        "jet_truthmatch"
     ]
     target_features = [
         "particle_pt",
