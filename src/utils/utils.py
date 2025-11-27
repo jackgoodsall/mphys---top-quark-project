@@ -245,6 +245,117 @@ def plot_2d_histogram(
     plt.tight_layout()
     fig.savefig(fig_save_path / f"{title}.png")
 
+def plot_difference_hist(
+    X,
+    Y,
+    n_bins,
+    X_label,
+    title,
+    fig_save_path,
+    **kwargs
+):
+    """
+    Plot histogram of (Y - X), i.e. reco - truth.
+    """
+    X = X.reshape(-1)
+    Y = Y.reshape(-1)
+
+    diff = Y - X  # reco - truth
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    ax.hist(
+        diff,
+        bins=n_bins,
+        histtype="step",
+    )
+
+    ax.set_xlabel(X_label)
+    ax.set_ylabel("Counts")
+    ax.set_title(title)
+    ax.grid(True, linestyle=":", alpha=0.7)
+
+    plt.tight_layout()
+
+    fig_save_path = Path(fig_save_path)
+    fig_save_path.mkdir(parents=True, exist_ok=True)
+    fig.savefig(fig_save_path / f"{title}.png", dpi = 1000)
+
+    return fig, ax
+
+def plot_reco_truth(
+    X,
+    Y,
+    n_bins,
+    X_label,
+    Y_label,
+    title,
+    fig_save_path,
+    fig_save_name,
+    truth_label="Truth",
+    reco_label="Reco",
+):
+    X = X.reshape(-1)
+    Y = Y.reshape(-1)
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1,
+        figsize=(8, 6),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]}
+    )
+
+    # Consistent binning for both
+    data_min = min(np.min(X), np.min(Y))
+    data_max = max(np.max(X), np.max(Y))
+    bins = np.linspace(data_min, data_max, n_bins + 1)
+
+    # --- Top: histograms ---
+    ax_top.hist(
+        X,
+        bins=bins,
+        histtype="step",
+        label=truth_label,
+    )
+    ax_top.hist(
+        Y,
+        bins=bins,
+        histtype="step",
+        label=reco_label,
+    )
+
+    ax_top.set_ylabel(Y_label)
+    ax_top.set_title(title)
+    ax_top.legend()
+    ax_top.grid(True, which="both", linestyle=":", alpha=0.7)
+
+    # --- Bottom: reco / truth ratio ---
+    truth_counts, _ = np.histogram(X, bins=bins)
+    reco_counts, _ = np.histogram(Y, bins=bins)
+
+    # Avoid divide-by-zero: put NaN where truth is 0
+    ratio = np.divide(
+        reco_counts,
+        truth_counts,
+        out=np.full_like(reco_counts, np.nan, dtype=float),
+        where=truth_counts != 0,
+    )
+
+    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+
+    ax_bottom.step(bin_centers, ratio, where="mid")
+    ax_bottom.axhline(1.0, linestyle="--", linewidth=1)
+    ax_bottom.set_xlabel(X_label)
+    ax_bottom.set_ylabel("Reco / Truth")
+    ax_bottom.grid(True, which="both", linestyle=":", alpha=0.7)
+
+    plt.tight_layout()
+
+    fig_save_path = Path(fig_save_path)
+    fig_save_path.mkdir(parents=True, exist_ok=True)
+    fig.savefig(fig_save_path / f"{fig_save_name}.png", dpi = 1000)
+
+    return fig, (ax_top, ax_bottom)
+
 def cartesian_to_polar(fourvec, eps=1e-9):
     px = fourvec[:, 1]
     py = fourvec[:, 2]
@@ -267,7 +378,8 @@ def generate_reconstruction_report(
         report_file_name = "reconstruction_report",
         coordinate_system = "polar",
         raw_predict_file_path= "data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_test.h5",
-        pid = 6):
+        pid = 6,
+        use_raw_targets_for_truth = True):
     
     if not Path(test_output_file_path).exists():
         raise FileNotFoundError(f"Test output file {test_output_file_path} does not exist")
@@ -279,7 +391,16 @@ def generate_reconstruction_report(
     
     reverse_transformers = joblib.load(target_reverse_transformer_path)
 
-    targets_transformed = load_top_targets_with_event_selection(raw_predict_file_path, top_pids = pid)
+    if use_raw_targets_for_truth:
+        # Load targets from the raw file and reverse-transform them. 
+        # This gives a physically meaningful "truth" comparison.
+        targets_transformed = load_top_targets_with_event_selection(raw_predict_file_path, top_pids = pid)
+    else:
+        # Use targets directly from the model's test output file and reverse-transform them.
+        # This compares the prediction to the *target* that went into the model before transformation.
+        targets_transformed = reverse_transform_variables(targets, reverse_transformers)
+
+
     predicted_transformed = reverse_transform_variables(predicted, reverse_transformers)
     
     combined_targets = add_four_momenta(targets_transformed[:, 0, :], targets_transformed[:, 1, :], cord_sys= coordinate_system)
@@ -323,6 +444,162 @@ def generate_reconstruction_report(
     plot_2d_histogram(combined_targets[..., 4], combined_predicted[..., 4],
                           200, "Targets (GeV)", "Predicted (GeV)", "Invariant mass", report_file_dir)
 
-        
-        
+    plot_reco_truth(
+    X=targets_transformed[..., 0,0],
+    Y=predicted_transformed[..., 0,0],
+    n_bins=200,
+    X_label=r"$P_{t} (GeV)$",
+    Y_label="Count",
+    title=r"$P_{t}$",
+    fig_save_path=report_file_dir,
+    fig_save_name= "IndividualPt",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_reco_truth(
+    X=targets_transformed[..., 1],
+    Y=predicted_transformed[..., 1],
+    n_bins=200,
+    X_label=r"$/Eta$",
+    Y_label="Count",
+    title=r"$/Eta$",
+    fig_save_path=report_file_dir,
+    fig_save_name="InvidualEta",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_reco_truth(
+    X=targets_transformed[..., 2],
+    Y=predicted_transformed[..., 2],
+    n_bins=200,
+    X_label=r"$/Phi ^{\circ}$",
+    Y_label="Count",
+    title="Phi",
+    fig_save_path=report_file_dir,
+    fig_save_name="IndividualPhi",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+
+    plot_reco_truth(
+    X=targets_transformed[..., 3],
+    Y=predicted_transformed[..., 3],
+    n_bins=200,
+    X_label=r"Energy (GeV)",
+    Y_label="Count",
+    title= "Energy",
+    fig_save_path=report_file_dir,
+    fig_save_name="IndividualPt",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_difference_hist(
+    X=targets_transformed[..., 0],
+    Y=predicted_transformed[..., 0],
+    n_bins=200,
+    X_label=r"$P_t$ (GeV)",
+    Y_label="Count",
+    title=r"$P_t$ ",
+    fig_save_path=report_file_dir,
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_difference_hist(
+    X=targets_transformed[..., 1],
+    Y=predicted_transformed[..., 1],
+    n_bins=200,
+    X_label="Targets",
+    Y_label="Count",
+    title="Eta",
+    fig_save_path=report_file_dir,
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_difference_hist(
+    X=targets_transformed[..., 2],
+    Y=predicted_transformed[..., 2],
+    n_bins=200,
+    X_label="Targets",
+    Y_label="Predicted",
+    title="Phi",
+    fig_save_path=report_file_dir,
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+
+    plot_difference_hist(
+    X=targets_transformed[..., 3],
+    Y=predicted_transformed[..., 3],
+    n_bins=200,
+    X_label="Targets (GeV)",
+    Y_label="Predicted (GeV)",
+    title="E",
+    fig_save_path=report_file_dir,
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+
+    # Combined
+    plot_reco_truth(
+    X=combined_targets[..., 0],
+    Y=combined_predicted[..., 0],
+    n_bins=200,
+    X_label=r"$P_{t}$ (GeV)",
+    Y_label="Count",
+    title=r"$P_{t}$",
+    fig_save_path=report_file_dir,
+    fig_save_name="Combinedpt",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_reco_truth(
+    X=combined_targets[..., 1],
+    Y=combined_predicted[..., 1],
+    n_bins=200,
+    X_label=r"$/Eta$",
+    Y_label="Count",
+    title=r"$/Eta$",
+    fig_save_path=report_file_dir,
+    fig_save_name="Combined eta",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    
+    plot_reco_truth(
+    X=combined_targets[..., 2],
+    Y=combined_predicted[..., 2],
+    n_bins=200,
+    X_label=r"$/Phi ^{\circ}$",
+    Y_label="Count",
+    title="Phi",
+    fig_save_path=report_file_dir,
+    fig_save_name="CombinedPhi",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_reco_truth(
+    X=combined_targets[..., 3],
+    Y=combined_predicted[..., 3],
+    n_bins=200,
+    X_label=r"$Energy (GeV)$",
+    Y_label="Count",
+    title= "Energy",
+    fig_save_path=report_file_dir,
+    fig_save_name="Combinedenergy",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+    plot_reco_truth(
+    X=combined_targets[..., 4],
+    Y=combined_predicted[..., 4],
+    n_bins=200,
+    X_label=r"$M_{t\bar{t}} (GeV)$",
+    Y_label="Count",
+    title="Invariant Mass",
+    fig_save_path=report_file_dir,
+    fig_save_name="invmass",
+    truth_label="Truth",
+    reco_label="Reco",
+    )
+
   
