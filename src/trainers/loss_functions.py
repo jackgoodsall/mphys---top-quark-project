@@ -10,6 +10,56 @@ import numpy as np
 
 import torch.nn.functional as F
 
+
+def logminmax_forward_torch(x, scaler, device, eps=0.0):
+    """
+    Torch version of LogMinMax.transform:
+        X_scaled = (log1p(clip(X, 0, inf)) - log_min) * scale + min_offset
+    but using the already-computed scaler.scale_ and scaler.min_offset_.
+
+    x: tensor of physical values (unscaled)
+    scaler: fitted LogMinMax instance
+    """
+    x = x.to(device).float()
+
+    # NaN mask preserved
+    mask = torch.isnan(x)
+
+    # clip x >= 0 as in _log_transform
+    x_pos = torch.clamp(x, min=0.0)
+
+    # log1p
+    x_log = torch.log1p(x_pos)
+
+    # bring scaler parameters to torch
+    scale = torch.as_tensor(scaler.scale_,      dtype=torch.float32, device=device)
+    min_offset = torch.as_tensor(scaler.min_offset_, dtype=torch.float32, device=device)
+
+    # broadcast if needed
+    while scale.dim() < x_log.dim():
+        scale = scale.unsqueeze(0)
+        min_offset = min_offset.unsqueeze(0)
+
+    x_scaled = x_log * scale + min_offset
+
+    mean = torch.as_tensor(scaler.scalar.mean_, dtype= torch.float32, device = device)
+    std = torch.as_tensor(scaler.scalar.scale_, dtype= torch.float32, device = device)
+
+    x_scaled = (x_scaled - mean) / std
+
+
+    # optional clipping to feature_range
+    if getattr(scaler, "clip", False):
+        low, high = scaler.feature_range
+        low_t  = torch.tensor(low,  dtype=torch.float32, device=device)
+        high_t = torch.tensor(high, dtype=torch.float32, device=device)
+        x_scaled = torch.clamp(x_scaled, low_t, high_t)
+
+    # restore NaNs
+    x_scaled[mask] = torch.nan
+    return x_scaled
+
+
 def logminmax_inverse_torch(x_scaled, logminmax, device):
     # logminmax is the fitted sklearn LogMinMaxScaler
     mean = torch.tensor(logminmax.scalar.mean_,  device=device, dtype=torch.float32)
@@ -113,8 +163,9 @@ def invariant_mass_loss(
     pt_scaler,      # LogMinMaxScaler for pT
     eta_scaler,     # StandardScaler for eta
     E_scaler,       # LogMinMaxScaler for E
-    mass_mean, mass_std,   # scalers for invariant mass itself
+    inv_mass_transform   # scalers for invariant mass itself
 ):
+    
     device = output.device
 
     pt_scaled  = output[..., 0]
@@ -147,14 +198,13 @@ def invariant_mass_loss(
     inv_mass = torch.sqrt(torch.clamp(m2, 0))
 
     # scale invariant mass same way you did for the target
-    mass_mean = torch.as_tensor(mass_mean, device=device, dtype=torch.float32)
-    mass_std  = torch.as_tensor(mass_std,  device=device, dtype=torch.float32)
-    inv_mass_scaled = (torch.log1p(inv_mass) - mass_mean) / mass_std
+
+    inv_mass_scaled = logminmax_forward_torch(inv_mass, inv_mass_transform, device)
 
     return torch.nn.functional.mse_loss(inv_mass_scaled.unsqueeze(-1), target_scaled_mass)
 
 import torch
-import itertools
+import itertools 
 
 def hungarian_match_top_W(outputs, targets, reduction="mean"):
     """
