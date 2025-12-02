@@ -727,10 +727,16 @@ class TopReconstructionDatasetFromH5:
         # 5. Transform interactions (Unchanged logic)
         interactions_transformed = interactions
         if interactions is not None and self.interaction_processor.needs_interaction():
-            interactions_flat = interactions.reshape(-1, 1)
-            interactions_transformed = self.interaction_transformers.transform(
-                interactions_flat
-            ).reshape(N, P, P, -1)
+            N, P, P2, F = interactions.shape  # P2 should == P, but let's not assume too hard
+
+            # Flatten spatial dims but keep feature dim
+            interactions_flat = interactions.reshape(-1, F)   # [N * P * P2, F]
+
+            # Now each column is a feature; StandardScaler/whatever will scale per feature
+            interactions_flat = self.interaction_transformers.transform(interactions_flat)  # same shape
+
+            # Reshape back
+            interactions_transformed = interactions_flat.reshape(N, P, P2, F)
             
         # Reconstruct targets_dict for return consistency
         targets_dict = {"targets": tops_transformed}
@@ -858,11 +864,16 @@ class TopReconstructionDatasetFromH5:
         self, jet_chunk: np.ndarray, interaction_chunk: Optional[np.ndarray] = None, pad_value: float = 0
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """Pad and create source mask."""
-        src_mask = np.all(jet_chunk[..., 0:len(self.jet_transformers)] == 0, axis=-1)
+        print(jet_chunk[0])
+        src_mask = np.any(
+        np.isnan(jet_chunk[..., 0:len(self.jet_transformers)]),
+        axis=-1,  # shape (batch, num_jets)
+        )
+
         jet_chunk = np.nan_to_num(jet_chunk, nan=pad_value)
 
         if interaction_chunk is not None:
-            interaction_chunk = np.nan_to_num(interaction_chunk, nan=0)
+            interaction_chunk = np.nan_to_num(interaction_chunk, nan= 0)
 
         return jet_chunk, src_mask, interaction_chunk
 
@@ -918,10 +929,21 @@ class TopReconstructionDatasetFromH5:
 
         # 5. Fit interaction transformer
         if interactions is not None and self.interaction_processor.needs_interaction():
-            interactions_flat = interactions.flatten()
-            valid_int_mask = interactions_flat != 0
-            if interactions_flat[valid_int_mask].size > 0:
-                self.interaction_transformers.partial_fit(interactions_flat[valid_int_mask].reshape(-1, 1))
+            N, P, P2, F = interactions.shape  # P2 == P typically
+
+            # Flatten spatial dims but keep feature dimension
+            interactions_flat = interactions.reshape(-1, F)   # [N * P * P2, F]
+
+            # Build a validity mask per *row* (sample), not per scalar
+            # Example: consider a row invalid if *all* features are zero
+            valid_rows = ~(interactions_flat == 0).all(axis=1)   # [N * P * P2]
+
+            if valid_rows.any():
+                # Only keep valid samples; each column is a feature for the transformer
+                self.interaction_transformers.partial_fit(
+                    interactions_flat[valid_rows]   # shape: [n_valid, F]
+                )
+
 
 # Usage examples:
 if __name__ == "__main__":

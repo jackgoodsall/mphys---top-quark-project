@@ -5,6 +5,11 @@
 /checkpoints/
 gpu_test.py
 Nov13/
+notebooks/
+test_report/
+random_*
+slurm*
+submit.sh
 
 
 __pycache__/

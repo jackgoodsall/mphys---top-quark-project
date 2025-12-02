@@ -8,7 +8,7 @@ root_dataset_prepper:
 
 
 preprocessing:
-  stream_size: 200000
+  stream_size: 400000
   save_path: "data/topquarkreconstruction/reco_targets"
   save_file_prefix: "ttbar_preprocessed_"
 
@@ -18,7 +18,7 @@ reconstruct_W: True
 use_hungarian_matching: True
   
 
-
+BatchNormUsed: True
 
 data_modules:
   input_path: data/topquarkreconstruction/reco_targets
@@ -75,7 +75,7 @@ model_training:
   weight_decay: 0.001
   use_lookahead : True
   min_epochs: 5
-  max_epochs: 20
+  max_epochs: 50
   
 model_artefacts:
   reverse_target_transformers: "data/topquarkreconstruction/processed_data/target_transformed.joblib"

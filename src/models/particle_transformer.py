@@ -177,10 +177,16 @@ class ParticleEmbedder(nn.Module):
             self.layers.extend([ nn.LayerNorm(size_1), nn.Linear(size_1, size_2), nn.GELU(), nn.Dropout(p_dropout)])
         self.layers.append(nn.Linear(size_2, embedding_size))
         
-    def forward(self, X):
+    def forward(self, X, src_mask = None):
 
         for layers in self.layers:
             X = layers(X)
+        
+        if src_mask is not None:
+            # mask -> [B, N, 1] → broadcasts over features
+            mask = src_mask.unsqueeze(-1).bool()
+            X = X.masked_fill(mask, 0.0)
+
         return X
 
 class ReverseEmbedder(nn.Module):
@@ -342,10 +348,10 @@ class InteractionEmbedder(nn.Module):
         hidden_sizes = [input_features] + hidden_layers 
         self.layers =  nn.ModuleList([])
         for size_1, size_2 in zip(hidden_sizes[:-1], hidden_sizes[1:]):
-            self.layers.extend([ nn.LayerNorm(size_1), nn.Conv1d(size_1, size_2, kernel_size=1), nn.GELU(), nn.Dropout(p_dropout)])
+            self.layers.extend([ nn.BatchNorm1d(size_1), nn.Conv1d(size_1, size_2, kernel_size=1), nn.GELU(), nn.Dropout(p_dropout)])
         self.layers.append(nn.Conv1d(size_2, output_size, kernel_size=1))
 
-    def forward(self, x):
+    def forward(self, x, src_mask = None):
         """
         x: [B, N, N, input_features]
         returns: [B, N, N, output_size]
@@ -354,7 +360,8 @@ class InteractionEmbedder(nn.Module):
 
         # Flatten pair (i, j) and arrange for Conv1d: [B*N*M, C_in, L]
         x = x.view(B * N * M, F)       # [B*N*M, F]
-        x = x.unsqueeze(-1)            # [B*N*M, F, 1]
+        x = x.unsqueeze(-1)    
+        x /= 3        # [B*N*M, F, 1]
 
         for layer in self.layers:
             if isinstance(layer, nn.LayerNorm):
@@ -369,7 +376,13 @@ class InteractionEmbedder(nn.Module):
         # Remove length dim and reshape back to [B, N, N, output_size]
         x = x.squeeze(-1)              # [B*N*M, output_size]
         x = x.view(B, N, M, -1)        # [B, N, N, output_size]
-        return x.permute(0, 3, 1, 2)
+
+        x=  x.permute(0, 3, 1, 2)
+        out = x
+        if src_mask is not None:
+            mask_expanded_T = src_mask[:, None, None, :] # [B,1,1,N]
+            out = out.masked_fill(mask_expanded_T.bool(), float("-inf"))
+        return out
 
 
 class ReconstructionInteractionTransformer(nn.Module):
@@ -415,7 +428,7 @@ class ReconstructionInteractionTransformer(nn.Module):
         interactions = self.interaction_embedder(interactions)
         
         B, N, F = jet.shape
-
+    
         tgt_tokens = self.tgt_tokens.expand(B, 2, F)
 
 
@@ -479,11 +492,10 @@ class ReconstructionPart(nn.Module):
         src_mask = X["src_mask"]
 
         # Embed
-        jet = self.particle_embedder(jet)
-        interactions = self.interaction_embedder(interactions)
+        jet = self.particle_embedder(jet, src_mask = src_mask)
+        interactions = self.interaction_embedder(interactions, src_mask = src_mask)
         
         B, N, F = jet.shape
-
 
         cls_tkns = self.particle_tokens.expand(B, self.number_class_tokens, self.particle_tokens.shape[-1])
 

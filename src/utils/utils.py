@@ -387,6 +387,7 @@ def generate_reconstruction_report(
 
     with h5py.File(test_output_file_path, "r") as file_object:
         targets = file_object["targets"][()]
+
         predicted = file_object["predicted"][()]
     
     reverse_transformers = joblib.load(target_reverse_transformer_path)
@@ -398,6 +399,7 @@ def generate_reconstruction_report(
     else:
         # Use targets directly from the model's test output file and reverse-transform them.
         # This compares the prediction to the *target* that went into the model before transformation.
+        
         targets_transformed = reverse_transform_variables(targets, reverse_transformers)
 
 
