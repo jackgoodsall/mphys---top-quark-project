@@ -22,9 +22,6 @@ def logminmax_forward_torch(x, scaler, device, eps=0.0):
     """
     x = x.to(device).float()
 
-    # NaN mask preserved
-    mask = torch.isnan(x)
-
     # clip x >= 0 as in _log_transform
     x_pos = torch.clamp(x, min=0.0)
 
@@ -42,12 +39,6 @@ def logminmax_forward_torch(x, scaler, device, eps=0.0):
 
     x_scaled = x_log * scale + min_offset
 
-    mean = torch.as_tensor(scaler.scalar.mean_, dtype= torch.float32, device = device)
-    std = torch.as_tensor(scaler.scalar.scale_, dtype= torch.float32, device = device)
-
-    x_scaled = (x_scaled - mean) / std
-
-
     # optional clipping to feature_range
     if getattr(scaler, "clip", False):
         low, high = scaler.feature_range
@@ -55,8 +46,6 @@ def logminmax_forward_torch(x, scaler, device, eps=0.0):
         high_t = torch.tensor(high, dtype=torch.float32, device=device)
         x_scaled = torch.clamp(x_scaled, low_t, high_t)
 
-    # restore NaNs
-    x_scaled[mask] = torch.nan
     return x_scaled
 
 
@@ -204,7 +193,7 @@ def invariant_mass_loss(
     return torch.nn.functional.mse_loss(inv_mass_scaled.unsqueeze(-1), target_scaled_mass)
 
 import torch
-import itertools 
+import itertools
 
 def hungarian_match_top_W(outputs, targets, reduction="mean"):
     """
@@ -311,4 +300,105 @@ def hungarian_match_top_W(outputs, targets, reduction="mean"):
         "top":  matched_top,
         "W":    matched_W,
         "loss": loss_per_event,
+    }
+
+def dice_loss(mask_logits, jet_mask_true, jet_valid_mask, eps: float = 1e-6):
+    """
+    mask_logits: [B, N] - raw logits from the model
+    jet_mask_true: [B, N] - {0,1}
+    jet_valid_mask: [B, N] - {0,1} (1 = real jet, 0 = padding)
+    """
+
+    # Convert logits to probabilities
+    probs = torch.sigmoid(mask_logits)  # [B, N]
+
+    # Only consider valid jets
+    valid = jet_valid_mask.bool()
+    probs = probs * valid
+    targets = jet_mask_true.float() * valid
+
+    # Flatten per batch (you can also compute per-event and then average)
+    probs_flat = probs.view(probs.shape[0], -1)      # [B, N']
+    targets_flat = targets.view(targets.shape[0], -1)
+
+    intersection = (probs_flat * targets_flat).sum(dim=1)        # [B]
+    probs_sum = probs_flat.sum(dim=1)                            # [B]
+    targets_sum = targets_flat.sum(dim=1)                        # [B]
+
+    dice = (2.0 * intersection + eps) / (probs_sum + targets_sum + eps)
+    loss = 1.0 - dice  # [B]
+
+    return loss.mean()
+
+
+def mask_loss_bce_dice(mask_logits: torch.Tensor,
+                       jet_mask_true: torch.Tensor,
+                       jet_valid_mask: torch.Tensor,
+                       w_bce: float = 0.5,
+                       w_dice: float = 0.5) -> torch.Tensor:
+    """
+    Combined BCE + Dice loss for the jet mask.
+    """
+    valid = jet_valid_mask.bool()
+
+    # BCE on valid jets
+    bce = F.binary_cross_entropy_with_logits(
+        mask_logits[valid],
+        jet_mask_true[valid].float(),
+    )
+
+    # Dice on full mask
+    dice = dice_loss(mask_logits, jet_mask_true, jet_valid_mask)
+
+    return w_bce * bce + w_dice * dice
+
+
+def total_masked_loss(
+    outputs: dict,
+    targets: dict,
+    w_bce: float = 0.5,
+    w_dice: float = 0.5,
+) -> dict:
+    """
+    Combined mask-only loss: BCE + Dice.
+
+    outputs:
+        "mask_logits": [B, N]
+    targets:
+        "jet_mask_true":  [B, N]
+        "jet_valid_mask": [B, N]
+
+    Returns:
+        {
+            "loss_total": scalar tensor,
+            "loss_bce": scalar tensor,
+            "loss_dice": scalar tensor,
+        }
+    """
+
+    mask_logits = outputs["mask_logits"]          # [B, N]
+    jet_mask_true = targets["jet_mask_true"]      # [B, N]
+    jet_valid_mask = targets["jet_valid_mask"]    # [B, N]
+
+    valid = jet_valid_mask.bool()
+
+    # BCE on valid jets
+    loss_bce = F.binary_cross_entropy_with_logits(
+        mask_logits[valid],
+        jet_mask_true[valid].float(),
+    )
+
+    # Dice on full mask
+    loss_dice = dice_loss(
+        mask_logits=mask_logits,
+        jet_mask_true=jet_mask_true,
+        jet_valid_mask=jet_valid_mask,
+    )
+
+    loss_total = w_bce * loss_bce + w_dice * loss_dice
+
+    return {
+        "loss_total": loss_total,
+        "loss_bce": loss_bce,
+        "loss_dice": loss_dice,
     }
