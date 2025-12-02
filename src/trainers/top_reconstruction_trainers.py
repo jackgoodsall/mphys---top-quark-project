@@ -53,17 +53,14 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.weight_decay = training_config.get("weight_decay", 5e-4)
         self.use_lookahead = training_config.get("use_lookahead", False)
         self.train_loss_history = []
-        self.reverse_transformers = joblib.load( Path(self.config["data_modules"]["input_path"], "target_transforms.joblib"))
         self.val_loss_history = []
-
 
         self.test_metrics = {}
 
         self.reconstruct_Ws = kwargs.get("reconstruct_Ws", False)
         self.use_hungarian = config.get("use_hungarian_matching", False)
 
-        self.inv_mass_transform = joblib.load( Path(self.config["data_modules"]["input_path"], "invariant_mass_transform.joblib"))
-
+        
         self.save_hyperparameters(ignore = ["model"])
     
     def forward(self, batch):
@@ -156,14 +153,9 @@ class ReconstructionTrainer(lightning.LightningModule):
     
     def loss_function(self, outputs, targets):
 
-        if self.reconstruct_Ws: 
-            if self.use_hungarian:
-                hungarian_outputs = hungarian_match_top_W(outputs, targets)
-                inv_loss = invariant_mass_loss(hungarian_outputs["top"], targets["inv_mass"], self.reverse_transformers[0], self.reverse_transformers[1], self.reverse_transformers[3], self.inv_mass_transform )
-                return hungarian_outputs["loss"] + inv_loss
-            return W_boson_loss_function(outputs, targets) + invariant_mass_loss(outputs["top"], targets["inv_mass"], self.reverse_transformers[0], self.reverse_transformers[1], self.reverse_transformers[3], mass_mean = 6.352097, mass_std = 0.30358553)
-        
-        return set_invariant_loss(outputs, targets)
+
+        masked_loss = total_masked_loss(outputs, targets)
+        return masked_loss["loss_total"]
     
     def on_train_epoch_end(self):
 

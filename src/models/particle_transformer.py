@@ -211,6 +211,8 @@ class ReverseEmbedder(nn.Module):
 
 
 
+
+
 class ReconstructionTransformer(nn.Module):
     def __init__(self,
                  particle_embedder,
@@ -524,3 +526,65 @@ class ReconstructionPart(nn.Module):
                 "W":W_bosons
             }
         return tops
+    
+
+
+
+
+    
+class MaskedReconstructionPart(nn.Module):
+    def __init__(self,
+                 particle_embedder,
+                 interaction_embedder,
+                 reverse_embedder,
+                 embedding_size,
+                 n_encoder_layers,
+                 n_decoder_layers,
+                 n_heads,
+                 out_dimensions,
+                 dim_ff,
+                 p_dropout,
+                 number_class_tokens,
+                 activation_function = "gelu",
+                 reconstruct_Ws = False,
+                 use_hungarian_matching = False,
+                 ):
+        super().__init__()
+
+        self.reconstruct_Ws = reconstruct_Ws
+        self.particle_embedder = particle_embedder
+        self.interaction_embedder = interaction_embedder
+        self.reverse_embedder = reverse_embedder
+        self.w_boson = copy.deepcopy(reverse_embedder)
+        self.number_class_tokens = number_class_tokens
+        self.use_hungarian_matching = use_hungarian_matching
+
+        self.encoder_stack = nn.ModuleList(
+            [ParticleAttentionBlock(embedding_size, dim_ff,
+                                    n_heads, p_dropout,pair_wise_dim=8) for _ in range(n_encoder_layers)]
+        )
+    
+
+    def forward(self, X):
+        # Unpack
+        jet = X["jet"]
+        interactions = X["interactions"]
+        src_mask = X["src_mask"]
+
+        # Embed
+        jet = self.particle_embedder(jet, src_mask = src_mask)
+        interactions = self.interaction_embedder(interactions, src_mask = src_mask)
+        
+        B, N, F = jet.shape
+
+        cls_tkns = self.particle_tokens.expand(B, self.number_class_tokens, self.particle_tokens.shape[-1])
+
+        # Encode
+        for layer in self.encoder_stack:
+            memory = layer(jet, interactions)
+
+
+
+        
+        return self.reverse_embedder(memory)
+    
