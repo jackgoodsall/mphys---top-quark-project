@@ -8,8 +8,8 @@ root_dataset_prepper:
 
 
 preprocessing:
-  stream_size: 400000
-  save_path: "data/topquarkreconstruction/reco_targets"
+  stream_size: 200000
+  save_path: "data/topquarkreconstruction/masked_targets"
   save_file_prefix: "ttbar_preprocessed_"
 
 interactions: 
@@ -21,7 +21,7 @@ use_hungarian_matching: True
 BatchNormUsed: True
 
 data_modules:
-  input_path: data/topquarkreconstruction/reco_targets
+  input_path: data/topquarkreconstruction/masked_targets
   input_prefix: "ttbar_preprocessed_"
 
   train:
@@ -67,7 +67,7 @@ model_parameters:
   reverse_embedder:
     n_input: 64
     hidden_sizes: [128, 64]
-    output_size: 5
+    output_size: 20
     p_dropout: 0.1
 
 model_training:
