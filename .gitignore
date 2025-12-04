@@ -10,6 +10,8 @@ test_report/
 random_*
 slurm*
 submit.sh
+/slurm_outputs/
+/masked_reconstruction/
 
 
 __pycache__/
