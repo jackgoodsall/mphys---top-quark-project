@@ -563,7 +563,13 @@ class MaskedReconstructionPart(nn.Module):
             [ParticleAttentionBlock(embedding_size, dim_ff,
                                     n_heads, p_dropout,pair_wise_dim=8) for _ in range(n_encoder_layers)]
         )
-    
+        self.target_tokens = nn.Parameter(torch.rand((1, embedding_size)) * 0.01)
+        
+        self.decoder_layer = nn.TransformerDecoderLayer(
+            embedding_size, n_heads, dim_ff, p_dropout, activation = activation_function,
+            batch_first= True
+        )
+        self.decoder_stack = nn.TransformerDecoder(self.decoder_layer, n_decoder_layers)
 
     def forward(self, X):
         # Unpack
@@ -572,19 +578,19 @@ class MaskedReconstructionPart(nn.Module):
         src_mask = X["src_mask"]
 
         # Embed
-        jet = self.particle_embedder(jet, src_mask = src_mask)
-        interactions = self.interaction_embedder(interactions, src_mask = src_mask)
+        jet = self.particle_embedder(jet, src_mask = ~src_mask)
+        interactions = self.interaction_embedder(interactions, src_mask = ~src_mask)
         
         B, N, F = jet.shape
-
-        cls_tkns = self.particle_tokens.expand(B, self.number_class_tokens, self.particle_tokens.shape[-1])
 
         # Encode
         for layer in self.encoder_stack:
             memory = layer(jet, interactions)
 
+        tgt = self.target_tokens.expand(B,1 , F)
+        tgt = self.decoder_stack(tgt, memory, memory_key_padding_mask = ~src_mask)
 
 
         
-        return self.reverse_embedder(memory)
+        return self.reverse_embedder(tgt)
     

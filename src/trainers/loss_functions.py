@@ -357,7 +357,7 @@ def total_masked_loss(
     outputs: dict,
     targets: dict,
     w_bce: float = 0.5,
-    w_dice: float = 0.5,
+    w_dice: float =10,
 ) -> dict:
     """
     Combined mask-only loss: BCE + Dice.
@@ -376,16 +376,15 @@ def total_masked_loss(
         }
     """
 
-    mask_logits = outputs["mask_logits"]          # [B, N]
-    jet_mask_true = targets["jet_mask_true"]      # [B, N]
-    jet_valid_mask = targets["jet_valid_mask"]    # [B, N]
+    mask_logits = outputs       # [B, N]
+    jet_mask_true = targets["jet_mask_true"].view(-1, 1, 20) # [B, N]
+    jet_valid_mask = targets["jet_valid_mask"].view(-1, 1, 20)   # [B, N]
 
-    valid = jet_valid_mask.bool()
-
+  
     # BCE on valid jets
     loss_bce = F.binary_cross_entropy_with_logits(
-        mask_logits[valid],
-        jet_mask_true[valid].float(),
+        mask_logits,
+        jet_mask_true.float(),
     )
 
     # Dice on full mask

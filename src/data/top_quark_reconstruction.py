@@ -174,14 +174,13 @@ class TopReconstructionInteractions(LightningDataModule):
 
 
 class ParTWDataset(Dataset):
-    def __init__(self, jet, interactions,src_mask, targets, W, inv_mass):
+    def __init__(self, jet, interactions,src_mask, targets):
         # ensure numpy arrays
         self.jet = np.asarray(jet)
         self.src_mask   = np.asarray(src_mask)
         self.targets     = np.asarray(targets)
         self.interactions = np.asarray(interactions)
-        self.W = np.asarray(W)
-        self.inv_mass = np.asarray(inv_mass)
+ 
     def __len__(self):
         return int(self.jet.shape[0])
 
@@ -192,9 +191,8 @@ class ParTWDataset(Dataset):
             "interactions": torch.from_numpy(self.interactions[idx])
         }
         target = {
-         "top" :  torch.from_numpy(self.targets[idx]).float(),
-           "W": torch.from_numpy(self.W[idx]).float(),
-           "inv_mass": torch.from_numpy(self.inv_mass[idx]).float()
+            "jet_mask_true" : self.targets[idx],
+            "jet_valid_mask" : self.src_mask[idx]
         }
         return sample, target
 
@@ -226,11 +224,10 @@ class TopandWReconstuctionDataModule(LightningDataModule):
         with h5py.File(path, "r") as f:
             jet = f["jet"][()]   # load to memory
             src_mask = f["src_mask"][()]
-            targ = f["targets"][()][..., :-1]
+            targ = f["targets"][()]
             interactions = f["interactions"][()]
-            w_targets = f["W_targets"][()][..., :-1]
-            inv_mass = f["inv_mass"][()].reshape(-1, 1)
-        ds = ParTWDataset(jet, interactions ,src_mask, targ, w_targets, inv_mass)
+
+        ds = ParTWDataset(jet, interactions ,src_mask, targ)
         return ds
 
     def setup(self, stage):

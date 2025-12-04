@@ -332,7 +332,14 @@ class TopReconstructionDatasetFromH5:
                 desc="Fitting",
             ):
                 jet_chunk = f["jet"][i : i + self.stream_size].copy()
+                event_chunk = f["event"][i : i + self.stream_size].copy()
                 self._fit_jet_transformers(jet_chunk)
+
+                # Filter events where event[:, 2] == 1
+                event_filter = event_chunk[:, 2] == 1
+                
+                
+                jet_chunk = jet_chunk[event_filter]
                 
                 if self.interaction_processor.needs_interaction():
                     try:
@@ -388,9 +395,18 @@ class TopReconstructionDatasetFromH5:
                 event_chunk = read_f["event"][i : i + self.stream_size].copy()
                 targets_chunk = read_f["targets"][i : i + self.stream_size].copy()
 
+                # Filter events where event[:, 2] == 1
+                event_filter = event_chunk[:, 2] == 1
+                
+                jet_chunk = jet_chunk[event_filter]
+                event_chunk = event_chunk[event_filter]
+                targets_chunk = targets_chunk[event_filter]
+                
+
                 targets_dict = self.target_extractor.extract_targets(jet_chunk, targets_chunk)
                 targets_mask = targets_dict["targets"]
                 
+
                 if jet_chunk.shape[0] == 0:
                     continue
                 

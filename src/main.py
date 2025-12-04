@@ -18,24 +18,15 @@ if __name__ == "__main__":
 
     particle_embedder = ParticleEmbedder(**config["model_parameters"]["particle_embedder"])
     reverse_embedder = ReverseEmbedder(**config["model_parameters"]["reverse_embedder"])
-    if config["interactions"] == True:
-        interactions_embedder = InteractionEmbedder(**config["model_parameters"]["interaction_embedder"])
+    interactions_embedder = InteractionEmbedder(**config["model_parameters"]["interaction_embedder"])
+   
+    transformer_model = MaskedReconstructionPart(particle_embedder,interactions_embedder
+                                                            , reverse_embedder, **config["model_parameters"]["transformer"], reconstruct_Ws = True,
+                                                            use_hungarian_matching= config["use_hungarian_matching"])
+    topantitopquark = TopandWReconstuctionDataModule(config)        
         
-        if config["reconstruct_W"] == True:
-            transformer_model = ReconstructionPart(particle_embedder,interactions_embedder
-                                                                 , reverse_embedder, **config["model_parameters"]["transformer"], reconstruct_Ws = True,
-                                                                 use_hungarian_matching= config["use_hungarian_matching"])
-            topantitopquark = TopandWReconstuctionDataModule(config)        
-        else:
-            transformer_model = ReconstructionPart(particle_embedder,interactions_embedder
-                                                                 , reverse_embedder, **config["model_parameters"]["transformer"], reconstruct_Ws = False)
-            topantitopquark = TopReconstructionInteractions(config)
-        
-    else:
-        transformer_model = ReconstructionTransformer(particle_embedder, reverse_embedder, **config["model_parameters"]["transformer"] )
 
-        topantitopquark = TopReconstruction(config)
-
+  
     
     print(config["reconstruct_W"])
     trainer, model = train_reconstruction_model(transformer_model,

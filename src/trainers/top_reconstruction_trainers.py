@@ -96,31 +96,21 @@ class ReconstructionTrainer(lightning.LightningModule):
         inputs, targets = batch
         outputs = self(inputs)
         loss = self.loss_function(outputs, targets)
-        if self.use_hungarian:
-            outputs = hungarian_match_top_W(outputs, targets)
-        if self.reconstruct_Ws:
-            W_targets = targets["W"]
-            W_outputs = outputs["W"]
-            targets = targets["top"]
-            outputs = outputs["top"]
+
         out_dir = Path(self.trainer.logger.log_dir)
 
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
        
         self.test_metrics["test_loss"] = loss
-        
+
+        targets = targets["jet_mask_true"]
+
         with h5py.File(out_dir / "test_outputs.h5", "r+" ) as file:
-            file["targets"][self.start_idx: self.start_idx + len(targets)] = targets.cpu().numpy()
+            file["targets"][self.start_idx: self.start_idx + len(targets)] = targets.view(-1, 1, 20).cpu().numpy()
             file["predicted"][self.start_idx: self.start_idx + len(targets)] = outputs.cpu().numpy()
 
             self.start_idx += len(targets)
-        
-        if self.reconstruct_Ws:
-            with h5py.File(out_dir / "W_boson_output.h5", "r+" ) as file:
-                file["targets"][self.W_start_idx: self.W_start_idx + len(targets)] = W_targets.cpu().numpy()
-                file["predicted"][self.W_start_idx: self.W_start_idx + len(targets)] = W_outputs.cpu().numpy()
 
-            self.W_start_idx += len(W_targets)
 
         return loss
 
@@ -191,42 +181,22 @@ class ReconstructionTrainer(lightning.LightningModule):
 
         test_loaders = self.trainer.test_dataloaders
         number_events = len(test_loaders.dataset)
-        _, tops = next(iter(test_loaders))
-        if self.reconstruct_Ws:
-            num_particles, num_features = tops["top"].shape[1:]
-        else:
-            num_particles, num_features = tops.shape[1:]
+        
+
         with h5py.File(out_dir / "test_outputs.h5", "w" ) as file:
             file.create_dataset("targets",
-                                   shape = (number_events, num_particles, num_features) )
+                                   shape = (number_events, 1, 20) )
 
             file.create_dataset("predicted",
-                                  shape = (number_events, num_particles, num_features))
-        if self.reconstruct_Ws:
-            with h5py.File(out_dir / "W_boson_output.h5", "w" ) as file:
-                file.create_dataset("targets",
-                                    shape = (number_events, num_particles, num_features) )
+                                  shape = (number_events, 1, 20))
 
-                file.create_dataset("predicted",
-                                    shape = (number_events, num_particles, num_features))
         self.start_idx = 0
         self.W_start_idx = 0
 
     def on_test_end(self):
         out_dir = Path(self.trainer.logger.log_dir)
-        ## To do: add in the reverse tranformer logic into here so that can just plot straight away.
 
-        generate_reconstruction_report(
-            out_dir / "test_outputs.h5",
-            out_dir / "top_plots",
-            Path(self.config["data_modules"]["input_path"], "target_transforms.joblib")
-        )
-        if self.reconstruct_Ws:
-            generate_reconstruction_report(
-                out_dir / "W_boson_output.h5",
-                out_dir / "W_boson_plots",
-                Path(self.config["data_modules"]["input_path"], "W_target_transforms.joblib")
-            , pid = 24)
+
         
         
 
@@ -289,6 +259,7 @@ def train_reconstruction_model(
         logger = logger,
         callbacks= callbacks,
         gradient_clip_val=1,
+        default_root_dir="./masked_reconstruction"
     )
     print("training")
     # Fit trainer
