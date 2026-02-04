@@ -536,7 +536,8 @@ class MaskedReconstructionPart(nn.Module):
     def __init__(self,
                  particle_embedder,
                  interaction_embedder,
-                 reverse_embedder,
+                 masked_predictor,
+                 kinematic_regressor,
                  embedding_size,
                  n_encoder_layers,
                  n_decoder_layers,
@@ -554,8 +555,9 @@ class MaskedReconstructionPart(nn.Module):
         self.reconstruct_Ws = reconstruct_Ws
         self.particle_embedder = particle_embedder
         self.interaction_embedder = interaction_embedder
-        self.reverse_embedder = reverse_embedder
-        self.w_boson = copy.deepcopy(reverse_embedder)
+        self.masked_predictor = masked_predictor
+        self.regression_predictor = kinematic_regressor
+        
         self.number_class_tokens = number_class_tokens
         self.use_hungarian_matching = use_hungarian_matching
 
@@ -590,7 +592,10 @@ class MaskedReconstructionPart(nn.Module):
         tgt = self.target_tokens.expand(B,1 , F)
         tgt = self.decoder_stack(tgt, memory, memory_key_padding_mask = ~src_mask)
 
+        ## Per query we get a binary mask over the input features
+        ## to say whether they are relevent
+        mask_prediction = self.masked_predictor(tgt)
+        object_regression = self.regression_predictor(tgt)
 
-        
-        return self.reverse_embedder(tgt)
+        return mask_prediction, object_regression
     
