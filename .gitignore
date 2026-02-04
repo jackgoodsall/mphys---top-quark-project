@@ -10,7 +10,7 @@ test_report/
 random_*
 slurm*
 submit.sh
-
+/masked_reconstruction/
 
 __pycache__/
 *.py[cod]

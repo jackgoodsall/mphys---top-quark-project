@@ -3,7 +3,7 @@ import torch
 
 import torch
 import vector
-
+import itertools 
 
 from scipy.optimize import linear_sum_assignment
 import numpy as np
@@ -58,7 +58,6 @@ def logminmax_forward_torch(x, scaler, device, eps=0.0):
     # restore NaNs
     x_scaled[mask] = torch.nan
     return x_scaled
-
 
 def logminmax_inverse_torch(x_scaled, logminmax, device):
     # logminmax is the fitted sklearn LogMinMaxScaler
@@ -117,7 +116,6 @@ def set_invariant_loss(output: torch.Tensor, targets: torch.Tensor, reduction: s
     else:
         raise ValueError(f"Unknown reduction: {reduction}")
     
-
 def W_boson_loss_function(
     outputs: dict,
     targets: dict,
@@ -155,7 +153,6 @@ def W_boson_loss_function(
         return combined_per_event
     else:
         raise ValueError(f"Unknown reduction: {reduction}")
-
 
 def invariant_mass_loss(
     output,
@@ -203,8 +200,6 @@ def invariant_mass_loss(
 
     return torch.nn.functional.mse_loss(inv_mass_scaled.unsqueeze(-1), target_scaled_mass)
 
-import torch
-import itertools 
 
 def hungarian_match_top_W(outputs, targets, reduction="mean"):
     """
@@ -312,3 +307,26 @@ def hungarian_match_top_W(outputs, targets, reduction="mean"):
         "W":    matched_W,
         "loss": loss_per_event,
     }
+
+
+class MMDLoss(nn.Module):
+    def __init__(self, bandwidths=[0.1, 0.2, 0.5, 0.9, 1.4, 2.0]):
+        super().__init__()
+        self.bandwidths = bandwidths
+    
+    def forward(self, X, Y):
+        """X, Y: (batch, features)"""
+        total_mmd = 0.0
+        for b in self.bandwidths:
+            l = (b ** 2) / 2
+            XX_dist = torch.cdist(X, X, p=2) ** 2
+            YY_dist = torch.cdist(Y, Y, p=2) ** 2
+            XY_dist = torch.cdist(X, Y, p=2) ** 2
+            
+            K_XX = (1 + XX_dist / (2 * l)) ** (-1)
+            K_YY = (1 + YY_dist / (2 * l)) ** (-1)
+            K_XY = (1 + XY_dist / (2 * l)) ** (-1)
+            
+            total_mmd += K_XX.mean() + K_YY.mean() - 2 * K_XY.mean()
+        
+        return total_mmd / len(self.bandwidths)

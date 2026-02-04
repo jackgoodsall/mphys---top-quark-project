@@ -386,10 +386,18 @@ def generate_reconstruction_report(
     Path(report_file_dir).mkdir(exist_ok = True)
 
     with h5py.File(test_output_file_path, "r") as file_object:
+    
         targets = file_object["targets"][()]
 
         predicted = file_object["predicted"][()]
     
+    with h5py.File(raw_predict_file_path, "r") as raw_file:
+        src_mask = raw_file["src_mask"][()]  
+
+    jet_multiplicity = 20 - src_mask.astype(bool).sum(axis=1)
+
+
+
     reverse_transformers = joblib.load(target_reverse_transformer_path)
 
     if use_raw_targets_for_truth:
@@ -604,4 +612,56 @@ def generate_reconstruction_report(
     reco_label="Reco",
     )
 
-  
+    
+
+
+
+    diff = combined_predicted[:, 4] - combined_targets[:, 4]
+    unique_mult = np.unique(jet_multiplicity)
+
+    rmse_values = []
+    mult_bins = []
+
+    for m in unique_mult:
+        mask = (jet_multiplicity == m)
+        if not np.any(mask):
+            continue
+        mse = np.mean(diff[mask] ** 2)
+        rmse = np.sqrt(mse)
+        mult_bins.append(m)
+        rmse_values.append(rmse)
+
+    mult_bins = np.array(mult_bins)
+    rmse_values = np.array(rmse_values)
+    plt.figure()
+    plt.bar(mult_bins, rmse_values, width=0.8, align="center")
+    plt.plot([min(unique_mult), max(unique_mult)], [np.sqrt(np.mean(diff**2)), np.sqrt(np.mean(diff**2))])
+    plt.xlabel("Jet multiplicity")
+    plt.ylabel(r"RMSE of $M_{t\bar{t}}$ (GeV)")
+    plt.title(r"$M_{t\bar{t}}$ RMSE vs jet multiplicity")
+    plt.xticks(mult_bins)  # integer ticks for multiplicities
+    plt.tight_layout()
+
+    save_path = os.path.join(report_file_dir, "rmse_invmass_per_jet_mult.png")
+    plt.savefig(save_path)
+    plt.show()
+    plt.close()
+
+
+    counts = np.array([(jet_multiplicity == m).sum() for m in mult_bins])
+    total = len(jet_multiplicity)
+    percentages = 100.0 * counts / total
+
+    plt.figure()
+    plt.bar(mult_bins, percentages, width=0.8, align="center")
+
+    plt.xlabel("Jet multiplicity")
+    plt.ylabel(r"RMSE of $M_{t\bar{t}}$ (GeV)")
+    plt.title(r"$M_{t\bar{t}}$ RMSE vs jet multiplicity")
+    plt.xticks(mult_bins)  # integer ticks for multiplicities
+    plt.tight_layout()
+
+    save_path = os.path.join(report_file_dir, "percetange of data per multi.png")
+    plt.savefig(save_path)
+    plt.show()
+    plt.close()

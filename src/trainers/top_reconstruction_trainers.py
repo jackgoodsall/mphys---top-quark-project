@@ -56,6 +56,8 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.reverse_transformers = joblib.load( Path(self.config["data_modules"]["input_path"], "target_transforms.joblib"))
         self.val_loss_history = []
 
+        self.mmd_calculator = MMDLoss()
+        self.alpha2 = training_config.get("alpha2", 0)
 
         self.test_metrics = {}
 
@@ -156,15 +158,26 @@ class ReconstructionTrainer(lightning.LightningModule):
     
     def loss_function(self, outputs, targets):
 
-        if self.reconstruct_Ws: 
-            if self.use_hungarian:
-                hungarian_outputs = hungarian_match_top_W(outputs, targets)
-                inv_loss = invariant_mass_loss(hungarian_outputs["top"], targets["inv_mass"], self.reverse_transformers[0], self.reverse_transformers[1], self.reverse_transformers[3], self.inv_mass_transform )
-                return hungarian_outputs["loss"] + inv_loss
-            return W_boson_loss_function(outputs, targets) + invariant_mass_loss(outputs["top"], targets["inv_mass"], self.reverse_transformers[0], self.reverse_transformers[1], self.reverse_transformers[3], mass_mean = 6.352097, mass_std = 0.30358553)
+
+        if self.use_hungarian:
+            hungarian_outputs = hungarian_match_top_W(outputs, targets)
+            inv_loss = invariant_mass_loss(hungarian_outputs["top"], targets["inv_mass"], self.reverse_transformers[0], self.reverse_transformers[1], self.reverse_transformers[3], self.inv_mass_transform )
+            base_loss = inv_loss + hungarian_outputs["loss"]
+
+   
+            outputs = hungarian_outputs["top"]
+            targets = targets["top"][:, : 2 , :]
         
-        return set_invariant_loss(outputs, targets)
-    
+            # Just add ONE MMD term to start simple
+            combined_outputs = torch.cat((outputs[:, 0], outputs[:, 1]), dim=0)
+            combined_targets = torch.cat((targets[:, 0], targets[:, 1]), dim=0)
+            mmd = self.mmd_calculator(combined_outputs[:, [0, 1]], combined_targets[:, [0,1]])  # Just first 2 featesur
+            mmd2 = self.mmd_calculator(combined_outputs[:, [0, 4]], combined_targets[:, [0,4]])
+            mmd3 = self.mmd_calculator(combined_outputs[:, [0, 4]], combined_targets[:, [0,4]])
+            mmd4 = self.mmd_calculator(combined_outputs[:, [2, 3]], combined_targets[:, [2,3]])
+        return base_loss + self.alpha2 * (mmd + mmd2 + mmd3 + mmd4)
+
+
     def on_train_epoch_end(self):
 
         cm = self.trainer.callback_metrics
