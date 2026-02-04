@@ -17,11 +17,15 @@ if __name__ == "__main__":
 
 
     particle_embedder = ParticleEmbedder(**config["model_parameters"]["particle_embedder"])
-    reverse_embedder = ReverseEmbedder(**config["model_parameters"]["reverse_embedder"])
+    masked_prediction_head = ReverseEmbedder(**config["model_parameters"]["masked_prediction_head"])
+    kinematic_regression_head = ReverseEmbedder(**config["model_parameters"]["kinematic_regression_head"])
+    
     interactions_embedder = InteractionEmbedder(**config["model_parameters"]["interaction_embedder"])
    
     transformer_model = MaskedReconstructionPart(particle_embedder,interactions_embedder
-                                                            , reverse_embedder, **config["model_parameters"]["transformer"], reconstruct_Ws = True,
+                                                            , masked_prediction_head,  kinematic_regression_head , 
+                                                            **config["model_parameters"]["transformer"], 
+                                                            reconstruct_Ws = True,
                                                             use_hungarian_matching= config["use_hungarian_matching"])
     topantitopquark = TopandWReconstuctionDataModule(config)        
         
