@@ -1,6 +1,5 @@
 from models.particle_transformer import  *
 from trainers.particle_classifcation_trainer import *
-from data.top_classification_data_modules import *
 from data.top_quark_reconstruction import *
 from trainers.top_reconstruction_trainers import *
 from utils.utils import load_and_split_config, load_any_config
@@ -27,7 +26,7 @@ if __name__ == "__main__":
                                                             **config["model_parameters"]["transformer"], 
                                                             reconstruct_Ws = True,
                                                             use_hungarian_matching= config["use_hungarian_matching"])
-    topantitopquark = TopandWReconstuctionDataModule(config)        
+    topantitopquark = MaskedFormerDataModule(config)        
         
 
   
