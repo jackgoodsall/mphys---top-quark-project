@@ -63,8 +63,8 @@ class ReconstructionTrainer(lightning.LightningModule):
         
         self.save_hyperparameters(ignore = ["model"])
     
-    def forward(self, batch):
-        return self.model(batch)
+    def forward(self, batch, last_output_only = False):
+        return self.model(batch, last_output_only = last_output_only)
 
     def training_step(self, batch, batch_idx):
        
@@ -94,7 +94,7 @@ class ReconstructionTrainer(lightning.LightningModule):
     
     def test_step(self, batch, batch_idx):
         inputs, targets = batch
-        outputs = self(inputs)
+        outputs = self(inputs, last_output_only = True)
         loss = self.loss_function(outputs, targets)
 
         out_dir = Path(self.trainer.logger.log_dir)
@@ -102,14 +102,17 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
        
         self.test_metrics["test_loss"] = loss
-
-        targets = targets["jet_mask_true"]
-
+        outputs = outputs[0]
         with h5py.File(out_dir / "test_outputs.h5", "r+" ) as file:
-            file["targets"][self.start_idx: self.start_idx + len(targets)] = targets.view(-1, 1, 20).cpu().numpy()
-            file["predicted"][self.start_idx: self.start_idx + len(targets)] = outputs.cpu().numpy()
+            batch_size = len(targets["target_kinematics"])
+            
+            file["target_kinematics"][self.start_idx: self.start_idx + batch_size] = targets["target_kinematics"].view(-1, 1, 5).cpu().numpy()
+            file["predicted_kinematics"][self.start_idx: self.start_idx + batch_size] = outputs["object_kinematics"].cpu().numpy()
+            
+            file["target_masks"][self.start_idx: self.start_idx + batch_size] = targets["jet_mask_true"].view(-1, 1, 20).cpu().numpy()
+            file["predicted_masks"][self.start_idx: self.start_idx + batch_size] = outputs["mask_predictions"].cpu().numpy()
 
-            self.start_idx += len(targets)
+            self.start_idx += batch_size
 
 
         return loss
@@ -128,7 +131,7 @@ class ReconstructionTrainer(lightning.LightningModule):
         scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
         step_size=2000,  # every 1000 steps
-        gamma=0.5,
+        gamma=0.7,
         )
 
         return {
@@ -142,10 +145,12 @@ class ReconstructionTrainer(lightning.LightningModule):
             }
     
     def loss_function(self, outputs, targets):
-
-
-        masked_loss = total_masked_loss(outputs, targets)
-        return masked_loss["loss_total"]
+        total_loss = 0 
+        for _ , v in outputs.items():
+            masked_loss = total_masked_loss(v["mask_predictions"], targets)
+            mse_regression_loss = nn.MSELoss()(v["object_kinematics"], targets["target_kinematics"])
+            total_loss += masked_loss["loss_total"] + mse_regression_loss
+        return total_loss
     
     def on_train_epoch_end(self):
 
@@ -184,21 +189,22 @@ class ReconstructionTrainer(lightning.LightningModule):
         
 
         with h5py.File(out_dir / "test_outputs.h5", "w" ) as file:
-            file.create_dataset("targets",
+            file.create_dataset("target_masks",
                                    shape = (number_events, 1, 20) )
 
-            file.create_dataset("predicted",
+            file.create_dataset("predicted_masks",
                                   shape = (number_events, 1, 20))
+            file.create_dataset("target_kinematics",
+                                   shape = (number_events, 1, 5) )
+
+            file.create_dataset("predicted_kinematics",
+                                  shape = (number_events, 1, 5))
 
         self.start_idx = 0
         self.W_start_idx = 0
 
     def on_test_end(self):
         out_dir = Path(self.trainer.logger.log_dir)
-
-
-        
-        
 
     def on_train_end(self):
         out_dir = Path(self.trainer.logger.log_dir)
@@ -220,8 +226,6 @@ def train_reconstruction_model(
         model,
         data_module,
         config,
-        min_epochs,
-        max_epochs,
         use_lr_finder = False,
         use_early_stopping = True,
         early_stopping_params = None,

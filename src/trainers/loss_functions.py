@@ -331,33 +331,12 @@ def dice_loss(mask_logits, jet_mask_true, jet_valid_mask, eps: float = 1e-6):
     return loss.mean()
 
 
-def mask_loss_bce_dice(mask_logits: torch.Tensor,
-                       jet_mask_true: torch.Tensor,
-                       jet_valid_mask: torch.Tensor,
-                       w_bce: float = 0.5,
-                       w_dice: float = 0.5) -> torch.Tensor:
-    """
-    Combined BCE + Dice loss for the jet mask.
-    """
-    valid = jet_valid_mask.bool()
-
-    # BCE on valid jets
-    bce = F.binary_cross_entropy_with_logits(
-        mask_logits[valid],
-        jet_mask_true[valid].float(),
-    )
-
-    # Dice on full mask
-    dice = dice_loss(mask_logits, jet_mask_true, jet_valid_mask)
-
-    return w_bce * bce + w_dice * dice
-
 
 def total_masked_loss(
     outputs: dict,
     targets: dict,
     w_bce: float = 0.5,
-    w_dice: float =10,
+    w_dice: float =0.5,
 ) -> dict:
     """
     Combined mask-only loss: BCE + Dice.
