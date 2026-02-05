@@ -35,7 +35,6 @@ if __name__ == "__main__":
     trainer, model = train_reconstruction_model(transformer_model,
                                                 topantitopquark,
                                                 config,
-                                                5, 20,
                                                 reconstruct_Ws = config["reconstruct_W"])
     trainer.test(model, datamodule = topantitopquark)
 
