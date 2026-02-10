@@ -294,44 +294,88 @@ def plot_reco_truth(
     fig_save_name,
     truth_label="Truth",
     reco_label="Reco",
+    range=None,
+    ratio_ylim=(0.5, 1.5),  # Default range for ratio plot
 ):
+    """
+    Plot truth vs reconstruction distributions with ratio panel.
+    
+    Parameters
+    ----------
+    X : array-like
+        Truth values
+    Y : array-like
+        Reconstructed values
+    n_bins : int
+        Number of bins for histograms
+    X_label : str
+        Label for x-axis
+    Y_label : str
+        Label for y-axis (counts)
+    title : str
+        Plot title
+    fig_save_path : str or Path
+        Directory to save figure
+    fig_save_name : str
+        Filename (without extension)
+    truth_label : str, optional
+        Label for truth histogram
+    reco_label : str, optional
+        Label for reco histogram
+    range : tuple of float, optional
+        (min, max) range for histograms. If None, uses data min/max.
+    ratio_ylim : tuple of float, optional
+        (min, max) y-axis limits for ratio panel. If None, auto-scales.
+    
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : tuple of matplotlib.axes.Axes
+        (ax_top, ax_bottom)
+    """
     X = X.reshape(-1)
     Y = Y.reshape(-1)
+    
     fig, (ax_top, ax_bottom) = plt.subplots(
         2, 1,
         figsize=(8, 6),
         sharex=True,
         gridspec_kw={"height_ratios": [3, 1]}
     )
-
-    # Consistent binning for both
-    data_min = min(np.min(X), np.min(Y))
-    data_max = max(np.max(X), np.max(Y))
+    
+    # Determine binning range
+    if range is None:
+        data_min = min(np.min(X), np.min(Y))
+        data_max = max(np.max(X), np.max(Y))
+    else:
+        data_min, data_max = range
+    
     bins = np.linspace(data_min, data_max, n_bins + 1)
-
+    
     # --- Top: histograms ---
     ax_top.hist(
         X,
         bins=bins,
         histtype="step",
         label=truth_label,
+        linewidth=1.5,
     )
     ax_top.hist(
         Y,
         bins=bins,
         histtype="step",
         label=reco_label,
+        linewidth=1.5,
     )
-
     ax_top.set_ylabel(Y_label)
     ax_top.set_title(title)
     ax_top.legend()
     ax_top.grid(True, which="both", linestyle=":", alpha=0.7)
-
+    
     # --- Bottom: reco / truth ratio ---
     truth_counts, _ = np.histogram(X, bins=bins)
     reco_counts, _ = np.histogram(Y, bins=bins)
-
+    
     # Avoid divide-by-zero: put NaN where truth is 0
     ratio = np.divide(
         reco_counts,
@@ -339,21 +383,26 @@ def plot_reco_truth(
         out=np.full_like(reco_counts, np.nan, dtype=float),
         where=truth_counts != 0,
     )
-
+    
     bin_centers = 0.5 * (bins[:-1] + bins[1:])
-
-    ax_bottom.step(bin_centers, ratio, where="mid")
-    ax_bottom.axhline(1.0, linestyle="--", linewidth=1)
+    ax_bottom.step(bin_centers, ratio, where="mid", linewidth=1.5)
+    ax_bottom.axhline(1.0, linestyle="--", linewidth=1, color="black", alpha=0.7)
     ax_bottom.set_xlabel(X_label)
     ax_bottom.set_ylabel("Reco / Truth")
+    
+    # Set ratio y-limits
+    if ratio_ylim is not None:
+        ax_bottom.set_ylim(ratio_ylim)
+    
     ax_bottom.grid(True, which="both", linestyle=":", alpha=0.7)
-
+    
     plt.tight_layout()
-
+    
+    # Save figure
     fig_save_path = Path(fig_save_path)
     fig_save_path.mkdir(parents=True, exist_ok=True)
-    fig.savefig(fig_save_path / f"{fig_save_name}.png", dpi = 1000)
-
+    fig.savefig(fig_save_path / f"{fig_save_name}.png", dpi=300, bbox_inches="tight")
+    
     return fig, (ax_top, ax_bottom)
 
 def cartesian_to_polar(fourvec, eps=1e-9):
