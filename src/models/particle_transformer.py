@@ -552,28 +552,41 @@ class MaskedReconstructionPart(nn.Module):
                  ):
         super().__init__()
 
+
+        ## Model paramaters
+        ## TO DO :  
+        ##      Remove the decrepted parameters that are not longer used. 
+        ## 
+        ##
         self.reconstruct_Ws = reconstruct_Ws
         self.particle_embedder = particle_embedder
         self.interaction_embedder = interaction_embedder
         self.masked_predictor = masked_predictor
         self.regression_predictor = kinematic_regressor
-        
         self.number_class_tokens = number_class_tokens
         self.use_hungarian_matching = use_hungarian_matching
 
+
+        ## Encoder stackin a module list so I can loop through them
         self.encoder_stack = nn.ModuleList(
             [ParticleAttentionBlock(embedding_size, dim_ff,
                                     n_heads, p_dropout,pair_wise_dim=8) for _ in range(n_encoder_layers)]
         )
-        self.target_tokens = nn.Parameter(torch.rand((1, embedding_size)) * 0.01)
+
+        ## Target tokens as a parameter
+        self.target_tokens = nn.Parameter(torch.rand((self.number_class_tokens, embedding_size)) * 0.01)
         
-        self.decoder_layer = nn.TransformerDecoderLayer(
+        ## Decoder layer stack - in a module list so that I can loop through them
+        self.decoder_stack = nn.ModuleList(
+            [nn.TransformerDecoderLayer(
             embedding_size, n_heads, dim_ff, p_dropout, activation = activation_function,
             batch_first= True
-        )
-        self.decoder_stack = nn.TransformerDecoder(self.decoder_layer, n_decoder_layers)
+        ) for _ in range(n_decoder_layers) ])
 
-    def forward(self, X):
+        
+
+    def forward(self, X, last_output_only = False):
+
         # Unpack
         jet = X["jet"]
         interactions = X["interactions"]
@@ -585,17 +598,38 @@ class MaskedReconstructionPart(nn.Module):
         
         B, N, F = jet.shape
 
-        # Encode
+        # Encoding layers
         for layer in self.encoder_stack:
             memory = layer(jet, interactions)
 
-        tgt = self.target_tokens.expand(B,1 , F)
-        tgt = self.decoder_stack(tgt, memory, memory_key_padding_mask = ~src_mask)
+        ## Expand the target tokens to size of batchs
+        tgt = self.target_tokens.expand(B, 1 , F)
 
-        ## Per query we get a binary mask over the input features
-        ## to say whether they are relevent
-        mask_prediction = self.masked_predictor(tgt)
-        object_regression = self.regression_predictor(tgt)
+        layer_outputs = {}
+        
+        ## Loop through the layers and get outputs of every layer for layer wise 
+        ## task computing
+        for i, layer in enumerate(self.decoder_stack):
+            tgt = layer(tgt, memory, memory_key_padding_mask = ~src_mask)
+            
+            mask_prediction = torch.einsum("bnd , bmd -> bnm",
+                                        tgt,
+                                        memory)
+            
 
-        return mask_prediction, object_regression
+            object_regression = self.regression_predictor(tgt)
+
+            layer_outputs[i] =  {
+            "mask_predictions" : mask_prediction,
+            "object_kinematics" : object_regression
+            }    
+                    
+        ## Return only the output of the last layer for test            
+        if last_output_only:
+            return  { 0 : {
+            "mask_predictions" : mask_prediction,
+            "object_kinematics" : object_regression
+            }    }     
+                    
+        return layer_outputs
     
