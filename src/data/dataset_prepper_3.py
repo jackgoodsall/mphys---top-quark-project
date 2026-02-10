@@ -134,103 +134,49 @@ class TargetProcessor(ABC):
         pass
 
 
-class BinaryMaskTargetProcessor(TargetProcessor):
-    """Processes targets as a binary mask (B, 20, 1) for classification."""
-
-    def get_target_count(self) -> int:
-        return 20 
-
-    def init_target_transformers(self) -> tuple:
-        return ()
-
-    def process_targets(self, targets_chunk: np.ndarray, is_temp: bool) -> Dict[str, np.ndarray]:
-        return {"targets": targets_chunk}
-
-    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
-        if targets_chunk.ndim == 2:
-            return targets_chunk.reshape(-1, 20, 1)
-        return targets_chunk
-
-    def get_save_keys(self) -> list:
-        return ["targets"]
-
-
-class CombinedMaskAndKinematicsProcessor(TargetProcessor):
-    """Processes binary mask, di-top kinematics, and invariant mass."""
+class IndividualParticleMaskAndKinematicsProcessor(TargetProcessor):
+    """Processes masks and kinematics for individual tops and W bosons."""
     
     def __init__(self):
-        self.ditop_transformers = None
-        self.mass_transformer = None
+        self.top_transformers = None
+        self.W_transformers = None
     
     def get_target_count(self) -> int:
-        return 1  # For di-top system (mask doesn't need count)
+        return 2  # 2 tops and 2 Ws
     
     def init_target_transformers(self) -> tuple:
-        """Initialize transformers for di-top kinematics AND mass."""
-        ditop_trans = (
+        """Initialize transformers for both tops and Ws kinematics."""
+        # Transformers for top kinematics (pt, eta, phi, energy)
+        top_trans = (
             LogMinMaxScaler(),      # pt
             StandardScaler(),       # eta
             PhiTransformer(),       # phi -> cos(phi), sin(phi)
             LogMinMaxScaler(),      # energy
         )
-        mass_trans = LogMinMaxScaler()  # invariant mass
         
-        self.ditop_transformers = ditop_trans
-        self.mass_transformer = mass_trans
-        
-        return (ditop_trans, mass_trans)
-    
-    def process_targets(self, targets_dict: Dict[str, np.ndarray], is_temp: bool) -> Dict[str, np.ndarray]:
-        """Apply target-specific processing."""
-        # Binary mask needs no processing
-        # Di-top kinematics is processed in _transform_targets
-        return targets_dict
-    
-    def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
-        """Not used for this combined processor."""
-        return targets_chunk
-    
-    def get_save_keys(self) -> list:
-        return ["targets", "target_kinematics", "target_mass"]
-
-
-class DiTopKinematicsProcessor(TargetProcessor):
-    """Processes combined di-top system kinematics + invariant mass."""
-    
-    def __init__(self):
-        self.ditop_transformers = None
-        self.mass_transformer = None
-    
-    def get_target_count(self) -> int:
-        return 1  # Single combined di-top system
-    
-    def init_target_transformers(self) -> tuple:
-        """Initialize transformers for di-top kinematics AND mass."""
-        ditop_trans = (
+        # Transformers for W kinematics (same structure)
+        W_trans = (
             LogMinMaxScaler(),      # pt
             StandardScaler(),       # eta
-            PhiTransformer(),       # phi
+            PhiTransformer(),       # phi -> cos(phi), sin(phi)
             LogMinMaxScaler(),      # energy
         )
-        mass_trans = LogMinMaxScaler()  # invariant mass
         
-        self.ditop_transformers = ditop_trans
-        self.mass_transformer = mass_trans
+        self.top_transformers = top_trans
+        self.W_transformers = W_trans
         
-        return (ditop_trans, mass_trans)
+        return (top_trans, W_trans)
     
     def process_targets(self, targets_dict: Dict[str, np.ndarray], is_temp: bool) -> Dict[str, np.ndarray]:
-        """Apply target-specific processing for di-top system."""
+        """Masks don't need processing, kinematics handled in _transform_targets."""
         return targets_dict
     
     def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
-        """Reshape targets to (B, 1, 4) format."""
-        if targets_chunk.ndim == 2:
-            return targets_chunk.reshape(-1, 1, 4)
+        """Not used for this processor."""
         return targets_chunk
     
     def get_save_keys(self) -> list:
-        return ["target_kinematics", "target_mass"]
+        return ["masks_tops", "masks_Ws", "kinematics_tops", "kinematics_Ws"]
 
 
 class InteractionProcessor(ABC):
@@ -271,72 +217,70 @@ class TargetExtractor(ABC):
         pass
 
 
-class BinaryMaskTargetExtractor(TargetExtractor):
-    """Creates a binary mask (B, 20, 1) from jet_truthmatch."""
-
-    def __init__(self, match_labels: np.ndarray = None):
-        self.match_labels = match_labels if match_labels is not None else np.array([1, 2, 3, 4, 5, 6])
-
-    def extract_targets(
-        self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
-    ) -> Dict[str, np.ndarray]:
-        """Creates a binary mask where 1 means the jet is a truth-matched constituent."""
-        B, P, F = jet_chunk.shape
-        jet_tags = jet_chunk[..., 6]
-
-        target_mask_bool = np.isin(jet_tags, self.match_labels)
-        targets_np = target_mask_bool.astype(np.float32)
-        binary_mask = targets_np[..., np.newaxis] 
-
-        return {"targets": binary_mask}
-
-
-class ReconstructedTargetExtractor(TargetExtractor):
+class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
     """
-    Reconstructs targets (Tops and W bosons) from jets using a fully 
-    VECTORIZED grouped reduction approach (no Python loop over events).
+    Extracts binary masks (B, 2, P) and reconstructed kinematics (B, 2, 5) 
+    for both tops and W bosons using fully vectorized operations.
     """
 
-    def __init__(self, tag_top1: np.ndarray = None, tag_top2: np.ndarray = None,
-                 tag_W1: np.ndarray = None, tag_W2: np.ndarray = None):
+    def __init__(self, 
+                 tag_top1: np.ndarray = None, 
+                 tag_top2: np.ndarray = None,
+                 tag_W1: np.ndarray = None, 
+                 tag_W2: np.ndarray = None,
+                 num_jets: int = 20):
         # Set default truth-matching tags
         self.tag_top1 = tag_top1 if tag_top1 is not None else np.array([1, 2, 3])
         self.tag_top2 = tag_top2 if tag_top2 is not None else np.array([4, 5, 6])
         self.tag_W1 = tag_W1 if tag_W1 is not None else np.array([2, 3])
         self.tag_W2 = tag_W2 if tag_W2 is not None else np.array([5, 6])
+        self.num_jets = num_jets
         
-        # Define tasks as a list of (tags, array_name, index) for simplified loop placement
+        # Define reconstruction tasks: (tags, particle_type, index)
         self.reco_tasks = [
-            (self.tag_top1, "tops", 0),  
-            (self.tag_top2, "tops", 1),  
-            (self.tag_W1, "Ws", 0),      
-            (self.tag_W2, "Ws", 1),      
+            (self.tag_top1, "tops", 0),
+            (self.tag_top2, "tops", 1),
+            (self.tag_W1, "Ws", 0),
+            (self.tag_W2, "Ws", 1),
         ]
 
     def extract_targets(
         self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
     ) -> Dict[str, np.ndarray]:
         """
-        Reconstruct top quarks and W bosons by summing truth-matched jets 
-        using fully vectorized NumPy Grouped Array Reduction (np.bincount).
+        Extract binary masks and reconstructed kinematics for tops and Ws.
         
         Args:
             jet_chunk (np.ndarray): Input jet array (B, P, F) where F includes 
-                                    pt, eta, phi, mass, and truthmatch tag (index 6).
-            targets_chunk (np.ndarray): Input truth targets (unused for reconstruction, 
-                                        but included for method signature consistency).
+                                    pt, eta, phi, energy, and truthmatch tag (index 6).
+            targets_chunk (np.ndarray): Unused for reconstruction.
 
         Returns:
-            Dict[str, np.ndarray]: Dictionary containing {"targets": reco_tops_full, 
-                                                         "W_targets": reco_Ws_full}.
+            Dict[str, np.ndarray]: Dictionary containing:
+                - "masks_tops": (B, 2, P) binary masks for [top1, top2]
+                - "masks_Ws": (B, 2, P) binary masks for [W1, W2]
+                - "kinematics_tops": (B, 2, 5) kinematics for [top1, top2]
+                - "kinematics_Ws": (B, 2, 5) kinematics for [W1, W2]
         """
         B, P, F = jet_chunk.shape
         
-        # --- 1. Prepare Flattened Inputs (B*P jets) ---
+        # --- 1. Extract Binary Masks ---
         
-        jet_tags = jet_chunk[..., 6] # Tags (float/int)
+        jet_tags = jet_chunk[..., 6]  # Shape (B, P)
         
-        # Create a single vector array for ALL jets (B*P elements)
+        # Create masks for each particle (B, P) -> (B, 2, P)
+        top1_mask = np.isin(jet_tags, self.tag_top1).astype(np.float32)
+        top2_mask = np.isin(jet_tags, self.tag_top2).astype(np.float32)
+        W1_mask = np.isin(jet_tags, self.tag_W1).astype(np.float32)
+        W2_mask = np.isin(jet_tags, self.tag_W2).astype(np.float32)
+        
+        # Stack masks: (B, 2, P)
+        masks_tops = np.stack([top1_mask, top2_mask], axis=1)  # (B, 2, P)
+        masks_Ws = np.stack([W1_mask, W2_mask], axis=1)        # (B, 2, P)
+        
+        # --- 2. Reconstruct Kinematics (Vectorized) ---
+        
+        # Prepare flattened inputs
         flat_jets_vec = vector.zip({
             "pt": jet_chunk[..., 0].flatten(),
             "eta": jet_chunk[..., 1].flatten(),
@@ -344,117 +288,7 @@ class ReconstructedTargetExtractor(TargetExtractor):
             "energy": jet_chunk[..., 3].flatten(),
         })
         
-        # Create a group index for every jet (The event ID, 0 to B-1)
-        event_indices = np.repeat(np.arange(B), P) # Shape (B*P,)
-        flat_tags = jet_tags.flatten()
-        
-        # Convert to Cartesian (Px, Py, Pz, E) for accurate linear summation
-        flat_px = flat_jets_vec.px.to_numpy()
-        flat_py = flat_jets_vec.py.to_numpy()
-        flat_pz = flat_jets_vec.pz.to_numpy()
-        flat_E = flat_jets_vec.energy.to_numpy()
-        
-        # Initialize the output arrays (B events, 2 particles, 4 features: pt, eta, phi, mass)
-        reco_tops = np.zeros((B, 2, 4), dtype=np.float32)
-        reco_Ws = np.zeros((B, 2, 4), dtype=np.float32)
-        
-        # --- 2. Vectorized Reconstruction Loop (Over 4 Target Types) ---
-        
-        for tags, target_type, idx in self.reco_tasks:
-            
-            # 2a. Mask: Select jets matched to the current target 
-            tag_mask = np.isin(flat_tags, tags)
-            
-            # 2b. Filter: Select only the indices for matched jets
-            matched_indices = event_indices[tag_mask]
-            
-            if matched_indices.size == 0:
-                continue
-            
-            # 2c. Grouped Reduction (np.bincount)
-            # Sum Cartesian components (Px, Py, Pz, E) grouped by event ID
-            sum_px = np.bincount(matched_indices, weights=flat_px[tag_mask], minlength=B)
-            sum_py = np.bincount(matched_indices, weights=flat_py[tag_mask], minlength=B)
-            sum_pz = np.bincount(matched_indices, weights=flat_pz[tag_mask], minlength=B)
-            sum_E = np.bincount(matched_indices, weights=flat_E[tag_mask], minlength=B)
-            
-            # 2d. Reconstruct the resulting 4-vector from the summed components
-            reco_cartesian = vector.zip({
-                "px": sum_px, 
-                "py": sum_py, 
-                "pz": sum_pz, 
-                "E": sum_E
-            })
-            
-            # 2e. Convert back to Polar coordinates (pt, eta, phi, mass)
-            reco_pteta_mass = np.stack([
-                reco_cartesian.pt.to_numpy(),
-                reco_cartesian.eta.to_numpy(),
-                reco_cartesian.phi.to_numpy(),
-                reco_cartesian.E.to_numpy(),
-            ], axis=-1) # Shape (B, 4)
-            
-            # 2f. Placement: Store the result in the correct output array and index
-            if target_type == "tops":
-                reco_tops[:, idx, :] = reco_pteta_mass
-            else: # target_type == "Ws"
-                reco_Ws[:, idx, :] = reco_pteta_mass
-
-        # --- 3. Final Output Formatting ---
-        
-        # Append the 5th column (placeholder ID/PDG=0) for consistency with the rest of the pipeline
-        reco_tops_full = np.concatenate([reco_tops, np.full((B, 2, 1), 0, dtype=np.float32)], axis=-1)
-        reco_Ws_full = np.concatenate([reco_Ws, np.full((B, 2, 1), 0, dtype=np.float32)], axis=-1)
-        
-        return {"targets": reco_tops_full, "W_targets": reco_Ws_full}
-
-
-class CombinedMaskAndKinematicsExtractor(TargetExtractor):
-    """
-    Extracts binary mask, combined di-top system kinematics, AND invariant mass.
-    """
-
-    def __init__(self, match_labels: np.ndarray = None, 
-                 tag_top1: np.ndarray = None, tag_top2: np.ndarray = None):
-        # Binary mask labels
-        self.match_labels = match_labels if match_labels is not None else np.array([1, 2, 3, 4, 5, 6])
-        
-        # Di-top kinematics labels
-        self.tag_top1 = tag_top1 if tag_top1 is not None else np.array([1, 2, 3])
-        self.tag_top2 = tag_top2 if tag_top2 is not None else np.array([4, 5, 6])
-        self.tag_ditop = np.concatenate([self.tag_top1, self.tag_top2])
-
-    def extract_targets(
-        self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
-    ) -> Dict[str, np.ndarray]:
-        """
-        Extract binary mask, di-top kinematics, and invariant mass.
-        
-        Returns:
-            Dict with keys:
-                - "targets": (B, P, 1) - binary mask
-                - "target_kinematics": (B, 1, 4) - di-top system
-                - "target_mass": (B, 1) - invariant mass
-        """
-        B, P, F = jet_chunk.shape
-        
-        # --- 1. Extract Binary Mask ---
-        jet_tags = jet_chunk[..., 6]
-        target_mask_bool = np.isin(jet_tags, self.match_labels)
-        targets_np = target_mask_bool.astype(np.float32)
-        binary_mask = targets_np[..., np.newaxis]  # (B, P, 1)
-        
-        # --- 2. Extract Di-Top Kinematics + Mass ---
-        # Create vector array for all jets
-        flat_jets_vec = vector.zip({
-            "pt": jet_chunk[..., 0].flatten(),
-            "eta": jet_chunk[..., 1].flatten(),
-            "phi": jet_chunk[..., 2].flatten(),
-            "energy": jet_chunk[..., 3].flatten(),
-        })
-        
-        # Event indices and tags
-        event_indices = np.repeat(np.arange(B), P)
+        event_indices = np.repeat(np.arange(B), P)  # (B*P,)
         flat_tags = jet_tags.flatten()
         
         # Convert to Cartesian for accurate summation
@@ -463,158 +297,69 @@ class CombinedMaskAndKinematicsExtractor(TargetExtractor):
         flat_pz = flat_jets_vec.pz.to_numpy()
         flat_E = flat_jets_vec.energy.to_numpy()
         
-        # Mask for all jets belonging to either top quark
-        ditop_mask = np.isin(flat_tags, self.tag_ditop)
-        matched_indices = event_indices[ditop_mask]
+        # Initialize output arrays (B, 2, 4) for [pt, eta, phi, energy]
+        reco_tops = np.zeros((B, 2, 4), dtype=np.float32)
+        reco_Ws = np.zeros((B, 2, 4), dtype=np.float32)
         
-        if matched_indices.size == 0:
-            # Return zeros if no matched jets found
-            ditop_system = np.zeros((B, 1, 4), dtype=np.float32)
-            ditop_mass = np.zeros((B, 1), dtype=np.float32)
-        else:
-            # Sum all Cartesian components for the combined system
-            sum_px = np.bincount(matched_indices, weights=flat_px[ditop_mask], minlength=B)
-            sum_py = np.bincount(matched_indices, weights=flat_py[ditop_mask], minlength=B)
-            sum_pz = np.bincount(matched_indices, weights=flat_pz[ditop_mask], minlength=B)
-            sum_E = np.bincount(matched_indices, weights=flat_E[ditop_mask], minlength=B)
+        # Vectorized reconstruction for all 4 particles
+        for tags, particle_type, idx in self.reco_tasks:
+            # Select jets matched to current particle
+            tag_mask = np.isin(flat_tags, tags)
+            matched_indices = event_indices[tag_mask]
             
-            # Reconstruct the combined 4-vector
-            ditop_vec = vector.zip({
+            if matched_indices.size == 0:
+                continue
+            
+            # Grouped reduction: sum Cartesian components by event
+            sum_px = np.bincount(matched_indices, weights=flat_px[tag_mask], minlength=B)
+            sum_py = np.bincount(matched_indices, weights=flat_py[tag_mask], minlength=B)
+            sum_pz = np.bincount(matched_indices, weights=flat_pz[tag_mask], minlength=B)
+            sum_E = np.bincount(matched_indices, weights=flat_E[tag_mask], minlength=B)
+            
+            # Reconstruct 4-vector
+            reco_vec = vector.zip({
                 "px": sum_px,
                 "py": sum_py,
                 "pz": sum_pz,
                 "E": sum_E
             })
             
-            # Convert to polar coordinates (pt, eta, phi, energy)
-            ditop_kinematics = np.stack([
-                ditop_vec.pt.to_numpy(),
-                ditop_vec.eta.to_numpy(),
-                ditop_vec.phi.to_numpy(),
-                ditop_vec.E.to_numpy(),
-            ], axis=-1)  # Shape (B, 4)
+            # Convert to polar coordinates
+            reco_polar = np.stack([
+                reco_vec.pt.to_numpy(),
+                reco_vec.eta.to_numpy(),
+                reco_vec.phi.to_numpy(),
+                reco_vec.E.to_numpy(),
+            ], axis=-1)  # (B, 4)
             
-            # Compute invariant mass: m^2 = E^2 - p^2
-            p2 = sum_px**2 + sum_py**2 + sum_pz**2
-            m2 = sum_E**2 - p2
-            inv_mass = np.sqrt(np.maximum(m2, 0.0))  # Clamp negative values to 0
-            
-            # Reshape to (B, 1, 4) and (B, 1)
-            ditop_system = ditop_kinematics[:, np.newaxis, :]  # (B, 1, 4)
-            ditop_mass = inv_mass[:, np.newaxis]  # (B, 1)
+            # Store in appropriate array
+            if particle_type == "tops":
+                reco_tops[:, idx, :] = reco_polar
+            else:  # "Ws"
+                reco_Ws[:, idx, :] = reco_polar
+        
+        # --- 3. Add Placeholder Column (5th feature = 0) ---
+        
+        kinematics_tops = np.concatenate([
+            reco_tops, 
+            np.zeros((B, 2, 1), dtype=np.float32)
+        ], axis=-1)  # (B, 2, 5)
+        
+        kinematics_Ws = np.concatenate([
+            reco_Ws,
+            np.zeros((B, 2, 1), dtype=np.float32)
+        ], axis=-1)  # (B, 2, 5)
         
         return {
-            "targets": binary_mask,
-            "target_kinematics": ditop_system,
-            "target_mass": ditop_mass
-        }
-
-
-class DiTopKinematicsExtractor(TargetExtractor):
-    """
-    Extracts combined di-top system kinematics AND invariant mass.
-    """
-
-    def __init__(self, tag_top1: np.ndarray = None, tag_top2: np.ndarray = None):
-        # Set default truth-matching tags for both tops
-        self.tag_top1 = tag_top1 if tag_top1 is not None else np.array([1, 2, 3])
-        self.tag_top2 = tag_top2 if tag_top2 is not None else np.array([4, 5, 6])
-        # Combined tags for the full di-top system
-        self.tag_ditop = np.concatenate([self.tag_top1, self.tag_top2])
-
-    def extract_targets(
-        self, jet_chunk: np.ndarray, targets_chunk: np.ndarray
-    ) -> Dict[str, np.ndarray]:
-        """
-        Reconstruct the combined di-top system and compute its invariant mass.
-        
-        Returns:
-            Dict with keys:
-                - "target_kinematics": (B, 1, 4) - [pt, eta, phi, E]
-                - "target_mass": (B, 1) - invariant mass
-        """
-        B, P, F = jet_chunk.shape
-        
-        # --- 1. Prepare Flattened Inputs ---
-        
-        jet_tags = jet_chunk[..., 6]
-        
-        # Create vector array for all jets
-        flat_jets_vec = vector.zip({
-            "pt": jet_chunk[..., 0].flatten(),
-            "eta": jet_chunk[..., 1].flatten(),
-            "phi": jet_chunk[..., 2].flatten(),
-            "energy": jet_chunk[..., 3].flatten(),
-        })
-        
-        # Event indices and tags
-        event_indices = np.repeat(np.arange(B), P)
-        flat_tags = jet_tags.flatten()
-        
-        # Convert to Cartesian for accurate summation
-        flat_px = flat_jets_vec.px.to_numpy()
-        flat_py = flat_jets_vec.py.to_numpy()
-        flat_pz = flat_jets_vec.pz.to_numpy()
-        flat_E = flat_jets_vec.energy.to_numpy()
-        
-        # --- 2. Reconstruct Combined Di-Top System ---
-        
-        # Mask for all jets belonging to either top quark
-        ditop_mask = np.isin(flat_tags, self.tag_ditop)
-        matched_indices = event_indices[ditop_mask]
-        
-        if matched_indices.size == 0:
-            # Return zeros if no matched jets found
-            ditop_system = np.zeros((B, 1, 4), dtype=np.float32)
-            ditop_mass = np.zeros((B, 1), dtype=np.float32)
-            return {
-                "target_kinematics": ditop_system,
-                "target_mass": ditop_mass
-            }
-        
-        # Sum all Cartesian components for the combined system
-        sum_px = np.bincount(matched_indices, weights=flat_px[ditop_mask], minlength=B)
-        sum_py = np.bincount(matched_indices, weights=flat_py[ditop_mask], minlength=B)
-        sum_pz = np.bincount(matched_indices, weights=flat_pz[ditop_mask], minlength=B)
-        sum_E = np.bincount(matched_indices, weights=flat_E[ditop_mask], minlength=B)
-        
-        # Reconstruct the combined 4-vector
-        ditop_vec = vector.zip({
-            "px": sum_px,
-            "py": sum_py,
-            "pz": sum_pz,
-            "E": sum_E
-        })
-        
-        # Convert to polar coordinates (pt, eta, phi, energy)
-        ditop_kinematics = np.stack([
-            ditop_vec.pt.to_numpy(),
-            ditop_vec.eta.to_numpy(),
-            ditop_vec.phi.to_numpy(),
-            ditop_vec.E.to_numpy(),
-        ], axis=-1)  # Shape (B, 4)
-        
-        # --- 3. Compute Invariant Mass ---
-        
-        # Compute invariant mass: m^2 = E^2 - p^2
-        p2 = sum_px**2 + sum_py**2 + sum_pz**2
-        m2 = sum_E**2 - p2
-        inv_mass = np.sqrt(np.maximum(m2, 0.0))  # Clamp negative values to 0
-        
-        # --- 4. Format Output ---
-        
-        # Reshape to (B, 1, 4) and (B, 1)
-        ditop_system = ditop_kinematics[:, np.newaxis, :]  # (B, 1, 4)
-        ditop_mass = inv_mass[:, np.newaxis]  # (B, 1)
-        
-        return {
-            "target_kinematics": ditop_system,
-            "target_mass": ditop_mass
+            "masks_tops": masks_tops,
+            "masks_Ws": masks_Ws,
+            "kinematics_tops": kinematics_tops,
+            "kinematics_Ws": kinematics_Ws,
         }
 
 
 class TopReconstructionDatasetFromH5:
-    """Dataset preprocessor for binary mask target processing."""
+    """Dataset preprocessor with support for individual particle masks and kinematics."""
 
     def __init__(
         self,
@@ -629,7 +374,7 @@ class TopReconstructionDatasetFromH5:
         self.preprocessing_config = config.get("preprocessing", {})
         self.target_processor = target_processor
         self.interaction_processor = interaction_processor or NoInteractionProcessor()
-        self.target_extractor = target_extractor or BinaryMaskTargetExtractor()
+        self.target_extractor = target_extractor or IndividualParticleMaskAndKinematicsExtractor()
 
         self.raw_file_prefix_and_path = self._construct_path(
             self.raw_file_config.get("save_path", "./data"),
@@ -655,28 +400,19 @@ class TopReconstructionDatasetFromH5:
         print("[INIT] Complete!", flush=True)
 
     def _save_transformers(self):
-        """Save fitted transformers to separate disk files."""
-        print(f"[SAVE] Saving transformers to {self.save_dir}", flush=True)
+        """Save fitted transformers to disk."""
+        transform_save_path = self.save_dir / "target_transforms.joblib"
         
-        # Save jet transformers
-        jet_transform_path = self.save_dir / "jet_transforms.joblib"
-        joblib.dump(self.jet_transformers, jet_transform_path)
-        print(f"[SAVE] Jet transformers saved to {jet_transform_path}", flush=True)
+        print(f"[SAVE] Saving transformers to {transform_save_path}", flush=True)
         
-        # Save target transformers
-        target_transform_path = self.save_dir / "target_transforms.joblib"
-        joblib.dump(self.target_transformers, target_transform_path)
-        print(f"[SAVE] Target transformers saved to {target_transform_path}", flush=True)
-        
-        # Save interaction transformers (if they exist)
-        if self.interaction_transformers is not None:
-            interaction_transform_path = self.save_dir / "interaction_transforms.joblib"
-            joblib.dump(self.interaction_transformers, interaction_transform_path)
-            print(f"[SAVE] Interaction transformers saved to {interaction_transform_path}", flush=True)
-        else:
-            print(f"[SAVE] No interaction transformers to save", flush=True)
-        
-        print(f"[SAVE] All transformers saved successfully!", flush=True)
+        transformers_dict = {
+            "jet_transformers": self.jet_transformers,
+            "target_transformers": self.target_transformers,
+            "interaction_transformers": self.interaction_transformers,
+        }
+        transform_save_path.parent.mkdir(parents = True, exist_ok= True)
+        joblib.dump(transformers_dict, transform_save_path)
+        print(f"[SAVE] Transformers saved successfully!", flush=True)
 
     def _construct_path(self, directory: str, prefix: str) -> Path:
         """Helper to construct paths consistently."""
@@ -771,7 +507,6 @@ class TopReconstructionDatasetFromH5:
     def _fit_jet_transformers(self, jet_chunk: np.ndarray):
         """Fit jet transformers on jet data."""
         N, P, F = jet_chunk.shape
-        num_features_to_transform = len(self.jet_transformers)
         
         for i, transformer in enumerate(self.jet_transformers):
             var = jet_chunk[..., i]
@@ -779,47 +514,27 @@ class TopReconstructionDatasetFromH5:
             transformer.partial_fit(var_flat)
 
     def _fit_target_transformers(self, targets_dict: Dict[str, np.ndarray]):
-        """Fit target transformers on target data."""
-        # Handle different target processor types
-        if isinstance(self.target_processor, (DiTopKinematicsProcessor, CombinedMaskAndKinematicsProcessor)):
-            # Fit kinematics transformers
-            if "target_kinematics" in targets_dict:
-                target_chunk = targets_dict["target_kinematics"]
-                transformers = self.target_transformers[0]  # Kinematics transformers
-                
-                N, M, F = target_chunk.shape
-                
-                # Fit all 4 features (pt, eta, phi, energy) - no placeholder to skip
-                for i, transformer in enumerate(transformers):
-                    var = target_chunk[..., i]
-                    var_flat = var.reshape(-1, 1)
-                    transformer.partial_fit(var_flat)
-            
-            # Fit mass transformer
-            if "target_mass" in targets_dict:
-                mass_chunk = targets_dict["target_mass"]  # (B, 1)
-                mass_transformer = self.target_transformers[1]  # Mass transformer
-                mass_transformer.partial_fit(mass_chunk)
-        
-        elif hasattr(self.target_processor, 'top_transformers'):
-            # Handle processors with multiple transformer sets (like WBosonTargetProcessor)
-            # Fit top transformers
-            if "targets" in targets_dict:
-                tops_chunk = targets_dict["targets"]
+        """Fit target transformers on target kinematics data."""
+        if isinstance(self.target_processor, IndividualParticleMaskAndKinematicsProcessor):
+            # Fit top transformers (skip placeholder column at index 4)
+            if "kinematics_tops" in targets_dict:
+                tops_chunk = targets_dict["kinematics_tops"]
                 N, M, F = tops_chunk.shape
+                
                 for i, transformer in enumerate(self.target_processor.top_transformers):
-                    if i < F - 1:
+                    if i < F - 1:  # Skip placeholder
                         var = tops_chunk[..., i]
                         var_flat = var.reshape(-1, 1)
                         transformer.partial_fit(var_flat)
             
-            # Fit W transformers
-            if "W_targets" in targets_dict:
-                W_chunk = targets_dict["W_targets"]
-                N, M, F = W_chunk.shape
+            # Fit W transformers (skip placeholder column at index 4)
+            if "kinematics_Ws" in targets_dict:
+                Ws_chunk = targets_dict["kinematics_Ws"]
+                N, M, F = Ws_chunk.shape
+                
                 for i, transformer in enumerate(self.target_processor.W_transformers):
-                    if i < F - 1:
-                        var = W_chunk[..., i]
+                    if i < F - 1:  # Skip placeholder
+                        var = Ws_chunk[..., i]
                         var_flat = var.reshape(-1, 1)
                         transformer.partial_fit(var_flat)
 
@@ -870,7 +585,6 @@ class TopReconstructionDatasetFromH5:
                 jet_chunk = jet_chunk[event_filter]
                 event_chunk = event_chunk[event_filter]
                 targets_chunk = targets_chunk[event_filter]
-                
 
                 targets_dict = self.target_extractor.extract_targets(jet_chunk, targets_chunk)
                 
@@ -946,66 +660,43 @@ class TopReconstructionDatasetFromH5:
         return jet, interactions_transformed
 
     def _transform_targets(self, targets_dict: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """Transform target kinematics and mass."""
-        if isinstance(self.target_processor, (DiTopKinematicsProcessor, CombinedMaskAndKinematicsProcessor)):
-            # Transform di-top kinematics (binary mask stays unchanged)
-            if "target_kinematics" in targets_dict:
-                target_chunk = targets_dict["target_kinematics"]
-                transformers = self.target_transformers[0]  # Kinematics transformers
-                
-                N, M, F = target_chunk.shape
-                
-                # Transform all 4 features (pt, eta, phi, energy) - no placeholder
-                target_transformed_list = []
-                for i, transformer in enumerate(transformers):
-                    var = target_chunk[..., i]
-                    var_reshaped = var.reshape(-1, 1)
-                    transformed_var = transformer.transform(var_reshaped).reshape(N, M, -1)
-                    target_transformed_list.append(transformed_var)
-                
-                # Concatenate all transformed features (phi becomes 2 features)
-                targets_dict["target_kinematics"] = np.concatenate(target_transformed_list, axis=-1)
-            
-            # Transform mass
-            if "target_mass" in targets_dict:
-                mass_chunk = targets_dict["target_mass"]  # (B, 1)
-                mass_transformer = self.target_transformers[1]  # Mass transformer
-                targets_dict["target_mass"] = mass_transformer.transform(mass_chunk)
-        
-        elif hasattr(self.target_processor, 'top_transformers'):
-            # Transform tops
-            if "targets" in targets_dict:
-                tops_chunk = targets_dict["targets"]
+        """Transform target kinematics (masks stay unchanged)."""
+        if isinstance(self.target_processor, IndividualParticleMaskAndKinematicsProcessor):
+            # Transform top kinematics
+            if "kinematics_tops" in targets_dict:
+                tops_chunk = targets_dict["kinematics_tops"]
                 N, M, F = tops_chunk.shape
                 
                 tops_transformed_list = []
                 for i, transformer in enumerate(self.target_processor.top_transformers):
-                    if i < F - 1:
+                    if i < F - 1:  # Skip placeholder
                         var = tops_chunk[..., i]
                         var_reshaped = var.reshape(-1, 1)
                         transformed_var = transformer.transform(var_reshaped).reshape(N, M, -1)
                         tops_transformed_list.append(transformed_var)
                 
+                # Concatenate transformed features and add placeholder back
                 tops_transformed = np.concatenate(tops_transformed_list, axis=-1)
                 placeholder = tops_chunk[..., -1:]
-                targets_dict["targets"] = np.concatenate([tops_transformed, placeholder], axis=-1)
+                targets_dict["kinematics_tops"] = np.concatenate([tops_transformed, placeholder], axis=-1)
             
-            # Transform Ws
-            if "W_targets" in targets_dict:
-                W_chunk = targets_dict["W_targets"]
-                N, M, F = W_chunk.shape
+            # Transform W kinematics
+            if "kinematics_Ws" in targets_dict:
+                Ws_chunk = targets_dict["kinematics_Ws"]
+                N, M, F = Ws_chunk.shape
                 
-                W_transformed_list = []
+                Ws_transformed_list = []
                 for i, transformer in enumerate(self.target_processor.W_transformers):
-                    if i < F - 1:
-                        var = W_chunk[..., i]
+                    if i < F - 1:  # Skip placeholder
+                        var = Ws_chunk[..., i]
                         var_reshaped = var.reshape(-1, 1)
                         transformed_var = transformer.transform(var_reshaped).reshape(N, M, -1)
-                        W_transformed_list.append(transformed_var)
+                        Ws_transformed_list.append(transformed_var)
                 
-                W_transformed = np.concatenate(W_transformed_list, axis=-1)
-                placeholder = W_chunk[..., -1:]
-                targets_dict["W_targets"] = np.concatenate([W_transformed, placeholder], axis=-1)
+                # Concatenate transformed features and add placeholder back
+                Ws_transformed = np.concatenate(Ws_transformed_list, axis=-1)
+                placeholder = Ws_chunk[..., -1:]
+                targets_dict["kinematics_Ws"] = np.concatenate([Ws_transformed, placeholder], axis=-1)
         
         return targets_dict
 
@@ -1046,34 +737,20 @@ class TopReconstructionDatasetFromH5:
             dtype="float32",
         )
 
-        # Create datasets for all target types in targets_dict
+        # Create datasets for masks and kinematics
         for key in self.target_processor.get_save_keys():
             if key in targets_dict:
                 target_array = targets_dict[key]
+                _, M_targets, target_features = target_array.shape
                 
-                # Handle different shapes
-                if target_array.ndim == 3:
-                    # (B, M, F) format
-                    _, M_targets, target_features = target_array.shape
-                    file.create_dataset(
-                        key, 
-                        shape=(0, M_targets, target_features), 
-                        maxshape=(None, M_targets, target_features), 
-                        compression="gzip", 
-                        compression_opts=4,
-                        dtype="float32",
-                    )
-                elif target_array.ndim == 2:
-                    # (B, F) format (e.g., target_mass)
-                    _, target_features = target_array.shape
-                    file.create_dataset(
-                        key, 
-                        shape=(0, target_features), 
-                        maxshape=(None, target_features), 
-                        compression="gzip", 
-                        compression_opts=4,
-                        dtype="float32",
-                    )
+                file.create_dataset(
+                    key, 
+                    shape=(0, M_targets, target_features), 
+                    maxshape=(None, M_targets, target_features), 
+                    compression="gzip", 
+                    compression_opts=4,
+                    dtype="float32",
+                )
 
         if interaction_shape is not None:
             _, N, N, interaction_features = interaction_shape
@@ -1109,7 +786,7 @@ class TopReconstructionDatasetFromH5:
         file["event"][n0:n1] = event_chunk.astype("float32")
         file["src_mask"][n0:n1] = src_mask_chunk.astype("float32")
 
-        # Save all target types
+        # Save all target types (masks and kinematics)
         for key in self.target_processor.get_save_keys():
             if key in targets_dict:
                 file[key].resize((n1,) + file[key].shape[1:])
@@ -1140,7 +817,7 @@ class TopReconstructionDatasetFromH5:
 
 if __name__ == "__main__":
     print("\n" + "="*60, flush=True)
-    print("COMBINED MASK + DI-TOP KINEMATICS PROCESSOR WITH MASS", flush=True)
+    print("INDIVIDUAL PARTICLE MASKS + KINEMATICS PROCESSOR", flush=True)
     print("="*60 + "\n", flush=True)
     
     try:
@@ -1160,12 +837,14 @@ if __name__ == "__main__":
                 }
             }
 
-        # Use CombinedMaskAndKinematicsProcessor and CombinedMaskAndKinematicsExtractor
-        processor = CombinedMaskAndKinematicsProcessor()
-        extractor = CombinedMaskAndKinematicsExtractor(
-            match_labels=np.array([1, 2, 3, 4, 5, 6]),  # For binary mask
-            tag_top1=np.array([1, 2, 3]),  # For di-top kinematics
-            tag_top2=np.array([4, 5, 6])   # For di-top kinematics
+        # Use IndividualParticleMaskAndKinematicsProcessor and Extractor
+        processor = IndividualParticleMaskAndKinematicsProcessor()
+        extractor = IndividualParticleMaskAndKinematicsExtractor(
+            tag_top1=np.array([1, 2, 3]),
+            tag_top2=np.array([4, 5, 6]),
+            tag_W1=np.array([2, 3]),
+            tag_W2=np.array([5, 6]),
+            num_jets=20
         )
 
         dataset = TopReconstructionDatasetFromH5(

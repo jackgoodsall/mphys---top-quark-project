@@ -8,7 +8,7 @@ root_dataset_prepper:
 
 
 preprocessing:
-  stream_size: 200000
+  stream_size: 500000
   save_path: "data/topquarkreconstruction/masked_targets"
   save_file_prefix: "ttbar_preprocessed_"
 
@@ -23,7 +23,8 @@ BatchNormUsed: True
 data_modules:
   input_path: data/topquarkreconstruction/masked_targets
   input_prefix: "ttbar_preprocessed_"
-
+  mass_with_kinematics:
+    True
   train:
     batch_size: 1024
     shuffle: True
@@ -59,24 +60,30 @@ model_parameters:
     n_encoder_layers: 8
     n_decoder_layers: 4
     n_heads: 8
-    out_dimensions: 5
+    out_dimensions: 6
     p_dropout: 0.1
     dim_ff: 256
-    number_class_tokens: 4
+    number_class_tokens: 1
 
-  reverse_embedder:
+  masked_prediction_head:
     n_input: 64
     hidden_sizes: [128, 64]
     output_size: 20
-    p_dropout: 0.1
+    p_dropout: 0
+
+  kinematic_regression_head:
+    n_input: 64
+    hidden_sizes: [128, 64]
+    output_size: 6
+    p_dropout: 0
 
 model_training:
   learning_rate: 0.0005
   weight_decay: 0.001
   use_lookahead : True
-  min_epochs: 5
-  max_epochs: 50
+  min_epochs: 15
+  max_epochs: 40
   
 model_artefacts:
-  reverse_target_transformers: "data/topquarkreconstruction/processed_data/target_transformed.joblib"
-  reverse_W_transformer: 
+  target_transformers: "data/topquarkreconstruction/masked_targets/target_transforms.joblib"
+  invariant_mass_transformers:  "data/topquarkreconstruction/masked_targets/invariant_mass_transform.joblib"

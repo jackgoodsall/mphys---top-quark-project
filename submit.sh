@@ -9,7 +9,7 @@
 module purge
 module load libs/cuda
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISsIBLE_DEVICES=0,1
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 echo "Job is using $SLURM_GPUS GPU(s) with ID(s) $CUDA_VISIBLE_DEVICES and $SLURM_CPUS_PER_TASK CPU core(s)"
