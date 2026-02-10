@@ -380,3 +380,220 @@ def total_masked_loss(
         "loss_bce": loss_bce,
         "loss_dice": loss_dice,
     }
+
+
+### Combined TOP system prediction thing 
+
+def combined_kinematics_loss(
+    outputs,
+    targets,
+    kinematic_scalers: tuple,
+    inv_mass_scaler,
+    kinematic_weight: float = 0.7,
+    inv_mass_weight: float = 0.3,
+    reduction: str = "mean",
+):
+    """
+    Combined loss for combined top kinematics + invariant mass.
+    """
+    device = outputs["object_kinematics"].device
+    
+    # 1) Direct MSE on combined kinematics
+    kin_loss_per_event = F.mse_loss(
+        outputs["object_kinematics"], 
+        targets["target_kinematics"], 
+        reduction='none'
+    ).mean(dim=(1, 2))  # Average over (1, 5) -> (B,)
+    
+    # Validate shape
+    assert kin_loss_per_event.dim() == 1, f"Expected 1D, got {kin_loss_per_event.shape}"
+    
+    # 2) Invariant mass loss (reconstructed from combined system)
+    mass_loss_per_event = invariant_mass_loss_combined(
+        output=outputs["object_kinematics"],
+        target_scaled_mass=targets["inv_mass"],  # NOTE: Changed from "inv_mass"
+        kinematic_scalers=kinematic_scalers,
+        inv_mass_scaler=inv_mass_scaler,
+        reduction="none"
+    )
+    
+    # Validate shape
+    assert mass_loss_per_event.dim() == 1, f"Expected 1D, got {mass_loss_per_event.shape}"
+    assert mass_loss_per_event.shape == kin_loss_per_event.shape, \
+        f"Shape mismatch: {mass_loss_per_event.shape} vs {kin_loss_per_event.shape}"
+    
+    # Check for NaN/Inf before combination
+    if torch.any(torch.isnan(kin_loss_per_event)):
+        print("[ERROR] NaN in kinematic loss!")
+        kin_loss_per_event = torch.nan_to_num(kin_loss_per_event, nan=0.0)
+    
+    if torch.any(torch.isnan(mass_loss_per_event)):
+        print("[ERROR] NaN in mass loss!")
+        mass_loss_per_event = torch.nan_to_num(mass_loss_per_event, nan=0.0)
+    
+    # Weighted combination
+    combined_per_event = (
+        kinematic_weight * kin_loss_per_event + 
+        inv_mass_weight * mass_loss_per_event
+    )
+    
+    # Final reduction
+    if reduction == "mean":
+        return {
+            "loss_total": combined_per_event.mean(),
+            "loss_kinematics": kin_loss_per_event.mean(),
+            "loss_inv_mass": mass_loss_per_event.mean(),
+        }
+    elif reduction == "sum":
+        return {
+            "loss_total": combined_per_event.sum(),
+            "loss_kinematics": kin_loss_per_event.sum(),
+            "loss_inv_mass": mass_loss_per_event.sum(),
+        }
+    elif reduction == "none":
+        return {
+            "loss_total": combined_per_event,
+            "loss_kinematics": kin_loss_per_event,
+            "loss_inv_mass": mass_loss_per_event,
+        }
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")
+
+
+def invariant_mass_loss_combined(
+    output,
+    target_scaled_mass,
+    kinematic_scalers: tuple,
+    inv_mass_scaler,
+    reduction="mean"
+):
+    """
+    Invariant mass loss using direct formula (no Cartesian conversion).
+    """
+    device = output.device
+    pt_scaler, eta_scaler, phi_scaler, E_scaler = kinematic_scalers
+    
+    # Extract and unscale
+    pt_scaled  = output[:, 0, 0]
+    eta_scaled = output[:, 0, 1]
+    E_scaled   = output[:, 0, 4]
+    
+    pt = logminmax_inverse_torch(pt_scaled, pt_scaler, device)
+    eta = standard_inverse_torch(
+        eta_scaled,
+        torch.tensor(eta_scaler.mean_, dtype=torch.float32, device=device),
+        torch.tensor(eta_scaler.scale_, dtype=torch.float32, device=device),
+    )
+    eta = torch.clamp(eta, min=-5.0, max=5.0)
+    E = logminmax_inverse_torch(E_scaled, E_scaler, device)
+    
+    # Direct formula - no sinh needed!
+    cosh_eta = torch.cosh(eta)
+    p_squared = pt**2 * cosh_eta**2
+    m_squared = E**2 - p_squared
+    m_squared = torch.clamp(m_squared, min=0.0)
+    inv_mass = torch.sqrt(m_squared + 1e-8)
+    
+    # Scale and compare
+    inv_mass_scaled = logminmax_forward_torch(inv_mass, inv_mass_scaler, device)
+    
+    if target_scaled_mass.dim() == 2:
+        target_scaled_mass = target_scaled_mass.squeeze(-1)
+    
+    # Use PyTorch MSE
+    return F.mse_loss(inv_mass_scaled, target_scaled_mass, reduction=reduction)
+
+
+
+
+
+def combined_kinematics_with_inv_loss(
+    outputs,
+    targets,
+    kinematic_weight: float = 0.7,
+    inv_mass_weight: float = 0.3,
+    reduction: str = "mean",
+):
+    """
+    Combined loss for combined top kinematics + invariant mass.
+    
+    Assumes:
+        outputs["object_kinematics"] = (B, 1, F) where F is 5 or 6
+        targets["target_kinematics"] = (B, 1, F) where F is 5 or 6
+        
+        When F=6:
+            [:, :, 0:5] = [pt, eta, sin_phi, cos_phi, E] (scaled)
+            [:, :, 5] = mass (scaled)
+    """
+    device = outputs["object_kinematics"].device
+    
+    output_features = outputs["object_kinematics"].shape[-1]
+    target_features = targets["target_kinematics"].shape[-1]
+    
+    # Sanity check: outputs and targets should have same number of features
+    if output_features != target_features:
+        raise ValueError(
+            f"Output features ({output_features}) != Target features ({target_features}). "
+            f"Both should be 5 (no mass) or 6 (with mass)."
+        )
+    
+    if output_features == 6:
+        # Model predicts mass as 6th feature
+        
+        # 1) Kinematic loss - first 5 features only
+        kin_loss_per_event = F.mse_loss(
+            outputs["object_kinematics"][:, :, :5],
+            targets["target_kinematics"][:, :, :5], 
+            reduction='none'
+        ).mean(dim=(1, 2))  # (B,)
+        
+        # 2) Mass loss - 6th feature only
+        mass_loss_per_event = F.mse_loss(
+            outputs["object_kinematics"][:, :, 5],  # (B, 1)
+            targets["target_kinematics"][:, :, 5],  # (B, 1)
+            reduction='none'
+        ).mean(dim=1)  # (B,) - average over the "1" dimension
+        
+    elif output_features == 5:
+        # No mass - just kinematics
+        kin_loss_per_event = F.mse_loss(
+            outputs["object_kinematics"], 
+            targets["target_kinematics"], 
+            reduction='none'
+        ).mean(dim=(1, 2))  # (B,)
+        
+        # No mass prediction
+        mass_loss_per_event = torch.zeros_like(kin_loss_per_event)
+        
+    else:
+        raise ValueError(
+            f"Expected 5 or 6 features, got {output_features}"
+        )
+    
+    # Weighted combination
+    combined_per_event = (
+        kinematic_weight * kin_loss_per_event + 
+        inv_mass_weight * mass_loss_per_event
+    )
+    
+    # Final reduction
+    if reduction == "mean":
+        return {
+            "loss_total": combined_per_event.mean(),
+            "loss_kinematics": kin_loss_per_event.mean(),
+            "loss_inv_mass": mass_loss_per_event.mean(),
+        }
+    elif reduction == "sum":
+        return {
+            "loss_total": combined_per_event.sum(),
+            "loss_kinematics": kin_loss_per_event.sum(),
+            "loss_inv_mass": mass_loss_per_event.sum(),
+        }
+    elif reduction == "none":
+        return {
+            "loss_total": combined_per_event,
+            "loss_kinematics": kin_loss_per_event,
+            "loss_inv_mass": mass_loss_per_event,
+        }
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")

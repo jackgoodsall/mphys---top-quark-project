@@ -59,9 +59,15 @@ class ReconstructionTrainer(lightning.LightningModule):
 
         self.reconstruct_Ws = kwargs.get("reconstruct_Ws", False)
         self.use_hungarian = config.get("use_hungarian_matching", False)
+    
+        self.inv_mass_transform = joblib.load( Path(self.config["model_artefacts"]["target_transformers"]))[1]
+        self.reverse_transformers = joblib.load( Path(self.config["model_artefacts"]["target_transformers"]))[0]
+        
+        self.mass_with_kinematics = self.config["data_modules"]["mass_with_kinematics"]
+
+        self.save_hyperparameters(ignore = ["model"])
 
         
-        self.save_hyperparameters(ignore = ["model"])
     
     def forward(self, batch, last_output_only = False):
         return self.model(batch, last_output_only = last_output_only)
@@ -106,7 +112,7 @@ class ReconstructionTrainer(lightning.LightningModule):
         with h5py.File(out_dir / "test_outputs.h5", "r+" ) as file:
             batch_size = len(targets["target_kinematics"])
             
-            file["target_kinematics"][self.start_idx: self.start_idx + batch_size] = targets["target_kinematics"].view(-1, 1, 5).cpu().numpy()
+            file["target_kinematics"][self.start_idx: self.start_idx + batch_size] = targets["target_kinematics"].view(-1, 1, 6).cpu().numpy()
             file["predicted_kinematics"][self.start_idx: self.start_idx + batch_size] = outputs["object_kinematics"].cpu().numpy()
             
             file["target_masks"][self.start_idx: self.start_idx + batch_size] = targets["jet_mask_true"].view(-1, 1, 20).cpu().numpy()
@@ -148,8 +154,17 @@ class ReconstructionTrainer(lightning.LightningModule):
         total_loss = 0 
         for _ , v in outputs.items():
             masked_loss = total_masked_loss(v["mask_predictions"], targets)
-            mse_regression_loss = nn.MSELoss()(v["object_kinematics"], targets["target_kinematics"])
-            total_loss += masked_loss["loss_total"] + mse_regression_loss
+            if self.mass_with_kinematics:
+                mse_regression_loss = combined_kinematics_with_inv_loss(v, targets)
+            else:
+                mse_regression_loss = combined_kinematics_loss(v, targets, self.reverse_transformers, self.inv_mass_transform, inv_mass_weight=0.1)
+            total_loss += masked_loss["loss_total"] + mse_regression_loss["loss_total"]
+
+            
+
+        print(f"inv mass loss is {mse_regression_loss['loss_inv_mass']}")
+        print(f"kinematic loss is {mse_regression_loss['loss_kinematics']}")
+        
         return total_loss
     
     def on_train_epoch_end(self):
@@ -195,10 +210,10 @@ class ReconstructionTrainer(lightning.LightningModule):
             file.create_dataset("predicted_masks",
                                   shape = (number_events, 1, 20))
             file.create_dataset("target_kinematics",
-                                   shape = (number_events, 1, 5) )
+                                   shape = (number_events, 1, 6) )
 
             file.create_dataset("predicted_kinematics",
-                                  shape = (number_events, 1, 5))
+                                  shape = (number_events, 1, 6))
 
         self.start_idx = 0
         self.W_start_idx = 0
