@@ -12,7 +12,8 @@ slurm*
 submit.sh
 /slurm_outputs/
 /masked_reconstruction/
-
+/MaskedFormerSlurmOutputs/  
+/src/models/components/matcher.py
 
 __pycache__/
 *.py[cod]
