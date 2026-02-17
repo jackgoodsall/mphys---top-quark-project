@@ -504,9 +504,6 @@ def invariant_mass_loss_combined(
     return F.mse_loss(inv_mass_scaled, target_scaled_mass, reduction=reduction)
 
 
-
-
-
 def combined_kinematics_with_inv_loss(
     outputs,
     targets,
