@@ -6,6 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import h5py
 
+# Object class constants
+CLASS_NULL = 0
+CLASS_TOP = 1
+CLASS_W = 2
+
 
 @dataclass
 class TaskConfig:
@@ -142,35 +147,38 @@ class TaskRegistry(nn.Module):
         targets: Dict[str, torch.Tensor],
         valid_mask: Optional[torch.Tensor] = None,
         layer_id: Optional[int] = None
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
         Compute total loss across all tasks.
-        
+
         Returns:
-            total_loss: Scalar loss
+            (total_loss, per_task_losses): total scalar loss and dict of per-task scalar losses
         """
         total_loss = 0.0
-        
+        per_task_losses: Dict[str, float] = {}
+
         for task_name, task in self.tasks.items():
             # Compute task loss
             task_loss = task.compute_loss(predictions, targets, valid_mask)
-            
+
             # Apply task-specific layer weighting
             if layer_id is not None:
                 layer_weight = task.config.get_layer_weight(layer_id)
                 task_loss = layer_weight * task_loss
-            
+
+            per_task_losses[task_name] = float(task_loss.item()) if torch.is_tensor(task_loss) else float(task_loss)
             total_loss += task_loss
-        
-        return total_loss
+
+        return total_loss, per_task_losses
 
 
 class MaskReconstructionTask(BaseTask):
     """Task for mask reconstruction"""
-    
-    def __init__(self, config: TaskConfig):
+
+    def __init__(self, config: TaskConfig, null_mask_penalty: float = 0.1):
         super().__init__(config)
         self.eps = 1e-8
+        self.null_mask_penalty = null_mask_penalty
     
     def compute_cost(
         self,
@@ -210,53 +218,105 @@ class MaskReconstructionTask(BaseTask):
         """Compute mask loss (Dice + BCE)"""
         pred_masks = predictions['mask_predictions']
         target_masks = targets['jet_mask_true']
-        
+
         if target_masks.ndim == 2:
             target_masks = target_masks.unsqueeze(1)
-        
+
         B, num_queries, N = pred_masks.shape
-        num_targets = target_masks.shape[1]
-        
-        pred_masks = pred_masks[:, :num_targets, :]
-        
-        pred_probs = pred_masks.sigmoid()
-        target_float = target_masks.float()
-        
-        if valid_mask is not None:
-            valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(pred_probs)
-            pred_probs = pred_probs * valid_mask_expanded
-            target_float = target_float * valid_mask_expanded
-        
-        pred_probs_flat = pred_probs.reshape(-1, N)
-        target_float_flat = target_float.reshape(-1, N)
-        pred_masks_flat = pred_masks.reshape(-1, N)
-        
-        # Dice loss
-        intersection = (pred_probs_flat * target_float_flat).sum(dim=-1)
-        pred_sum = pred_probs_flat.sum(dim=-1)
-        target_sum = target_float_flat.sum(dim=-1)
-        dice = (2 * intersection) / (pred_sum + target_sum + self.eps)
-        dice_loss = 1 - dice
-        
-        # BCE loss
-        bce_per_particle = F.binary_cross_entropy_with_logits(
-            pred_masks_flat, target_float_flat, reduction='none'
-        )
-        
-        if valid_mask is not None:
-            valid_mask_flat = valid_mask.unsqueeze(1).expand(-1, num_targets, -1).reshape(-1, N)
-            bce_per_particle = bce_per_particle * valid_mask_flat
-            num_valid_per_sample = valid_mask_flat.sum(dim=-1)
-            num_valid_per_sample = torch.clamp(num_valid_per_sample, min=1)
-            bce_loss = bce_per_particle.sum(dim=-1) / num_valid_per_sample
+        obj_valid = targets.get('obj_valid_mask')
+
+        if obj_valid is not None:
+            # --- New path: use obj_valid_mask for variable T ---
+            total_loss = pred_masks.new_tensor(0.0)
+
+            if obj_valid.any():
+                real_pred_logits = pred_masks[obj_valid]       # [N_real, N]
+                real_tgt = target_masks[obj_valid]             # [N_real, N]
+
+                real_pred_probs = real_pred_logits.sigmoid()
+                real_tgt_float = real_tgt.float()
+
+                if valid_mask is not None:
+                    vm_expanded = valid_mask.unsqueeze(1).expand(B, num_queries, N)
+                    real_vm = vm_expanded[obj_valid]            # [N_real, N]
+                    real_pred_probs = real_pred_probs * real_vm
+                    real_tgt_float = real_tgt_float * real_vm
+
+                # Dice loss
+                intersection = (real_pred_probs * real_tgt_float).sum(dim=-1)
+                pred_sum = real_pred_probs.sum(dim=-1)
+                target_sum = real_tgt_float.sum(dim=-1)
+                dice = (2 * intersection) / (pred_sum + target_sum + self.eps)
+                dice_loss = (1 - dice).mean()
+
+                # BCE loss
+                bce = F.binary_cross_entropy_with_logits(
+                    real_pred_logits, real_tgt_float, reduction='none'
+                )
+                if valid_mask is not None:
+                    bce = bce * real_vm
+                    num_valid = real_vm.sum(dim=-1).clamp(min=1)
+                    bce_loss = (bce.sum(dim=-1) / num_valid).mean()
+                else:
+                    bce_loss = bce.mean()
+
+                dice_weight = self.config.get_loss_weight('dice')
+                bce_weight = self.config.get_loss_weight('bce')
+                total_loss = dice_weight * dice_loss + bce_weight * bce_loss
+
+            # Null mask penalty: encourage unmatched queries to predict empty masks
+            if self.null_mask_penalty > 0 and (~obj_valid).any():
+                null_logits = pred_masks[~obj_valid]           # [N_null, N]
+                null_targets = torch.zeros_like(null_logits)
+                null_loss = F.binary_cross_entropy_with_logits(
+                    null_logits, null_targets, reduction='mean'
+                )
+                total_loss = total_loss + self.null_mask_penalty * null_loss
+
+            return total_loss
         else:
-            bce_loss = bce_per_particle.mean(dim=-1)
-        
-        dice_weight = self.config.get_loss_weight('dice')
-        bce_weight = self.config.get_loss_weight('bce')
-        
-        total_loss = dice_weight * dice_loss.mean() + bce_weight * bce_loss.mean()
-        return total_loss
+            # --- Backward compatible path: use [:num_targets] slicing ---
+            num_targets = target_masks.shape[1]
+            pred_masks = pred_masks[:, :num_targets, :]
+
+            pred_probs = pred_masks.sigmoid()
+            target_float = target_masks.float()
+
+            if valid_mask is not None:
+                valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(pred_probs)
+                pred_probs = pred_probs * valid_mask_expanded
+                target_float = target_float * valid_mask_expanded
+
+            pred_probs_flat = pred_probs.reshape(-1, N)
+            target_float_flat = target_float.reshape(-1, N)
+            pred_masks_flat = pred_masks.reshape(-1, N)
+
+            # Dice loss
+            intersection = (pred_probs_flat * target_float_flat).sum(dim=-1)
+            pred_sum = pred_probs_flat.sum(dim=-1)
+            target_sum = target_float_flat.sum(dim=-1)
+            dice = (2 * intersection) / (pred_sum + target_sum + self.eps)
+            dice_loss = 1 - dice
+
+            # BCE loss
+            bce_per_particle = F.binary_cross_entropy_with_logits(
+                pred_masks_flat, target_float_flat, reduction='none'
+            )
+
+            if valid_mask is not None:
+                valid_mask_flat = valid_mask.unsqueeze(1).expand(-1, num_targets, -1).reshape(-1, N)
+                bce_per_particle = bce_per_particle * valid_mask_flat
+                num_valid_per_sample = valid_mask_flat.sum(dim=-1)
+                num_valid_per_sample = torch.clamp(num_valid_per_sample, min=1)
+                bce_loss = bce_per_particle.sum(dim=-1) / num_valid_per_sample
+            else:
+                bce_loss = bce_per_particle.mean(dim=-1)
+
+            dice_weight = self.config.get_loss_weight('dice')
+            bce_weight = self.config.get_loss_weight('bce')
+
+            total_loss = dice_weight * dice_loss.mean() + bce_weight * bce_loss.mean()
+            return total_loss
     
     def create_test_datasets(self, file: h5py.File, number_events: int):
         """Create HDF5 datasets for mask predictions"""
@@ -295,12 +355,12 @@ class MaskReconstructionTask(BaseTask):
         if target_masks.ndim == 2:
             target_masks = target_masks[:, None, :]
         
-        # Take only matched predictions
-        num_targets = min(pred_masks_logits.shape[1], target_masks.shape[1])
-        pred_masks_logits = pred_masks_logits[:, :num_targets, :]
-        pred_masks_prob = pred_masks_prob[:, :num_targets, :]
-        target_masks = target_masks[:, :num_targets, :]
-        
+        # Truncate to max_objects (predictions may have Q > max_objects after padding)
+        M = self.config.max_objects
+        pred_masks_logits = pred_masks_logits[:, :M, :]
+        pred_masks_prob = pred_masks_prob[:, :M, :]
+        target_masks = target_masks[:, :M, :]
+
         # Save to HDF5
         end_idx = start_idx + batch_size
         file["target_masks"][start_idx:end_idx] = target_masks
@@ -338,31 +398,38 @@ class KinematicRegressionTask(BaseTask):
     ) -> torch.Tensor:
         """Compute kinematic loss"""
         pred_kin = predictions['object_kinematics']
-        target_kin = targets['kinematics']
-        
+        target_kin = targets.get('kinematics', targets.get('target_kinematics'))
+
         # Handle 2D targets
         if target_kin.ndim == 2:
             target_kin = target_kin.unsqueeze(1)
-        
-        # Take only matched predictions
-        num_targets = target_kin.shape[1]
-        pred_kin = pred_kin[:, :num_targets, :]
-        
-        # Flatten
-        pred_kin = pred_kin.reshape(-1, pred_kin.shape[-1])
-        target_kin = target_kin.reshape(-1, target_kin.shape[-1])
-        
+
+        obj_valid = targets.get('obj_valid_mask')
+
+        if obj_valid is not None:
+            # New path: use obj_valid_mask for variable T
+            pred_real = pred_kin[obj_valid]       # [N_real, D]
+            target_real = target_kin[obj_valid]   # [N_real, D]
+
+            if pred_real.numel() == 0:
+                return torch.tensor(0.0, device=pred_kin.device)
+        else:
+            # Backward compatible path: use [:num_targets] slicing
+            num_targets = target_kin.shape[1]
+            pred_real = pred_kin[:, :num_targets, :].reshape(-1, pred_kin.shape[-1])
+            target_real = target_kin.reshape(-1, target_kin.shape[-1])
+
         # Get loss type and weight
         if 'l1' in self.config.loss_weights:
-            loss = F.l1_loss(pred_kin, target_kin)
+            loss = F.l1_loss(pred_real, target_real)
             weight = self.config.get_loss_weight('l1')
         elif 'mse' in self.config.loss_weights:
-            loss = F.mse_loss(pred_kin, target_kin)
+            loss = F.mse_loss(pred_real, target_real)
             weight = self.config.get_loss_weight('mse')
         else:
-            loss = F.smooth_l1_loss(pred_kin, target_kin)
+            loss = F.smooth_l1_loss(pred_real, target_real)
             weight = self.config.get_loss_weight('smooth_l1')
-        
+
         return weight * loss
     
     def create_test_datasets(self, file: h5py.File, number_events: int):
@@ -390,17 +457,17 @@ class KinematicRegressionTask(BaseTask):
     ):
         """Save kinematic predictions to HDF5"""
         pred_kin = predictions['object_kinematics'].cpu().numpy()
-        target_kin = targets['kinematics'].cpu().numpy()
+        target_kin = (targets.get('kinematics') or targets.get('target_kinematics')).cpu().numpy()
         
         # Handle 2D targets
         if target_kin.ndim == 2:
             target_kin = target_kin[:, None, :]
         
-        # Take only matched predictions
-        num_targets = min(pred_kin.shape[1], target_kin.shape[1])
-        pred_kin = pred_kin[:, :num_targets, :]
-        target_kin = target_kin[:, :num_targets, :]
-        
+        # Truncate to max_objects (predictions may have Q > max_objects after padding)
+        M = self.config.max_objects
+        pred_kin = pred_kin[:, :M, :]
+        target_kin = target_kin[:, :M, :]
+
         # Save to HDF5
         end_idx = start_idx + batch_size
         file["target_kinematics"][start_idx:end_idx] = target_kin
@@ -492,12 +559,12 @@ class ClassificationTask(BaseTask):
         pred_classes = predictions['class_logits'].argmax(dim=-1).cpu().numpy()
         target_classes = targets['classes'].cpu().numpy()
         
-        # Take only matched predictions
-        num_targets = min(pred_logits.shape[1], target_classes.shape[1])
-        pred_logits = pred_logits[:, :num_targets, :]
-        pred_classes = pred_classes[:, :num_targets]
-        target_classes = target_classes[:, :num_targets]
-        
+        # Truncate to max_objects (predictions may have Q > max_objects after padding)
+        M = self.config.max_objects
+        pred_logits = pred_logits[:, :M, :]
+        pred_classes = pred_classes[:, :M]
+        target_classes = target_classes[:, :M]
+
         # Save to HDF5
         end_idx = start_idx + batch_size
         file["target_classes"][start_idx:end_idx] = target_classes
@@ -911,14 +978,315 @@ class MulticlassClassificationTask(BaseTask):
         pred_cls    = pred_logits.argmax(dim=-1)            # [B, Q]
         target_cls  = targets["classes"].long()             # [B, T]
 
-        T = min(pred_logits.shape[1], target_cls.shape[1])
-        pred_logits = pred_logits[:, :T, :].cpu().numpy()
-        pred_probs  = pred_probs[:, :T, :].cpu().numpy()
-        pred_cls    = pred_cls[:, :T].cpu().numpy()
-        target_cls  = target_cls[:, :T].cpu().numpy()
+        # Truncate to max_objects (predictions may have Q > max_objects after padding)
+        M = self.config.max_objects
+        pred_logits = pred_logits[:, :M, :].cpu().numpy()
+        pred_probs  = pred_probs[:, :M, :].cpu().numpy()
+        pred_cls    = pred_cls[:, :M].cpu().numpy()
+        target_cls  = target_cls[:, :M].cpu().numpy()
 
         end_idx = start_idx + batch_size
         file["target_classes"][start_idx:end_idx]         = target_cls
         file["predicted_class_logits"][start_idx:end_idx] = pred_logits
         file["predicted_class_probs"][start_idx:end_idx]  = pred_probs
         file["predicted_classes"][start_idx:end_idx]      = pred_cls
+
+
+class ObjectnessTask(BaseTask):
+    """
+    Binary classification: is this query a real object?
+    Runs over ALL Q queries (this is the object-count signal).
+
+    Predictions: "objectness_logit" [B, Q, 1]
+    Targets: derived from targets["classes"] — real=1.0, null=0.0
+    """
+
+    def __init__(self, config: TaskConfig, null_weight: float = 0.1):
+        super().__init__(config)
+        self.null_weight = null_weight
+        # Detection stats accumulators
+        self._tp: int = 0
+        self._fp: int = 0
+        self._fn: int = 0
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Cost: -log p(real) broadcast to [B, Q, T].
+        All real targets have objectness=1 so cost is uniform across T columns.
+        Biases the matcher toward queries already predicting "real".
+        """
+        if 'objectness_logit' not in predictions:
+            first = next(iter(predictions.values()))
+            B, Q = first.shape[:2]
+            T = next(iter(targets.values())).shape[1]
+            return torch.zeros(B, Q, T, device=first.device)
+
+        pred_logit = predictions['objectness_logit']  # [B, Q, 1]
+        prob_real = pred_logit.squeeze(-1).sigmoid()   # [B, Q]
+        neg_log_prob = -torch.log(prob_real.clamp(min=1e-8))  # [B, Q]
+
+        # Determine T from targets
+        first_target = next(iter(targets.values()))
+        T = first_target.shape[1]
+
+        # Broadcast: [B, Q] -> [B, Q, T]
+        cost = neg_log_prob.unsqueeze(-1).expand(-1, -1, T)
+
+        return self.config.cost_weights.get('objectness', 1.0) * cost
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Weighted BCE over ALL Q queries.
+        Real slots (obj_valid=True)  -> weight = 1.0
+        Null slots (obj_valid=False) -> weight = null_weight
+        """
+        if 'objectness_logit' not in predictions:
+            first = next(iter(predictions.values()))
+            return torch.tensor(0.0, device=first.device)
+
+        pred_logit = predictions['objectness_logit'].squeeze(-1)  # [B, Q]
+
+        obj_valid = targets.get('obj_valid_mask')
+        if obj_valid is None:
+            # Backward compat: all queries are real
+            target_obj = torch.ones_like(pred_logit)
+            weight = torch.ones_like(pred_logit)
+        else:
+            target_obj = obj_valid.float()  # [B, Q]
+            weight = torch.where(obj_valid, 1.0, self.null_weight)
+
+        loss = F.binary_cross_entropy_with_logits(
+            pred_logit, target_obj, weight=weight, reduction='mean'
+        )
+
+        # Update detection stats
+        with torch.no_grad():
+            self._update_detection_stats(pred_logit, obj_valid if obj_valid is not None else target_obj.bool())
+
+        loss_weight = self.config.get_loss_weight('objectness')
+        return loss_weight * loss
+
+    def _update_detection_stats(self, pred_logit: torch.Tensor, obj_valid: torch.Tensor):
+        """Accumulate TP, FP, FN for precision/recall/F1."""
+        pred_real = (pred_logit.sigmoid() > 0.5)
+        self._tp += int((pred_real & obj_valid).sum().item())
+        self._fp += int((pred_real & ~obj_valid).sum().item())
+        self._fn += int((~pred_real & obj_valid).sum().item())
+
+    def get_detection_stats(self) -> Dict[str, float]:
+        """Return precision, recall, F1 since last reset."""
+        precision = self._tp / max(self._tp + self._fp, 1)
+        recall = self._tp / max(self._tp + self._fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'tp': self._tp,
+            'fp': self._fp,
+            'fn': self._fn,
+        }
+
+    def reset_detection_stats(self):
+        """Reset detection stats. Call at the start of each epoch."""
+        self._tp = 0
+        self._fp = 0
+        self._fn = 0
+
+    def create_test_datasets(self, file: h5py.File, number_events: int):
+        """Create HDF5 datasets for objectness predictions."""
+        M = self.config.max_objects
+        file.create_dataset("predicted_objectness_logit", shape=(number_events, M), dtype='float32')
+        file.create_dataset("predicted_objectness_prob", shape=(number_events, M), dtype='float32')
+        file.create_dataset("target_objectness", shape=(number_events, M), dtype='float32')
+
+    def save_test_predictions(
+        self,
+        file: h5py.File,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        start_idx: int,
+        batch_size: int
+    ):
+        """Save objectness predictions to HDF5."""
+        if 'objectness_logit' not in predictions:
+            return
+
+        pred_logit = predictions['objectness_logit'].squeeze(-1)  # [B, Q]
+        pred_prob = pred_logit.sigmoid()
+
+        obj_valid = targets.get('obj_valid_mask')
+        if obj_valid is not None:
+            target_obj = obj_valid.float()
+        else:
+            target_obj = torch.ones_like(pred_logit)
+
+        M = self.config.max_objects
+        end_idx = start_idx + batch_size
+        file["predicted_objectness_logit"][start_idx:end_idx] = pred_logit[:, :M].cpu().numpy()
+        file["predicted_objectness_prob"][start_idx:end_idx] = pred_prob[:, :M].cpu().numpy()
+        file["target_objectness"][start_idx:end_idx] = target_obj[:, :M].cpu().numpy()
+
+
+class ObjectTypeTask(BaseTask):
+    """
+    Binary classification: is this real object a top (1) or a W (0)?
+    Runs on REAL (matched) slots ONLY. Null slots are excluded entirely.
+
+    Predictions: "type_logit" [B, Q, 1]
+    Targets: derived from targets["classes"][obj_valid] — top=1.0, W=0.0
+    """
+
+    def __init__(self, config: TaskConfig, top_weight: float = 1.0):
+        super().__init__(config)
+        self.top_weight = top_weight
+        # Accuracy accumulators
+        self._correct: int = 0
+        self._total: int = 0
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        For each (query, target) pair, compute BCE between query's type_logit
+        and the target's type label (top=1, W=0).
+        Called before null padding so targets["classes"] is [B, T] with real objects only.
+        Returns [B, Q, T].
+        """
+        if 'type_logit' not in predictions or 'classes' not in targets:
+            first = next(iter(predictions.values()))
+            B, Q = first.shape[:2]
+            T = next(iter(targets.values())).shape[1]
+            return torch.zeros(B, Q, T, device=first.device)
+
+        pred_logit = predictions['type_logit'].squeeze(-1)  # [B, Q]
+        target_classes = targets['classes']                  # [B, T]
+
+        B, Q = pred_logit.shape
+        T = target_classes.shape[1]
+
+        # Target type labels: top (CLASS_TOP=1) -> 1.0, W (CLASS_W=2) -> 0.0
+        type_labels = (target_classes == CLASS_TOP).float()  # [B, T]
+
+        # Expand for pairwise cost: [B, Q, T]
+        pred_expanded = pred_logit.unsqueeze(2).expand(B, Q, T)  # [B, Q, T]
+        target_expanded = type_labels.unsqueeze(1).expand(B, Q, T)  # [B, Q, T]
+
+        cost = F.binary_cross_entropy_with_logits(
+            pred_expanded, target_expanded, reduction='none'
+        )
+
+        return self.config.cost_weights.get('type', 1.0) * cost
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Weighted BCE on real slots only.
+        top slots -> weight = top_weight
+        W slots   -> weight = 1.0
+        """
+        if 'type_logit' not in predictions:
+            first = next(iter(predictions.values()))
+            return torch.tensor(0.0, device=first.device)
+
+        pred_logit = predictions['type_logit'].squeeze(-1)  # [B, Q]
+
+        obj_valid = targets.get('obj_valid_mask')
+        if obj_valid is None:
+            return torch.tensor(0.0, device=pred_logit.device)
+
+        if not obj_valid.any():
+            return torch.tensor(0.0, device=pred_logit.device)
+
+        classes = targets['classes']  # [B, Q] (padded, CLASS_NULL for unmatched)
+
+        # Extract real slots only
+        real_logits = pred_logit[obj_valid]     # [N_real]
+        real_classes = classes[obj_valid]        # [N_real]
+
+        # Type labels: top (CLASS_TOP=1) -> 1.0, W (CLASS_W=2) -> 0.0
+        type_labels = (real_classes == CLASS_TOP).float()
+
+        # Per-sample weights
+        weight = torch.where(real_classes == CLASS_TOP, self.top_weight, 1.0)
+
+        loss = F.binary_cross_entropy_with_logits(
+            real_logits, type_labels, weight=weight, reduction='mean'
+        )
+
+        # Update accuracy stats
+        with torch.no_grad():
+            self._update_accuracy(real_logits, type_labels)
+
+        loss_weight = self.config.get_loss_weight('type')
+        return loss_weight * loss
+
+    def _update_accuracy(self, pred_logits: torch.Tensor, type_labels: torch.Tensor):
+        """Accumulate binary accuracy on real objects."""
+        preds = (pred_logits.sigmoid() > 0.5).float()
+        self._correct += int((preds == type_labels).sum().item())
+        self._total += int(type_labels.numel())
+
+    def get_accuracy_stats(self) -> Dict[str, float]:
+        """Return accuracy since last reset."""
+        if self._total == 0:
+            return {'accuracy': 0.0, 'total_samples': 0}
+        return {
+            'accuracy': self._correct / self._total,
+            'total_samples': self._total,
+        }
+
+    def reset_accuracy_stats(self):
+        """Reset accuracy accumulators."""
+        self._correct = 0
+        self._total = 0
+
+    def create_test_datasets(self, file: h5py.File, number_events: int):
+        """Create HDF5 datasets for type predictions."""
+        M = self.config.max_objects
+        file.create_dataset("predicted_type_logit", shape=(number_events, M), dtype='float32')
+        file.create_dataset("predicted_type_prob", shape=(number_events, M), dtype='float32')
+        file.create_dataset("target_type", shape=(number_events, M), dtype='float32')
+        file.create_dataset("target_classes", shape=(number_events, M), dtype='int32')
+
+    def save_test_predictions(
+        self,
+        file: h5py.File,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        start_idx: int,
+        batch_size: int
+    ):
+        """Save type predictions to HDF5."""
+        if 'type_logit' not in predictions:
+            return
+
+        pred_logit = predictions['type_logit'].squeeze(-1)  # [B, Q]
+        pred_prob = pred_logit.sigmoid()
+
+        obj_valid = targets.get('obj_valid_mask')
+        classes = targets.get('classes', torch.zeros_like(pred_logit, dtype=torch.long))
+
+        type_labels = (classes == CLASS_TOP).float()
+
+        M = self.config.max_objects
+        end_idx = start_idx + batch_size
+        file["predicted_type_logit"][start_idx:end_idx] = pred_logit[:, :M].cpu().numpy()
+        file["predicted_type_prob"][start_idx:end_idx] = pred_prob[:, :M].cpu().numpy()
+        file["target_type"][start_idx:end_idx] = type_labels[:, :M].cpu().numpy()
+        file["target_classes"][start_idx:end_idx] = classes[:, :M].cpu().numpy()
