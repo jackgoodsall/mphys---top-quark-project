@@ -75,7 +75,12 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.test_metrics = {}
         
         self.save_hyperparameters(ignore=["model", "task_registry"])
-    
+
+    @property
+    def _sync_dist(self) -> bool:
+        """Only use sync_dist when running on multiple devices."""
+        return getattr(self.trainer, 'num_devices', 1) > 1
+
     def forward(self, batch, last_output_only=False):
         """Forward pass through model"""
         return self.model(batch, last_output_only=last_output_only)
@@ -86,104 +91,211 @@ class ReconstructionTrainer(lightning.LightningModule):
         inputs['targets'] = targets
 
         outputs = self(inputs)
-        total_loss = self._compute_loss(outputs, targets)
-        
-        self.log('train_loss', total_loss, on_step=False, on_epoch=True, 
-                prog_bar=True, sync_dist=True)
-        
+        total_loss, task_losses = self._compute_loss(outputs, targets)
+
+        self.log('train_loss', total_loss, on_step=False, on_epoch=True,
+                prog_bar=True, sync_dist=self._sync_dist)
+        for task_name, task_loss in task_losses.items():
+            self.log(f'train_loss_{task_name}', task_loss, on_step=False,
+                     on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
+
         return total_loss
     
     def validation_step(self, batch, batch_idx):
         """Task-agnostic validation step"""
         inputs, targets = batch
         inputs['targets'] = targets
-        
+
         outputs = self(inputs)
-        total_loss = self._compute_loss(outputs, targets)
-        
-        self.log('val_loss', total_loss, on_step=False, on_epoch=True, 
-                prog_bar=True, sync_dist=True)
-        
+        total_loss, task_losses = self._compute_loss(outputs, targets)
+
+        self.log('val_loss', total_loss, on_step=False, on_epoch=True,
+                prog_bar=True, sync_dist=self._sync_dist)
+        for task_name, task_loss in task_losses.items():
+            self.log(f'val_loss_{task_name}', task_loss, on_step=False,
+                     on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
+
         return total_loss
     
     def test_step(self, batch, batch_idx):
         """Task-agnostic test step"""
         inputs, targets = batch
         inputs['targets'] = targets
-        
+
         outputs = self(inputs, last_output_only=True)
-        total_loss = self._compute_loss(outputs, targets)
-        
-        self.log('test_loss', total_loss, on_step=False, on_epoch=True, 
-                prog_bar=True, sync_dist=True)
-        
+        total_loss, task_losses = self._compute_loss(outputs, targets)
+
+        self.log('test_loss', total_loss, on_step=False, on_epoch=True,
+                prog_bar=True, sync_dist=self._sync_dist)
+        for task_name, task_loss in task_losses.items():
+            self.log(f'test_loss_{task_name}', task_loss, on_step=False,
+                     on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
+
         out_dir = Path(self.trainer.logger.log_dir)
         self._save_test_predictions(outputs, targets, out_dir)
-        
+
         return total_loss
     
     def _compute_loss(
-        self, 
-        outputs: Dict[int, Dict[str, torch.Tensor]], 
-        targets: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
+        self,
+        outputs: Dict[int, Dict[str, torch.Tensor]],
+        targets
+    ):
         """
         Compute loss across all layers.
         Each task applies its own layer weights.
+
+        If __targets__ is injected into layer dicts (new matching path),
+        extract and use those. Otherwise fall back to the original targets.
+
+        Returns:
+            (total_loss, task_loss_accum): total scalar and per-task accumulated losses
         """
         total_loss = 0.0
-        valid_mask = targets.get('valid_mask')
-        
+        task_loss_accum: Dict[str, float] = {}
+
         for layer_id, layer_predictions in outputs.items():
-            # TaskRegistry applies per-task layer weights internally
-            layer_loss = self.task_registry.compute_total_loss(
-                predictions=layer_predictions,
-                targets=targets,
+            if "__targets__" in layer_predictions:
+                layer_targets = layer_predictions["__targets__"]
+                valid_mask = layer_targets.get("jet_valid_mask")
+                preds = {k: v for k, v in layer_predictions.items()
+                         if k != "__targets__"}
+            else:
+                layer_targets = targets
+                preds = layer_predictions
+                valid_mask = targets.get('valid_mask') if isinstance(targets, dict) else None
+
+            layer_loss, per_task = self.task_registry.compute_total_loss(
+                predictions=preds,
+                targets=layer_targets,
                 valid_mask=valid_mask,
-                layer_id=layer_id  # Pass layer_id for task-specific weighting
+                layer_id=layer_id
             )
             total_loss += layer_loss
-        
-        return total_loss
+
+            for task_name, task_val in per_task.items():
+                task_loss_accum[task_name] = task_loss_accum.get(task_name, 0.0) + task_val
+
+        # Stop training on NaN/Inf
+        if torch.is_tensor(total_loss) and not torch.isfinite(total_loss):
+            bad_tasks = [k for k, v in task_loss_accum.items() if not (v == v)]  # NaN check
+            print(f"\nNon-finite total_loss={total_loss.item():.4f} — stopping training.")
+            if bad_tasks:
+                print(f"   Tasks with NaN: {bad_tasks}")
+            self.trainer.should_stop = True
+
+        return total_loss, task_loss_accum
     
     def configure_optimizers(self):
-        """Optimizer configuration"""
+        """Optimizer configuration with config-driven scheduler selection"""
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
+            self.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay
         )
-        
+
         if self.use_lookahead:
             import torch_optimizer
             optimizer = torch_optimizer.Lookahead(optimizer)
-        
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=2000,
-            gamma=0.7,
-        )
-        
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
+            # torch_optimizer.Lookahead doesn't initialise hooks dicts
+            # that PyTorch >=2.6 expects when calling state_dict()
+            if not hasattr(optimizer, '_optimizer_state_dict_pre_hooks'):
+                optimizer._optimizer_state_dict_pre_hooks = {}
+            if not hasattr(optimizer, '_optimizer_state_dict_post_hooks'):
+                optimizer._optimizer_state_dict_post_hooks = {}
+            if not hasattr(optimizer, '_optimizer_load_state_dict_pre_hooks'):
+                optimizer._optimizer_load_state_dict_pre_hooks = {}
+            if not hasattr(optimizer, '_optimizer_load_state_dict_post_hooks'):
+                optimizer._optimizer_load_state_dict_post_hooks = {}
+
+        sched_cfg = self.config.get("model_training", {}).get("scheduler", {})
+        sched_type = sched_cfg.get("type", "step")
+
+        if sched_type == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=sched_cfg.get("step_size", 2000),
+                gamma=sched_cfg.get("gamma", 0.7),
+            )
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
+
+        elif sched_type == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=sched_cfg.get("T_max", 50),
+                eta_min=sched_cfg.get("eta_min", 1e-6),
+            )
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
+
+        elif sched_type == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                factor=sched_cfg.get("factor", 0.5),
+                patience=sched_cfg.get("patience", 5),
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": sched_cfg.get("plateau_monitor", "val_loss"),
+                },
             }
-        }
+
+        elif sched_type == "none":
+            return optimizer
+
+        else:
+            raise ValueError(f"Unknown scheduler type: {sched_type}")
     
     def on_train_epoch_end(self):
-        """Track training loss history"""
+        """Track training loss history and log task metrics"""
         cm = self.trainer.callback_metrics
         train_loss = self._grab_metric(cm, ["train_loss", "train_loss_epoch"])
         if train_loss is not None:
             self.train_loss_history.append(train_loss)
-    
+
+        # Log and reset task-level metrics
+        for task_name, task in self.task_registry.tasks.items():
+            if hasattr(task, 'get_detection_stats'):
+                stats = task.get_detection_stats()
+                for stat_name, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        self.log(f'train_{task_name}_{stat_name}', float(value),
+                                 prog_bar=False, sync_dist=self._sync_dist)
+                task.reset_detection_stats()
+
+            if hasattr(task, 'get_accuracy_stats'):
+                stats = task.get_accuracy_stats()
+                for stat_name, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        self.log(f'train_{task_name}_{stat_name}', float(value),
+                                 prog_bar=False, sync_dist=self._sync_dist)
+                task.reset_accuracy_stats()
+
     def on_validation_epoch_end(self):
-        """Track validation loss history"""
+        """Track validation loss history and log task metrics"""
         cm = self.trainer.callback_metrics
         val_loss = self._grab_metric(cm, ["val_loss", "val_loss_epoch"])
         if val_loss is not None:
             self.val_loss_history.append(val_loss)
+
+        # Log and reset task-level metrics
+        for task_name, task in self.task_registry.tasks.items():
+            if hasattr(task, 'get_detection_stats'):
+                stats = task.get_detection_stats()
+                for stat_name, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        self.log(f'val_{task_name}_{stat_name}', float(value),
+                                 prog_bar=False, sync_dist=self._sync_dist)
+                task.reset_detection_stats()
+
+            if hasattr(task, 'get_accuracy_stats'):
+                stats = task.get_accuracy_stats()
+                for stat_name, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        self.log(f'val_{task_name}_{stat_name}', float(value),
+                                 prog_bar=False, sync_dist=self._sync_dist)
+                task.reset_accuracy_stats()
     
     def _grab_metric(self, cm, keys):
         """Helper to extract metric from callback metrics"""
@@ -209,30 +321,73 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.test_start_idx = 0
     
     def _save_test_predictions(
-        self, 
-        outputs: Dict[int, Dict[str, torch.Tensor]], 
-        targets: Dict[str, torch.Tensor],
+        self,
+        outputs: Dict[int, Dict[str, torch.Tensor]],
+        targets,
         out_dir: Path
     ):
         """Save test predictions to HDF5"""
         final_layer = max(outputs.keys())
-        predictions = outputs[final_layer]
-        
+        layer_dict = outputs[final_layer]
+
+        # Use matched/padded targets if available, else original targets
+        if "__targets__" in layer_dict:
+            save_targets = layer_dict["__targets__"]
+            predictions = {k: v for k, v in layer_dict.items()
+                          if k != "__targets__"}
+        else:
+            save_targets = targets
+            predictions = layer_dict
+
         batch_size = predictions[list(predictions.keys())[0]].shape[0]
-        
+
         for task_name, task in self.task_registry.tasks.items():
             h5_filename = f"test_outputs_{task_name}.h5"
             with h5py.File(out_dir / h5_filename, "r+") as file:
                 task.save_test_predictions(
                     file=file,
                     predictions=predictions,
-                    targets=targets,
+                    targets=save_targets,
                     start_idx=self.test_start_idx,
                     batch_size=batch_size
                 )
-        
+
         self.test_start_idx += batch_size
     
+    def on_fit_start(self):
+        """Log model parameter counts at the start of training"""
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"\nModel parameters: {total:,} total, {trainable:,} trainable\n")
+        if self.logger:
+            self.logger.experiment.add_scalar('model/total_params', float(total), global_step=0)
+            self.logger.experiment.add_scalar('model/trainable_params', float(trainable), global_step=0)
+
+    def on_train_epoch_start(self):
+        """Log current learning rate"""
+        optimizers = self.optimizers()
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        for opt in optimizers:
+            # Lookahead wraps the optimizer — access inner param_groups
+            param_groups = getattr(opt, 'optimizer', opt).param_groups
+            for j, pg in enumerate(param_groups):
+                suffix = f'_pg{j}' if len(param_groups) > 1 else ''
+                self.log(f'lr{suffix}', pg['lr'], on_step=False,
+                         on_epoch=True, prog_bar=False, sync_dist=False)
+
+    def on_before_optimizer_step(self, optimizer):
+        """Log gradient norm before optimizer step (after clipping)"""
+        grads = [p.grad for p in self.parameters() if p.grad is not None]
+        if grads:
+            total_norm = torch.norm(
+                torch.stack([g.detach().norm(2) for g in grads])
+            ).item()
+        else:
+            total_norm = 0.0
+        self.log('grad_norm', total_norm, on_step=True, on_epoch=False,
+                 prog_bar=False, sync_dist=False)
+
     def on_train_end(self):
         """Plot loss curves"""
         out_dir = Path(self.trainer.logger.log_dir)
@@ -251,57 +406,69 @@ class ReconstructionTrainer(lightning.LightningModule):
         plt.close()
 
 
-## Function to train a binary classifier
 def train_reconstruction_model(
         model,
         task_registry,
         data_module,
         config,
-        use_lr_finder = False,
-        use_early_stopping = True,
-        early_stopping_params = None,
-        logger = None,
-        *args,
-        **kwargs
+        ckpt_path=None,
+        logger=None,
     ):
-    callbacks = []
-    ## Uses default dict to ensure construction
-    ## To do actually finish EarlyStopping addition
-    if use_early_stopping:
-        if early_stopping_params:
-            callbacks.append(EarlyStopping(**early_stopping_params))
-        else:
-            callbacks.append(EarlyStopping(monitor = "val_loss"))
-    ## Adds a model checkpointer so that it only saves weights of the model.
-    ## To do make the dirpath inside the lightning log
-    checkpoint_cb = ModelCheckpoint(
-        filename="{epoch}-{val_loss:.3f}",
-        save_top_k=1,
-        monitor="val_loss",
-        mode="min",
-        save_weights_only=True, 
-    )
+    """
+    Train the reconstruction model with config-driven callbacks and scheduler.
 
-    callbacks.append(checkpoint_cb)
-    
-    # Create Trainer
-    print("loading")
+    Args:
+        model: The particle transformer model
+        task_registry: TaskRegistry with registered tasks
+        data_module: Lightning DataModule
+        config: Full config dict
+        ckpt_path: Optional checkpoint path to resume training from
+        logger: Optional Lightning logger
+    """
+    callbacks = []
+
+    # --- Config-driven callbacks ---
+    cb_cfg = config.get("training_callbacks", {})
+
+    # Early stopping
+    es_cfg = cb_cfg.get("early_stopping", {})
+    callbacks.append(EarlyStopping(
+        monitor=es_cfg.get("monitor", "val_loss"),
+        patience=es_cfg.get("patience", 10),
+        min_delta=es_cfg.get("min_delta", 0.0001),
+        mode=es_cfg.get("mode", "min"),
+    ))
+
+    # Model checkpoint (no dirpath — Lightning places it in default_root_dir/version_N/checkpoints/)
+    ckpt_cfg = cb_cfg.get("checkpoint", {})
+    callbacks.append(ModelCheckpoint(
+        save_top_k=ckpt_cfg.get("save_top_k", 3),
+        monitor=ckpt_cfg.get("monitor", "val_loss"),
+        mode=ckpt_cfg.get("mode", "min"),
+        save_weights_only=ckpt_cfg.get("save_weights_only", False),
+        filename=ckpt_cfg.get("filename", "epoch={epoch}-val_loss={val_loss:.4f}"),
+        save_last=ckpt_cfg.get("save_last", True),
+    ))
+
+    # Log directory — checkpoints co-located with Lightning logs
+    log_dir = config.get("model_artefacts", {}).get("log_dir", "lightning_logs")
+    grad_clip = config.get("model_training", {}).get("gradient_clip_val", 1.0)
+    precision = config.get("model_training", {}).get("precision", "32-true")
+
     lightning_trainer = lightning.Trainer(
-        num_nodes = 1,
+        num_nodes=1,
+        precision=precision,
         min_epochs=config["model_training"]["min_epochs"],
         max_epochs=config["model_training"]["max_epochs"],
-        logger = logger,
-        callbacks= callbacks,
-        gradient_clip_val=1,
-        default_root_dir="./masked_reconstruction"
+        logger=logger,
+        callbacks=callbacks,
+        gradient_clip_val=grad_clip,
+        default_root_dir=log_dir,
     )
-    print("training")
-    # Fit trainer
-    ## Passes in the whole config object as allows for easier saving
-    model = ReconstructionTrainer(model,task_registry, config, **kwargs)
-    print("fitting")
-    lightning_trainer.fit(model, datamodule=data_module)
-    return lightning_trainer, model
+
+    lightning_model = ReconstructionTrainer(model, task_registry, config)
+    lightning_trainer.fit(lightning_model, datamodule=data_module, ckpt_path=ckpt_path)
+    return lightning_trainer, lightning_model
 
 
 

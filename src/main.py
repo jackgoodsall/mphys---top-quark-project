@@ -1,7 +1,23 @@
+import lightning as pl
+from pathlib import Path
 from models.particle_transformer import  *
 from data.top_quark_reconstruction import *
 from trainers.top_reconstruction_trainers import *
 from utils.utils import load_and_split_config, load_any_config
+
+
+def find_latest_checkpoint(log_dir: str):
+    """Return the path to last.ckpt in the most recent Lightning version dir."""
+    log_path = Path(log_dir)
+    if not log_path.exists():
+        return None
+    version_dirs = sorted(log_path.glob("version_*"),
+                          key=lambda p: int(p.name.split("_")[1]))
+    for version_dir in reversed(version_dirs):
+        last_ckpt = version_dir / "checkpoints" / "last.ckpt"
+        if last_ckpt.exists():
+            return str(last_ckpt)
+    return None
 
 
 
@@ -58,7 +74,8 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             loss_weights=mask_loss_weights,
             max_objects=max_objects,
             layer_weights=mask_layer_weights
-        )
+        ),
+        null_mask_penalty=mask_config.get('null_mask_penalty', 0.1)
     )
     task_registry.register_task(mask_task)
     
@@ -97,7 +114,59 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         )
     )
     #task_registry.register_task(kinematics_task)
-    
+
+    # ========================================
+    # Objectness Task (is this query a real object?)
+    # ========================================
+    obj_config = task_configs.get("objectness", {})
+
+    obj_layer_weights = _build_layer_weights(
+        layer_config=obj_config.get('layer_weights'),
+        strategy=obj_config.get('layer_weight_strategy'),
+        strategy_params=obj_config.get('layer_weight_params', {}),
+        n_layers=n_decoder_layers
+    )
+
+    objectness_task = ObjectnessTask(
+        TaskConfig(
+            name='objectness',
+            output_names=['objectness_logit'],
+            output_dims={'objectness_logit': 1},
+            cost_weights={'objectness': obj_config.get('cost_weight', 1.0)},
+            loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
+            max_objects=max_objects,
+            layer_weights=obj_layer_weights
+        ),
+        null_weight=obj_config.get('null_weight', 0.1)
+    )
+    task_registry.register_task(objectness_task)
+
+    # ========================================
+    # Object Type Task (top vs W classification)
+    # ========================================
+    type_config = task_configs.get("object_type", {})
+
+    type_layer_weights = _build_layer_weights(
+        layer_config=type_config.get('layer_weights'),
+        strategy=type_config.get('layer_weight_strategy'),
+        strategy_params=type_config.get('layer_weight_params', {}),
+        n_layers=n_decoder_layers
+    )
+
+    object_type_task = ObjectTypeTask(
+        TaskConfig(
+            name='object_type',
+            output_names=['type_logit'],
+            output_dims={'type_logit': 1},
+            cost_weights={'type': type_config.get('cost_weight', 1.0)},
+            loss_weights={'type': type_config.get('loss_weight', 1.0)},
+            max_objects=max_objects,
+            layer_weights=type_layer_weights
+        ),
+        top_weight=type_config.get('top_weight', 1.0)
+    )
+    task_registry.register_task(object_type_task)
+
     return task_registry
 
 
@@ -175,7 +244,12 @@ def create_layer_weights(strategy: str, n_layers: int, **kwargs) -> Optional[Dic
 
 if __name__ == "__main__":
     config = load_any_config("config/top_reconstruction_config.yaml")
-    
+
+    # Reproducibility
+    seed = config.get("model_training", {}).get("seed", None)
+    if seed is not None:
+        pl.seed_everything(seed, workers=True)
+
     # Create embedders
     particle_embedder = ParticleEmbedder(**config["model_parameters"]["particle_embedder"])
     interactions_embedder = InteractionEmbedder(**config["model_parameters"]["interaction_embedder"])
@@ -191,21 +265,61 @@ if __name__ == "__main__":
         interaction_embedder=interactions_embedder,
         task_registry=task_registry,
         **config["model_parameters"]["transformer"],
-        use_hungarian_matching=config.get("use_hungarian_matching", True)
+        use_hungarian_matching=config.get("use_hungarian_matching", True),
+        matching_solver=config.get("matching_solver", "gpu_bruteforce"),
+        max_targets=config.get("max_targets", 5),
     )
     
     # DataModule
-    topantitopquark = MaskedFormer2(config)
-    
-    # Train
-    trainer, model = train_reconstruction_model(
-        model=transformer_model,
-        task_registry=task_registry,
-        data_module=topantitopquark,
-        config=config
-    )
-    
-    # Test
-    trainer.test(model, datamodule=topantitopquark)
+    topantitopquark = MaskedFormerTopsWsDataModule(config)
+
+    # --- Mode dispatch ---
+    inf_cfg = config.get("inference", {})
+    mode = inf_cfg.get("mode", "train")
+    ckpt_path = inf_cfg.get("checkpoint_path", None)
+    log_dir = config.get("model_artefacts", {}).get("log_dir", "lightning_logs")
+
+    if mode == "train":
+        trainer, model = train_reconstruction_model(
+            model=transformer_model,
+            task_registry=task_registry,
+            data_module=topantitopquark,
+            config=config,
+        )
+        trainer.test(model, datamodule=topantitopquark)
+
+    elif mode == "test":
+        assert ckpt_path is not None, (
+            "inference.checkpoint_path must be set in config for test mode"
+        )
+        lightning_model = ReconstructionTrainer.load_from_checkpoint(
+            ckpt_path,
+            model=transformer_model,
+            task_registry=task_registry,
+            config=config,
+        )
+        trainer = pl.Trainer(default_root_dir=log_dir)
+        trainer.test(lightning_model, datamodule=topantitopquark)
+
+    elif mode == "resume":
+        if ckpt_path is None:
+            ckpt_path = find_latest_checkpoint(log_dir)
+            if ckpt_path is None:
+                raise FileNotFoundError(
+                    f"No last.ckpt found in {log_dir}. "
+                    "Set inference.checkpoint_path explicitly."
+                )
+            print(f"Auto-detected checkpoint: {ckpt_path}")
+        trainer, model = train_reconstruction_model(
+            model=transformer_model,
+            task_registry=task_registry,
+            data_module=topantitopquark,
+            config=config,
+            ckpt_path=ckpt_path,
+        )
+        trainer.test(model, datamodule=topantitopquark)
+
+    else:
+        raise ValueError(f"Unknown inference mode: {mode}. Use 'train', 'test', or 'resume'.")
 
 
