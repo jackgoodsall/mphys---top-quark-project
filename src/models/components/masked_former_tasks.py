@@ -264,14 +264,19 @@ class MaskReconstructionTask(BaseTask):
                 bce_weight = self.config.get_loss_weight('bce')
                 total_loss = dice_weight * dice_loss + bce_weight * bce_loss
 
-            # Null mask penalty: encourage unmatched queries to predict empty masks
+            # Null mask penalty: encourage unmatched queries to predict empty masks.
+            # Adaptive scaling: reduce penalty when most queries are null so the
+            # "predict empty" signal doesn't overwhelm real-object learning.
             if self.null_mask_penalty > 0 and (~obj_valid).any():
                 null_logits = pred_masks[~obj_valid]           # [N_null, N]
                 null_targets = torch.zeros_like(null_logits)
                 null_loss = F.binary_cross_entropy_with_logits(
                     null_logits, null_targets, reduction='mean'
                 )
-                total_loss = total_loss + self.null_mask_penalty * null_loss
+                n_real = obj_valid.sum().float()
+                n_total = obj_valid.numel()
+                adaptive_scale = (n_real / n_total).clamp(min=0.01)
+                total_loss = total_loss + self.null_mask_penalty * adaptive_scale * null_loss
 
             return total_loss
         else:
@@ -347,9 +352,9 @@ class MaskReconstructionTask(BaseTask):
         batch_size: int
     ):
         """Save mask predictions to HDF5"""
-        pred_masks_logits = predictions['mask_predictions'].cpu().numpy()
-        pred_masks_prob = predictions['mask_predictions'].sigmoid().cpu().numpy()
-        target_masks = targets['jet_mask_true'].cpu().numpy()
+        pred_masks_logits = predictions['mask_predictions'].float().cpu().numpy()
+        pred_masks_prob = predictions['mask_predictions'].sigmoid().float().cpu().numpy()
+        target_masks = targets['jet_mask_true'].float().cpu().numpy()
         
         # Handle 2D targets
         if target_masks.ndim == 2:
@@ -456,8 +461,8 @@ class KinematicRegressionTask(BaseTask):
         batch_size: int
     ):
         """Save kinematic predictions to HDF5"""
-        pred_kin = predictions['object_kinematics'].cpu().numpy()
-        target_kin = (targets.get('kinematics') or targets.get('target_kinematics')).cpu().numpy()
+        pred_kin = predictions['object_kinematics'].float().cpu().numpy()
+        target_kin = (targets.get('kinematics') or targets.get('target_kinematics')).float().cpu().numpy()
         
         # Handle 2D targets
         if target_kin.ndim == 2:
@@ -555,9 +560,9 @@ class ClassificationTask(BaseTask):
         if 'class_logits' not in predictions or 'classes' not in targets:
             return
         
-        pred_logits = predictions['class_logits'].cpu().numpy()
-        pred_classes = predictions['class_logits'].argmax(dim=-1).cpu().numpy()
-        target_classes = targets['classes'].cpu().numpy()
+        pred_logits = predictions['class_logits'].float().cpu().numpy()
+        pred_classes = predictions['class_logits'].argmax(dim=-1).float().cpu().numpy()
+        target_classes = targets['classes'].float().cpu().numpy()
         
         # Truncate to max_objects (predictions may have Q > max_objects after padding)
         M = self.config.max_objects
@@ -980,10 +985,10 @@ class MulticlassClassificationTask(BaseTask):
 
         # Truncate to max_objects (predictions may have Q > max_objects after padding)
         M = self.config.max_objects
-        pred_logits = pred_logits[:, :M, :].cpu().numpy()
-        pred_probs  = pred_probs[:, :M, :].cpu().numpy()
-        pred_cls    = pred_cls[:, :M].cpu().numpy()
-        target_cls  = target_cls[:, :M].cpu().numpy()
+        pred_logits = pred_logits[:, :M, :].float().cpu().numpy()
+        pred_probs  = pred_probs[:, :M, :].float().cpu().numpy()
+        pred_cls    = pred_cls[:, :M].float().cpu().numpy()
+        target_cls  = target_cls[:, :M].float().cpu().numpy()
 
         end_idx = start_idx + batch_size
         file["target_classes"][start_idx:end_idx]         = target_cls
@@ -1062,7 +1067,13 @@ class ObjectnessTask(BaseTask):
             weight = torch.ones_like(pred_logit)
         else:
             target_obj = obj_valid.float()  # [B, Q]
-            weight = torch.where(obj_valid, 1.0, self.null_weight)
+            # Adaptive null weighting: scale null weight by n_real/Q per event
+            # so the total null contribution stays proportional to the real signal.
+            # T_i=4,Q=5 → ratio=0.8; T_i=1,Q=5 → ratio=0.2 (5× reduction)
+            n_real = obj_valid.sum(dim=1, keepdim=True).float()  # [B, 1]
+            Q = obj_valid.shape[1]
+            adaptive_null_w = self.null_weight * (n_real / Q).clamp(min=0.01)  # [B, 1]
+            weight = torch.where(obj_valid, torch.ones_like(pred_logit), adaptive_null_w.expand_as(pred_logit))
 
         loss = F.binary_cross_entropy_with_logits(
             pred_logit, target_obj, weight=weight, reduction='mean'
@@ -1132,9 +1143,9 @@ class ObjectnessTask(BaseTask):
 
         M = self.config.max_objects
         end_idx = start_idx + batch_size
-        file["predicted_objectness_logit"][start_idx:end_idx] = pred_logit[:, :M].cpu().numpy()
-        file["predicted_objectness_prob"][start_idx:end_idx] = pred_prob[:, :M].cpu().numpy()
-        file["target_objectness"][start_idx:end_idx] = target_obj[:, :M].cpu().numpy()
+        file["predicted_objectness_logit"][start_idx:end_idx] = pred_logit[:, :M].float().cpu().numpy()
+        file["predicted_objectness_prob"][start_idx:end_idx] = pred_prob[:, :M].float().cpu().numpy()
+        file["target_objectness"][start_idx:end_idx] = target_obj[:, :M].float().cpu().numpy()
 
 
 class ObjectTypeTask(BaseTask):
@@ -1286,7 +1297,7 @@ class ObjectTypeTask(BaseTask):
 
         M = self.config.max_objects
         end_idx = start_idx + batch_size
-        file["predicted_type_logit"][start_idx:end_idx] = pred_logit[:, :M].cpu().numpy()
-        file["predicted_type_prob"][start_idx:end_idx] = pred_prob[:, :M].cpu().numpy()
-        file["target_type"][start_idx:end_idx] = type_labels[:, :M].cpu().numpy()
-        file["target_classes"][start_idx:end_idx] = classes[:, :M].cpu().numpy()
+        file["predicted_type_logit"][start_idx:end_idx] = pred_logit[:, :M].float().cpu().numpy()
+        file["predicted_type_prob"][start_idx:end_idx] = pred_prob[:, :M].float().cpu().numpy()
+        file["target_type"][start_idx:end_idx] = type_labels[:, :M].float().cpu().numpy()
+        file["target_classes"][start_idx:end_idx] = classes[:, :M].float().cpu().numpy()
