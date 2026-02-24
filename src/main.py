@@ -1,9 +1,11 @@
+import torch
 import lightning as pl
 from pathlib import Path
 from models.particle_transformer import  *
 from data.top_quark_reconstruction import *
 from trainers.top_reconstruction_trainers import *
 from utils.utils import load_and_split_config, load_any_config
+
 
 
 def find_latest_checkpoint(log_dir: str):
@@ -245,6 +247,10 @@ def create_layer_weights(strategy: str, n_layers: int, **kwargs) -> Optional[Dic
 if __name__ == "__main__":
     config = load_any_config("config/top_reconstruction_config.yaml")
 
+    # FP32 matmul precision (TF32 on Ampere+ GPUs)
+    matmul_precision = config.get("model_training", {}).get("matmul_precision", "highest")
+    torch.set_float32_matmul_precision(matmul_precision)
+
     # Reproducibility
     seed = config.get("model_training", {}).get("seed", None)
     if seed is not None:
@@ -319,7 +325,42 @@ if __name__ == "__main__":
         )
         trainer.test(model, datamodule=topantitopquark)
 
+    elif mode == "lr_find":
+        from lightning.pytorch.tuner import Tuner
+
+        # Minimal trainer — no early stopping, no checkpointing
+        lr_trainer = pl.Trainer(
+            num_nodes=1,
+            precision=config.get("model_training", {}).get("precision", "32-true"),
+            max_epochs=1,
+            default_root_dir=log_dir,
+            enable_checkpointing=False,
+            logger=False,
+        )
+        lightning_model = ReconstructionTrainer(transformer_model, task_registry, config)
+
+        tuner = Tuner(lr_trainer)
+        lr_finder = tuner.lr_find(
+            lightning_model,
+            datamodule=topantitopquark,
+            min_lr=1e-6,
+            max_lr=1e-1,
+            num_training=200,        # steps: more steps → smoother curve
+            mode="exponential",      # log-scale sweep
+            early_stop_threshold=4,  # stop if loss 4x worse than best
+        )
+
+        suggestion = lr_finder.suggestion()
+        print(f"\nSuggested LR: {suggestion:.2e}")
+        print("(Set model_training.learning_rate in config to this value)\n")
+
+        plot_path = Path(log_dir) / "lr_find_result.png"
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        fig = lr_finder.plot(suggest=True)
+        fig.savefig(plot_path, dpi=150)
+        print(f"LR range test plot saved to: {plot_path}")
+
     else:
-        raise ValueError(f"Unknown inference mode: {mode}. Use 'train', 'test', or 'resume'.")
+        raise ValueError(f"Unknown inference mode: {mode}. Use 'train', 'test', 'resume', or 'lr_find'.")
 
 
