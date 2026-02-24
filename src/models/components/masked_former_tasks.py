@@ -109,64 +109,104 @@ class BaseTask(ABC, nn.Module):
 
 class TaskRegistry(nn.Module):
     """Registry for managing multiple tasks"""
-    
+
     def __init__(self):
         super().__init__()
         self.tasks = nn.ModuleDict()
-    
+        # None = all tasks active; set of names = only those tasks active.
+        # Plain Python attribute so it is NOT saved in checkpoints — reconstructed
+        # from config on every run, making checkpoint resume correct automatically.
+        self._active_tasks: Optional[set] = None
+
     def register_task(self, task: 'BaseTask'):
         """Register a new task"""
         self.tasks[task.config.name] = task
-    
+
+    def set_active_tasks(self, task_names: Optional[list]):
+        """
+        Control which tasks contribute to cost and loss computation.
+
+        Task parameters remain in the model and optimizer throughout — only
+        their loss/cost contributions are gated. This preserves optimizer
+        state and avoids initialisation shocks at the phase transition.
+
+        Args:
+            task_names: List of task names to activate, or None for all tasks.
+        """
+        if task_names is None:
+            self._active_tasks = None
+        else:
+            unknown = set(task_names) - set(self.tasks.keys())
+            if unknown:
+                raise ValueError(f"Unknown tasks requested: {unknown}")
+            self._active_tasks = set(task_names)
+
+    def _is_active(self, task_name: str) -> bool:
+        return self._active_tasks is None or task_name in self._active_tasks
+
     def compute_total_cost(
         self,
         predictions: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """
-        Compute total cost across all tasks.
-        
+        Compute total cost across all active tasks.
+
         Returns:
             cost_matrix: [B, num_queries, num_targets]
         """
         total_cost = None
-        
+
         for task_name, task in self.tasks.items():
+            if not self._is_active(task_name):
+                continue
             task_cost = task.compute_cost(predictions, targets)
-            
+
             if total_cost is None:
                 total_cost = task_cost
             else:
                 total_cost += task_cost
-        
+
         return total_cost
-    
+
     def compute_total_loss(
         self,
         predictions: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor],
         valid_mask: Optional[torch.Tensor] = None,
-        layer_id: Optional[int] = None
+        layer_id: Optional[int] = None,
+        is_final_layer: bool = True,
     ) -> tuple:
         """
-        Compute total loss across all tasks.
+        Compute total loss across all active tasks.
 
         Returns:
-            (total_loss, per_task_losses): total scalar loss and dict of per-task scalar losses
+            (total_loss, per_task_losses): total scalar loss and dict of per-task tensor losses
         """
         total_loss = 0.0
-        per_task_losses: Dict[str, float] = {}
+        per_task_losses: Dict[str, torch.Tensor] = {}
 
         for task_name, task in self.tasks.items():
-            # Compute task loss
-            task_loss = task.compute_loss(predictions, targets, valid_mask)
+            if not self._is_active(task_name):
+                continue
 
-            # Apply task-specific layer weighting
+            # Determine layer weight up-front so we can skip zero-weight tasks
             if layer_id is not None:
                 layer_weight = task.config.get_layer_weight(layer_id)
-                task_loss = layer_weight * task_loss
+                if layer_weight == 0:
+                    continue
+            else:
+                layer_weight = 1.0
 
-            per_task_losses[task_name] = float(task_loss.item()) if torch.is_tensor(task_loss) else float(task_loss)
+            # Gate stat updates to final decoder layer only (intermediate layers
+            # give misleading stats since matching is performed on the final layer)
+            task._stats_enabled = is_final_layer
+            task_loss = task.compute_loss(predictions, targets, valid_mask)
+            task._stats_enabled = True  # reset to safe default
+
+            task_loss = layer_weight * task_loss
+
+            per_task_losses[task_name] = task_loss.detach() if torch.is_tensor(task_loss) else torch.tensor(float(task_loss))
             total_loss += task_loss
 
         return total_loss, per_task_losses
@@ -179,6 +219,8 @@ class MaskReconstructionTask(BaseTask):
         super().__init__(config)
         self.eps = 1e-8
         self.null_mask_penalty = null_mask_penalty
+        # Set True during mask-only pretraining to remove "predict nothing" signal
+        self.suppress_null_penalty = False
     
     def compute_cost(
         self,
@@ -267,7 +309,8 @@ class MaskReconstructionTask(BaseTask):
             # Null mask penalty: encourage unmatched queries to predict empty masks.
             # Adaptive scaling: reduce penalty when most queries are null so the
             # "predict empty" signal doesn't overwhelm real-object learning.
-            if self.null_mask_penalty > 0 and (~obj_valid).any():
+            # Suppressed during mask-only pretraining to eliminate "predict nothing" signal.
+            if self.null_mask_penalty > 0 and not self.suppress_null_penalty and (~obj_valid).any():
                 null_logits = pred_masks[~obj_valid]           # [N_null, N]
                 null_targets = torch.zeros_like(null_logits)
                 null_loss = F.binary_cross_entropy_with_logits(
@@ -342,6 +385,11 @@ class MaskReconstructionTask(BaseTask):
             shape=(number_events, self.config.max_objects, N_particles),
             dtype='float32'
         )
+        file.create_dataset(
+            "jet_valid_mask",
+            shape=(number_events, N_particles),
+            dtype='float32'
+        )
     
     def save_test_predictions(
         self,
@@ -355,6 +403,7 @@ class MaskReconstructionTask(BaseTask):
         pred_masks_logits = predictions['mask_predictions'].float().cpu().numpy()
         pred_masks_prob = predictions['mask_predictions'].sigmoid().float().cpu().numpy()
         target_masks = targets['jet_mask_true'].float().cpu().numpy()
+        jet_valid_mask = targets.get('jet_valid_mask')
         
         # Handle 2D targets
         if target_masks.ndim == 2:
@@ -371,6 +420,8 @@ class MaskReconstructionTask(BaseTask):
         file["target_masks"][start_idx:end_idx] = target_masks
         file["predicted_masks_logits"][start_idx:end_idx] = pred_masks_logits
         file["predicted_masks_prob"][start_idx:end_idx] = pred_masks_prob
+        if jet_valid_mask is not None:
+            file["jet_valid_mask"][start_idx:end_idx] = jet_valid_mask.float().cpu().numpy()
 
 
 class KinematicRegressionTask(BaseTask):
@@ -670,10 +721,10 @@ class MulticlassClassificationTask(BaseTask):
         else:
             self.register_buffer("class_weights", None)
 
-        # Accuracy accumulators — updated in compute_loss, read externally
-        self._correct_top1: int = 0
-        self._correct_topk: int = 0
-        self._total: int = 0
+        # Accuracy accumulators — GPU buffers, .item() deferred to getter
+        self.register_buffer('_correct_top1_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_correct_topk_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_total_buf', torch.zeros(1, dtype=torch.long), persistent=False)
 
     # ------------------------------------------------------------------
     # Cost (used by Hungarian matcher)
@@ -872,33 +923,30 @@ class MulticlassClassificationTask(BaseTask):
         pred_logits: torch.Tensor,   # [N, C]  — detached by caller's no_grad
         target_cls:  torch.Tensor,   # [N]
     ):
-        """Accumulate top-1 and top-k correct counts."""
+        """Accumulate top-1 and top-k correct counts (no .item() — deferred to getter)."""
+        if not getattr(self, '_stats_enabled', True):
+            return
         N = target_cls.shape[0]
 
         # Top-1
         top1_preds = pred_logits.argmax(dim=-1)                 # [N]
-        self._correct_top1 += int((top1_preds == target_cls).sum().item())
+        self._correct_top1_buf += (top1_preds == target_cls).sum()
 
         # Top-k (only meaningful if k < C)
         if self.topk < self.num_classes:
             topk_preds = pred_logits.topk(self.topk, dim=-1).indices  # [N, k]
             target_exp = target_cls.unsqueeze(1).expand_as(topk_preds)
-            self._correct_topk += int(
-                (topk_preds == target_exp).any(dim=-1).sum().item()
-            )
+            self._correct_topk_buf += (topk_preds == target_exp).any(dim=-1).sum()
         else:
             # k >= C means top-k accuracy is always 1.0
-            self._correct_topk += N
+            self._correct_topk_buf += N
 
-        self._total += N
+        self._total_buf += N
 
     def get_accuracy_stats(self) -> Dict[str, float]:
         """
         Return accumulated top-1 and top-k accuracy since last reset.
-
-        Typical usage — call after each validation epoch:
-            stats = task.get_accuracy_stats()
-            task.reset_accuracy_stats()
+        (.item() called here, once per epoch)
 
         Returns:
             {
@@ -908,7 +956,8 @@ class MulticlassClassificationTask(BaseTask):
                 'total_samples': int,
             }
         """
-        if self._total == 0:
+        total = self._total_buf.item()
+        if total == 0:
             return {
                 "top1_accuracy": 0.0,
                 "topk_accuracy": 0.0,
@@ -916,17 +965,17 @@ class MulticlassClassificationTask(BaseTask):
                 "total_samples": 0,
             }
         return {
-            "top1_accuracy": self._correct_top1 / self._total,
-            "topk_accuracy": self._correct_topk / self._total,
+            "top1_accuracy": self._correct_top1_buf.item() / total,
+            "topk_accuracy": self._correct_topk_buf.item() / total,
             "topk": self.topk,
-            "total_samples": self._total,
+            "total_samples": total,
         }
 
     def reset_accuracy_stats(self):
         """Reset accuracy accumulators. Call at the start of each epoch."""
-        self._correct_top1 = 0
-        self._correct_topk = 0
-        self._total = 0
+        self._correct_top1_buf.zero_()
+        self._correct_topk_buf.zero_()
+        self._total_buf.zero_()
 
     # ------------------------------------------------------------------
     # HDF5 I/O
@@ -1009,10 +1058,11 @@ class ObjectnessTask(BaseTask):
     def __init__(self, config: TaskConfig, null_weight: float = 0.1):
         super().__init__(config)
         self.null_weight = null_weight
-        # Detection stats accumulators
-        self._tp: int = 0
-        self._fp: int = 0
-        self._fn: int = 0
+        # Detection stats accumulators — GPU buffers so .item() is deferred to
+        # get_detection_stats() (called once per epoch, not per step)
+        self.register_buffer('_tp_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_fp_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_fn_buf', torch.zeros(1, dtype=torch.long), persistent=False)
 
     def compute_cost(
         self,
@@ -1087,31 +1137,36 @@ class ObjectnessTask(BaseTask):
         return loss_weight * loss
 
     def _update_detection_stats(self, pred_logit: torch.Tensor, obj_valid: torch.Tensor):
-        """Accumulate TP, FP, FN for precision/recall/F1."""
+        """Accumulate TP, FP, FN for precision/recall/F1 (no .item() — deferred to getter)."""
+        if not getattr(self, '_stats_enabled', True):
+            return
         pred_real = (pred_logit.sigmoid() > 0.5)
-        self._tp += int((pred_real & obj_valid).sum().item())
-        self._fp += int((pred_real & ~obj_valid).sum().item())
-        self._fn += int((~pred_real & obj_valid).sum().item())
+        self._tp_buf += (pred_real & obj_valid).sum()
+        self._fp_buf += (pred_real & ~obj_valid).sum()
+        self._fn_buf += (~pred_real & obj_valid).sum()
 
     def get_detection_stats(self) -> Dict[str, float]:
-        """Return precision, recall, F1 since last reset."""
-        precision = self._tp / max(self._tp + self._fp, 1)
-        recall = self._tp / max(self._tp + self._fn, 1)
+        """Return precision, recall, F1 since last reset (.item() called here, once per epoch)."""
+        tp = self._tp_buf.item()
+        fp = self._fp_buf.item()
+        fn = self._fn_buf.item()
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-8)
         return {
             'precision': precision,
             'recall': recall,
             'f1': f1,
-            'tp': self._tp,
-            'fp': self._fp,
-            'fn': self._fn,
+            'tp': tp,
+            'fp': fp,
+            'fn': fn,
         }
 
     def reset_detection_stats(self):
         """Reset detection stats. Call at the start of each epoch."""
-        self._tp = 0
-        self._fp = 0
-        self._fn = 0
+        self._tp_buf.zero_()
+        self._fp_buf.zero_()
+        self._fn_buf.zero_()
 
     def create_test_datasets(self, file: h5py.File, number_events: int):
         """Create HDF5 datasets for objectness predictions."""
@@ -1160,9 +1215,9 @@ class ObjectTypeTask(BaseTask):
     def __init__(self, config: TaskConfig, top_weight: float = 1.0):
         super().__init__(config)
         self.top_weight = top_weight
-        # Accuracy accumulators
-        self._correct: int = 0
-        self._total: int = 0
+        # Accuracy accumulators — GPU buffers, .item() deferred to getter
+        self.register_buffer('_correct_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_total_buf', torch.zeros(1, dtype=torch.long), persistent=False)
 
     def compute_cost(
         self,
@@ -1248,24 +1303,27 @@ class ObjectTypeTask(BaseTask):
         return loss_weight * loss
 
     def _update_accuracy(self, pred_logits: torch.Tensor, type_labels: torch.Tensor):
-        """Accumulate binary accuracy on real objects."""
+        """Accumulate binary accuracy on real objects (no .item() — deferred to getter)."""
+        if not getattr(self, '_stats_enabled', True):
+            return
         preds = (pred_logits.sigmoid() > 0.5).float()
-        self._correct += int((preds == type_labels).sum().item())
-        self._total += int(type_labels.numel())
+        self._correct_buf += (preds == type_labels).sum().long()
+        self._total_buf += type_labels.numel()
 
     def get_accuracy_stats(self) -> Dict[str, float]:
-        """Return accuracy since last reset."""
-        if self._total == 0:
+        """Return accuracy since last reset (.item() called here, once per epoch)."""
+        total = self._total_buf.item()
+        if total == 0:
             return {'accuracy': 0.0, 'total_samples': 0}
         return {
-            'accuracy': self._correct / self._total,
-            'total_samples': self._total,
+            'accuracy': self._correct_buf.item() / total,
+            'total_samples': total,
         }
 
     def reset_accuracy_stats(self):
         """Reset accuracy accumulators."""
-        self._correct = 0
-        self._total = 0
+        self._correct_buf.zero_()
+        self._total_buf.zero_()
 
     def create_test_datasets(self, file: h5py.File, number_events: int):
         """Create HDF5 datasets for type predictions."""
