@@ -1,3 +1,4 @@
+import math
 import lightning
 from lightning import Trainer
 from torchmetrics import Accuracy
@@ -43,6 +44,30 @@ def _check_for_nans( name, x):
         print(f"   max   = {bad.max().item() if bad.numel()>0 else 'n/a'}")
         print(f"   sample values = {bad[:10]}")
 
+
+def _as_float(value, key_name: str) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(f"Config '{key_name}' must be numeric, got: {value!r}") from exc
+    raise TypeError(f"Config '{key_name}' must be numeric, got type: {type(value).__name__}")
+
+
+def _as_int(value, key_name: str) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError as exc:
+            raise ValueError(f"Config '{key_name}' must be integer-like, got: {value!r}") from exc
+    raise TypeError(f"Config '{key_name}' must be integer-like, got type: {type(value).__name__}")
+
 class ReconstructionTrainer(lightning.LightningModule):
     """
     Base trainer that is completely task-agnostic.
@@ -65,15 +90,21 @@ class ReconstructionTrainer(lightning.LightningModule):
         
         # Training config
         training_config = config["model_training"]
-        self.lr = training_config.get("learning_rate", 1e-4)
-        self.weight_decay = training_config.get("weight_decay", 5e-4)
+        self.lr = _as_float(training_config.get("learning_rate", 1e-4), "model_training.learning_rate")
+        self.weight_decay = _as_float(training_config.get("weight_decay", 5e-4), "model_training.weight_decay")
         self.use_lookahead = training_config.get("use_lookahead", False)
         
         # History tracking
         self.train_loss_history = []
         self.val_loss_history = []
         self.test_metrics = {}
-        
+
+        # Mask-only pretraining config
+        pretrain_cfg = config.get("pretraining", {})
+        self.mask_pretrain_epochs = pretrain_cfg.get("mask_pretrain_epochs", 0)
+        self.mask_pretrain_tasks = pretrain_cfg.get("tasks", ["mask"])
+        self._pretrain_phase_active = self.mask_pretrain_epochs > 0
+
         self.save_hyperparameters(ignore=["model", "task_registry"])
 
     @property
@@ -158,10 +189,12 @@ class ReconstructionTrainer(lightning.LightningModule):
         extract and use those. Otherwise fall back to the original targets.
 
         Returns:
-            (total_loss, task_loss_accum): total scalar and per-task accumulated losses
+            (total_loss, task_loss_accum): total scalar and per-task accumulated losses (tensors)
         """
         total_loss = 0.0
-        task_loss_accum: Dict[str, float] = {}
+        task_loss_accum: Dict[str, torch.Tensor] = {}
+
+        final_layer_id = max(outputs.keys())
 
         for layer_id, layer_predictions in outputs.items():
             if "__targets__" in layer_predictions:
@@ -178,16 +211,21 @@ class ReconstructionTrainer(lightning.LightningModule):
                 predictions=preds,
                 targets=layer_targets,
                 valid_mask=valid_mask,
-                layer_id=layer_id
+                layer_id=layer_id,
+                is_final_layer=(layer_id == final_layer_id),
             )
             total_loss += layer_loss
 
             for task_name, task_val in per_task.items():
-                task_loss_accum[task_name] = task_loss_accum.get(task_name, 0.0) + task_val
+                prev = task_loss_accum.get(task_name, 0.0)
+                task_loss_accum[task_name] = prev + task_val
 
         # Stop training on NaN/Inf
         if torch.is_tensor(total_loss) and not torch.isfinite(total_loss):
-            bad_tasks = [k for k, v in task_loss_accum.items() if not (v == v)]  # NaN check
+            bad_tasks = [
+                k for k, v in task_loss_accum.items()
+                if not (torch.isfinite(v).all() if torch.is_tensor(v) else (v == v))
+            ]
             print(f"\nNon-finite total_loss={total_loss.item():.4f} — stopping training.")
             if bad_tasks:
                 print(f"   Tasks with NaN: {bad_tasks}")
@@ -223,24 +261,24 @@ class ReconstructionTrainer(lightning.LightningModule):
         if sched_type == "step":
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
-                step_size=sched_cfg.get("step_size", 2000),
-                gamma=sched_cfg.get("gamma", 0.7),
+                step_size=_as_int(sched_cfg.get("step_size", 2000), "model_training.scheduler.step_size"),
+                gamma=_as_float(sched_cfg.get("gamma", 0.7), "model_training.scheduler.gamma"),
             )
             return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
 
         elif sched_type == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=sched_cfg.get("T_max", 50),
-                eta_min=sched_cfg.get("eta_min", 1e-6),
+                T_max=_as_int(sched_cfg.get("T_max", 50), "model_training.scheduler.T_max"),
+                eta_min=_as_float(sched_cfg.get("eta_min", 1e-6), "model_training.scheduler.eta_min"),
             )
             return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
 
         elif sched_type == "plateau":
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                factor=sched_cfg.get("factor", 0.5),
-                patience=sched_cfg.get("patience", 5),
+                factor=_as_float(sched_cfg.get("factor", 0.5), "model_training.scheduler.factor"),
+                patience=_as_int(sched_cfg.get("patience", 5), "model_training.scheduler.patience"),
             )
             return {
                 "optimizer": optimizer,
@@ -248,6 +286,27 @@ class ReconstructionTrainer(lightning.LightningModule):
                     "scheduler": scheduler,
                     "monitor": sched_cfg.get("plateau_monitor", "val_loss"),
                 },
+            }
+
+        elif sched_type == "warmup_cosine":
+            warmup_epochs = _as_int(sched_cfg.get("warmup_epochs", 5), "model_training.scheduler.warmup_epochs")
+            T_max = _as_int(sched_cfg.get("T_max", 50), "model_training.scheduler.T_max")
+            eta_min = _as_float(sched_cfg.get("eta_min", 1e-6), "model_training.scheduler.eta_min")
+            base_lr = self.lr
+
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    # Linear ramp: 0 → 1 over warmup_epochs
+                    return max(1e-8, epoch / max(1, warmup_epochs))
+                progress = (epoch - warmup_epochs) / max(1, T_max - warmup_epochs)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+                # Scale cosine to [eta_min/base_lr, 1.0]
+                return eta_min / base_lr + (1.0 - eta_min / base_lr) * cosine
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
             }
 
         elif sched_type == "none":
@@ -378,7 +437,7 @@ class ReconstructionTrainer(lightning.LightningModule):
             self.logger.experiment.add_scalar('model/trainable_params', float(trainable), global_step=0)
 
     def on_train_epoch_start(self):
-        """Reset peak GPU memory counter and log current learning rate"""
+        """Reset peak GPU memory counter, log current learning rate, and apply pretraining phase."""
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -392,6 +451,27 @@ class ReconstructionTrainer(lightning.LightningModule):
                 suffix = f'_pg{j}' if len(param_groups) > 1 else ''
                 self.log(f'lr{suffix}', pg['lr'], on_step=False,
                          on_epoch=True, prog_bar=False, sync_dist=False)
+
+        # Mask-only pretraining phase transitions
+        if self._pretrain_phase_active:
+            epoch = self.trainer.current_epoch
+            mask_task = self.task_registry.tasks['mask'] if 'mask' in self.task_registry.tasks else None
+            if epoch < self.mask_pretrain_epochs:
+                # Phase 1: mask only — no objectness/type cost or loss, no null penalty
+                self.task_registry.set_active_tasks(self.mask_pretrain_tasks)
+                if mask_task is not None:
+                    mask_task.suppress_null_penalty = True
+                if epoch == 0:
+                    print(f"\n[Pretraining] Phase 1: mask-only "
+                          f"(epochs 0–{self.mask_pretrain_epochs - 1}), "
+                          f"active tasks: {self.mask_pretrain_tasks}")
+            elif epoch == self.mask_pretrain_epochs:
+                # Phase 2: all tasks enabled
+                self.task_registry.set_active_tasks(None)
+                if mask_task is not None:
+                    mask_task.suppress_null_penalty = False
+                print(f"\n[Pretraining] Phase 2: full multi-task "
+                      f"(epoch {epoch}+), all tasks active")
 
     def on_before_optimizer_step(self, optimizer):
         """Log gradient norm before optimizer step (after clipping)"""
@@ -407,6 +487,8 @@ class ReconstructionTrainer(lightning.LightningModule):
 
     def on_train_end(self):
         """Plot loss curves"""
+        if self.trainer.logger is None:
+            return
         out_dir = Path(self.trainer.logger.log_dir)
         
         fig_path = out_dir / "loss_curves.png"
