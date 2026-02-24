@@ -571,8 +571,10 @@ class MaskedReconstructionPart(nn.Module):
         )
 
         # Target tokens (learnable query embeddings)
+        # randn (zero-centered) rather than rand (positive-biased) so queries
+        # start distinguishable and the matcher can form meaningful assignments
         self.target_tokens = nn.Parameter(
-            torch.rand((self.number_class_tokens, embedding_size)) * 0.01
+            torch.randn((self.number_class_tokens, embedding_size)) * 0.02
         )
 
         # Decoder
@@ -586,6 +588,11 @@ class MaskedReconstructionPart(nn.Module):
         # Build prediction heads from task registry
         self.prediction_heads = self._build_prediction_heads(embedding_size)
 
+        # Pre-compute which output names are needed per decoder layer.
+        # Layers where a task's layer_weight == 0 skip that task's heads,
+        # avoiding unnecessary forward passes.
+        self._layer_output_map = self._build_layer_output_map(n_decoder_layers)
+
         # Matching setup
         if self.use_hungarian_matching:
             self.matcher = create_matcher(
@@ -594,6 +601,25 @@ class MaskedReconstructionPart(nn.Module):
                 max_targets=max_targets,
             )
     
+    def _build_layer_output_map(self, n_decoder_layers: int) -> Dict[int, set]:
+        """
+        Pre-compute which output names are needed at each decoder layer.
+
+        An output is needed at layer i if any task that produces it has a
+        non-zero layer_weight for i.  The final layer always includes all
+        outputs (needed for the cost matrix and test saving).
+        """
+        final_layer = n_decoder_layers - 1
+        output_map: Dict[int, set] = {}
+        for i in range(n_decoder_layers):
+            needed: set = set()
+            for task in self.task_registry.tasks.values():
+                lw = task.config.get_layer_weight(i)
+                if lw != 0 or i == final_layer:
+                    needed.update(task.config.output_names)
+            output_map[i] = needed
+        return output_map
+
     def _build_prediction_heads(self, embedding_size: int) -> nn.ModuleDict:
         """
         Build prediction heads from task registry.
@@ -656,9 +682,9 @@ class MaskedReconstructionPart(nn.Module):
         # Decode
         for i, layer in enumerate(self.decoder_stack):
             tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
-            
-            # Generate outputs dynamically from task registry
-            layer_outputs[i] = self._compute_layer_outputs(tgt, memory)
+
+            # Only compute heads needed at this layer (zero-weight layers are skipped)
+            layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i)
         
         # Apply matching using task registry
         if self.use_hungarian_matching and targets is not None:
@@ -666,30 +692,33 @@ class MaskedReconstructionPart(nn.Module):
         
         if last_output_only:
             final_layer = max(layer_outputs.keys())
-            return {0: layer_outputs[final_layer]}
+            return {final_layer: layer_outputs[final_layer]}
         
         return layer_outputs
     
     def _compute_layer_outputs(
-        self, 
+        self,
         queries: torch.Tensor,  # [B, num_queries, embedding_size]
-        memory: torch.Tensor    # [B, N_particles, embedding_size]
+        memory: torch.Tensor,   # [B, N_particles, embedding_size]
+        layer_id: int = -1,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute outputs for all tasks.
-        Output names come from task registry, not hardcoded.
+        Compute outputs for tasks needed at this layer.
+        Layers with layer_weight==0 for a task skip that task's heads,
+        avoiding unnecessary forward passes (e.g. kinematics at early layers).
         """
+        # Fall back to all heads for unknown layer_id (e.g. -1 sentinel)
+        needed = self._layer_output_map.get(layer_id, set(self.prediction_heads.keys()))
+
         outputs = {}
-        
-        # Generate each output type that tasks need
         for output_name, head in self.prediction_heads.items():
+            if output_name not in needed:
+                continue
             if output_name == 'mask_predictions':
-                # Special case: cross-attention with memory
                 outputs[output_name] = torch.einsum("bnd,bmd->bnm", queries, memory)
             else:
-                # Apply prediction head to queries
                 outputs[output_name] = head(queries)
-        
+
         return outputs
     def _collate_targets(
         self,
@@ -799,8 +828,16 @@ class MaskedReconstructionPart(nn.Module):
         """
         # ---- 1. Collate targets if needed ----
         if isinstance(targets, list):
+            # Old path: List[Dict] — collate on GPU (fallback)
             targets_batched, target_valid_mask = self._collate_targets(targets)
+        elif 'target_valid_mask' in targets:
+            # Fast path: already pre-collated by masked_former_collate_fn on CPU
+            targets_batched = targets
+            target_valid_mask = targets['target_valid_mask'].to(
+                next(iter(targets.values())).device
+            )
         else:
+            # Backward compat: Dict targets without target_valid_mask (fixed T)
             targets_batched = targets
             jmt = targets_batched['jet_mask_true']
             if jmt.ndim == 2:
@@ -836,15 +873,32 @@ class MaskedReconstructionPart(nn.Module):
         pred_idxs = pred_idxs.to(cost_matrix.device)
         B, Q = pred_idxs.shape
 
-        # ---- 3. Permute outputs (preserves gradients) ----
-        batch_idxs = torch.arange(B, device=pred_idxs.device).unsqueeze(1)
+        # ---- 3. Permute outputs with batched gather (preserves gradients) ----
+        # Group layers by output name, stack [n_layers, B, Q, D], run one
+        # torch.gather per output name — reduces ~32 kernel launches to ~4.
+        layer_ids = sorted(decoder_outputs.keys())
+        permuted_outputs = {lid: {} for lid in layer_ids}
 
-        permuted_outputs = {}
-        for layer_id, layer_dict in decoder_outputs.items():
-            permuted_outputs[layer_id] = {}
-            for output_name, output_tensor in layer_dict.items():
-                permuted_outputs[layer_id][output_name] = \
-                    output_tensor[batch_idxs, pred_idxs]
+        # Collect all output names that appear in at least one layer
+        all_output_names: set = set()
+        for lid in layer_ids:
+            all_output_names.update(decoder_outputs[lid].keys())
+
+        for output_name in all_output_names:
+            layers_with = [lid for lid in layer_ids if output_name in decoder_outputs[lid]]
+            if not layers_with:
+                continue
+
+            stacked = torch.stack([decoder_outputs[lid][output_name] for lid in layers_with])
+            # stacked: [L, B, Q, D]
+            D = stacked.shape[-1]
+            idx = (pred_idxs
+                   .unsqueeze(0)          # [1, B, Q]
+                   .unsqueeze(-1)         # [1, B, Q, 1]
+                   .expand(len(layers_with), -1, -1, D))  # [L, B, Q, D]
+            gathered = torch.gather(stacked, 2, idx)      # [L, B, Q, D]
+            for j, lid in enumerate(layers_with):
+                permuted_outputs[lid][output_name] = gathered[j]
 
         # ---- 4. Pad targets from T_max to Q ----
         T_max = target_valid_mask.shape[1]
