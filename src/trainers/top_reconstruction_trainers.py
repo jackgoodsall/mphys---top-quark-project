@@ -99,6 +99,15 @@ class ReconstructionTrainer(lightning.LightningModule):
             self.log(f'train_loss_{task_name}', task_loss, on_step=False,
                      on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
 
+        # GPU memory (MB) — local device query, no cross-GPU sync needed
+        if torch.cuda.is_available():
+            mem_alloc = torch.cuda.memory_allocated() / 1e6
+            mem_reserved = torch.cuda.memory_reserved() / 1e6
+            self.log('gpu_mem_alloc_mb', mem_alloc, on_step=True, on_epoch=False,
+                     prog_bar=False, sync_dist=False)
+            self.log('gpu_mem_reserved_mb', mem_reserved, on_step=True, on_epoch=False,
+                     prog_bar=False, sync_dist=False)
+
         return total_loss
     
     def validation_step(self, batch, batch_idx):
@@ -248,11 +257,16 @@ class ReconstructionTrainer(lightning.LightningModule):
             raise ValueError(f"Unknown scheduler type: {sched_type}")
     
     def on_train_epoch_end(self):
-        """Track training loss history and log task metrics"""
+        """Track training loss history, log task metrics, and log peak GPU memory"""
         cm = self.trainer.callback_metrics
         train_loss = self._grab_metric(cm, ["train_loss", "train_loss_epoch"])
         if train_loss is not None:
             self.train_loss_history.append(train_loss)
+
+        if torch.cuda.is_available():
+            peak_mb = torch.cuda.max_memory_allocated() / 1e6
+            self.log('gpu_peak_mem_mb', peak_mb, on_step=False, on_epoch=True,
+                     prog_bar=False, sync_dist=False)
 
         # Log and reset task-level metrics
         for task_name, task in self.task_registry.tasks.items():
@@ -364,7 +378,10 @@ class ReconstructionTrainer(lightning.LightningModule):
             self.logger.experiment.add_scalar('model/trainable_params', float(trainable), global_step=0)
 
     def on_train_epoch_start(self):
-        """Log current learning rate"""
+        """Reset peak GPU memory counter and log current learning rate"""
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         optimizers = self.optimizers()
         if not isinstance(optimizers, list):
             optimizers = [optimizers]
