@@ -709,6 +709,26 @@ class MaskedReconstructionPart(nn.Module):
         T_per_event = [t['jet_mask_true'].shape[0] for t in targets_list]
         T_max = max(T_per_event)
 
+        # Edge case: every event in the batch has zero reconstructable objects.
+        # Return all-False valid mask and empty-dimension target tensors so
+        # the matcher (which already handles T_max==0) can proceed cleanly.
+        if T_max == 0:
+            P = targets_list[0]['jet_valid_mask'].shape[0]
+            batched: Dict[str, torch.Tensor] = {
+                'jet_mask_true': torch.zeros(B, 0, P, device=device),
+                'jet_valid_mask': torch.stack(
+                    [t['jet_valid_mask'] for t in targets_list]
+                ),
+            }
+            if 'target_kinematics' in targets_list[0]:
+                D = targets_list[0]['target_kinematics'].shape[-1]
+                batched['target_kinematics'] = torch.zeros(B, 0, D, device=device)
+                batched['kinematics'] = batched['target_kinematics']
+            if 'classes' in targets_list[0]:
+                batched['classes'] = torch.zeros(B, 0, dtype=torch.long, device=device)
+            target_valid_mask = torch.zeros(B, 0, dtype=torch.bool, device=device)
+            return batched, target_valid_mask
+
         # Pad and stack jet_mask_true: [T_i, P] -> [B, T_max, P]
         jmt_list = []
         for t in targets_list:
