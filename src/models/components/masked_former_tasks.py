@@ -217,7 +217,7 @@ class MaskReconstructionTask(BaseTask):
 
     def __init__(self, config: TaskConfig, null_mask_penalty: float = 0.1):
         super().__init__(config)
-        self.eps = 1e-8
+        self.eps = 1e-6  # Increased from 1e-8 for better numerical stability in Dice loss
         self.null_mask_penalty = null_mask_penalty
         # Set True during mask-only pretraining to remove "predict nothing" signal
         self.suppress_null_penalty = False
