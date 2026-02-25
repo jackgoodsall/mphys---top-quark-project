@@ -187,7 +187,7 @@ class MIParticleAttentionBlock(nn.Module):
 
         x1 = self.ln1(x)                                         # [B, N, D]
         V  = self.v_proj(x1)                                     # [B, N, D_mia]
-        weights    = F.softmax(u_t, dim=2)                       # [B, N, N, D_mia]
+        weights    = torch.nan_to_num(F.softmax(u_t, dim=2), nan=0.0)  # [B, N, N, D_mia]; nan_to_num handles fully-masked padding rows
         mia_result = torch.einsum('bijn,bjn->bin', weights, V)   # [B, N, D_mia]
         mia_result = self.mia_dropout(self.mia_out_proj(mia_result))  # [B, N, D]
 
