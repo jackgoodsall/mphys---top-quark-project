@@ -6,7 +6,7 @@ from typing import List
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 import copy
-from src.models.components.attention_layers import ParticleAttentionBlock, ClassAttentionBlock, DecoderAttentionBlock
+from src.models.components.attention_layers import ParticleAttentionBlock, ClassAttentionBlock, DecoderAttentionBlock, MIParticleAttentionBlock, InteractionDimReducer
 from src.models.components.masked_former_tasks import *
 from src.models.components.matcher import *
 from typing import Dict, Optional, Union
@@ -178,13 +178,26 @@ class ParticleEmbedder(nn.Module):
         self.layer_sizes = [n_input] + hidden_sizes 
         self.layers = nn.ModuleList()
         for size_1, size_2 in zip(self.layer_sizes[:-1], self.layer_sizes[1:]):
-            self.layers.extend([ nn.LayerNorm(size_1), nn.Linear(size_1, size_2), nn.GELU(), nn.Dropout(p_dropout)])
+            # Add eps=1e-6 to LayerNorm for numerical stability
+            self.layers.extend([ nn.LayerNorm(size_1, eps=1e-6), nn.Linear(size_1, size_2), nn.GELU(), nn.Dropout(p_dropout)])
         self.layers.append(nn.Linear(size_2, embedding_size))
         
     def forward(self, X, src_mask = None):
-
-        for layers in self.layers:
-            X = layers(X)
+        # Clip input to prevent extreme values from causing NaNs in Linear layers
+        X = torch.clamp(X, min=-100.0, max=100.0)
+        
+        # Check for NaNs in INPUT to embedder
+        if torch.isnan(X).any():
+            nan_count = torch.isnan(X).sum().item()
+            raise RuntimeError(f"NaN in ParticleEmbedder INPUT (after clipping)! {nan_count} NaNs out of {X.numel()}")
+        
+        for i, layer in enumerate(self.layers):
+            X = layer(X)
+            # Debug: check for NaN after each layer
+            if torch.isnan(X).any():
+                nan_count = torch.isnan(X).sum().item()
+                layer_name = layer.__class__.__name__
+                raise RuntimeError(f"NaN after ParticleEmbedder layer {i} ({layer_name})! {nan_count} NaNs out of {X.numel()}")
         
         if src_mask is not None:
             # mask -> [B, N, 1] → broadcasts over features
@@ -353,8 +366,14 @@ class InteractionEmbedder(nn.Module):
         super().__init__()
         hidden_sizes = [input_features] + hidden_layers 
         self.layers =  nn.ModuleList([])
-        for size_1, size_2 in zip(hidden_sizes[:-1], hidden_sizes[1:]):
-            self.layers.extend([ nn.BatchNorm1d(size_1), nn.Conv1d(size_1, size_2, kernel_size=1), nn.GELU(), nn.Dropout(p_dropout)])
+        for i, (size_1, size_2) in enumerate(zip(hidden_sizes[:-1], hidden_sizes[1:])):
+            # First BatchNorm: slower momentum + more eps to handle extreme interaction values
+            # Later BatchNorms: standard settings
+            if i == 0:
+                bn = nn.BatchNorm1d(size_1, eps=1e-4, momentum=0.01, affine=True)  
+            else:
+                bn = nn.BatchNorm1d(size_1, eps=1e-5, momentum=0.1, affine=True)
+            self.layers.extend([bn, nn.Conv1d(size_1, size_2, kernel_size=1), nn.GELU(), nn.Dropout(p_dropout)])
         self.layers.append(nn.Conv1d(size_2, output_size, kernel_size=1))
 
     def forward(self, x, src_mask = None):
@@ -364,10 +383,13 @@ class InteractionEmbedder(nn.Module):
         """
         B, N, M, F = x.shape  # F = input_features
 
+        # Clip extreme values (m² can be huge, kT too) to prevent BatchNorm corruption
+        # Features: [delta_R, kT, z, m²] - keep reasonable range for batch norm
+        x = torch.clamp(x, min=-100.0, max=100.0)
+
         # Flatten pair (i, j) and arrange for Conv1d: [B*N*M, C_in, L]
         x = x.view(B * N * M, F)       # [B*N*M, F]
-        x = x.unsqueeze(-1)    
-        x /= 3        # [B*N*M, F, 1]
+        x = x.unsqueeze(-1)            # [B*N*M, F, 1]
 
         for layer in self.layers:
             if isinstance(layer, nn.LayerNorm):
@@ -551,6 +573,9 @@ class MaskedReconstructionPart(nn.Module):
                  use_hungarian_matching=True,
                  matching_solver: str = "gpu_bruteforce",
                  max_targets: int = 5,
+                 use_mia_encoder: bool = False,
+                 n_mia_layers: int = 5,
+                 mia_interaction_dim: int = 64,
                  *args,
                  **kwargs
                  ):
@@ -562,13 +587,33 @@ class MaskedReconstructionPart(nn.Module):
         self.number_class_tokens = number_class_tokens
         self.use_hungarian_matching = use_hungarian_matching
         self.task_registry = task_registry
+        self.use_mia_encoder = use_mia_encoder
 
-        # Encoder
-        self.encoder_stack = nn.ModuleList(
-            [ParticleAttentionBlock(embedding_size, dim_ff,
-                                    n_heads, p_dropout, pair_wise_dim=8)
-             for _ in range(n_encoder_layers)]
-        )
+        if use_mia_encoder:
+            # MIParT-style encoder:
+            #   K x MIParticleAttentionBlock  (high-dim interaction D1=mia_interaction_dim)
+            #   InteractionDimReducer         (D1 -> n_heads = D2)
+            #   L x ParticleAttentionBlock    (low-dim interaction D2=n_heads)
+            # where K + L = n_encoder_layers, K = n_mia_layers
+            n_part_layers = max(0, n_encoder_layers - n_mia_layers)
+            self.mia_encoder_stack = nn.ModuleList(
+                [MIParticleAttentionBlock(embedding_size, dim_ff,
+                                         p_dropout, mia_dim=mia_interaction_dim)
+                 for _ in range(n_mia_layers)]
+            )
+            self.interaction_reducer = InteractionDimReducer(mia_interaction_dim, n_heads)
+            self.encoder_stack = nn.ModuleList(
+                [ParticleAttentionBlock(embedding_size, dim_ff,
+                                        n_heads, p_dropout, pair_wise_dim=n_heads)
+                 for _ in range(n_part_layers)]
+            )
+        else:
+            # Original ParT-style encoder
+            self.encoder_stack = nn.ModuleList(
+                [ParticleAttentionBlock(embedding_size, dim_ff,
+                                        n_heads, p_dropout, pair_wise_dim=8)
+                 for _ in range(n_encoder_layers)]
+            )
 
         # Target tokens (learnable query embeddings)
         # randn (zero-centered) rather than rand (positive-biased) so queries
@@ -664,14 +709,50 @@ class MaskedReconstructionPart(nn.Module):
         src_mask = X["src_mask"]
         targets = X.get("targets", None)
         
+        # Input validation: check for NaNs in raw inputs (exclude infs which might be intentional padding)
+        if torch.isnan(jet).any():
+            nan_count = torch.isnan(jet).sum().item()
+            nan_pct = 100.0 * nan_count / jet.numel()
+            raise RuntimeError(f"NaN in input jet features! {nan_count} NaNs ({nan_pct:.2f}% of {jet.numel()} total values)")
+        if torch.isnan(interactions).any():
+            nan_count = torch.isnan(interactions).sum().item()
+            nan_pct = 100.0 * nan_count / interactions.numel()
+            raise RuntimeError(f"NaN in input interactions! {nan_count} NaNs ({nan_pct:.2f}% of {interactions.numel()} total values)")
+        
+        # Check for extreme values that might cause overflow
+        jet_max = jet.abs().max().item()
+        if jet_max > 1e6:
+            raise RuntimeError(f" Extreme value in jet features: max={jet_max:.2e}, this will cause NaN in embedder")
+        
         # Embed
         jet = self.particle_embedder(jet, src_mask=~src_mask)
         interactions = self.interaction_embedder(interactions, src_mask=~src_mask)
+        
+        # NaN detection after embeddings (-inf is allowed for attention masking)
+        if torch.isnan(jet).any():
+            raise RuntimeError(f"NaN after particle embedder!")
+        if torch.isnan(interactions).any():
+            # Count actual NaNs vs -inf (which is expected for masking)
+            nan_mask = torch.isnan(interactions)
+            raise RuntimeError(f"NaN after interaction embedder! Found {nan_mask.sum()} NaN values")
         
         B, N, F = jet.shape
         
         # Encode
         memory = jet
+        if self.use_mia_encoder:
+            # Phase 1: MIA blocks with high-dim interactions
+            for layer in self.mia_encoder_stack:
+                memory = layer(memory, interactions)
+            # Compress interactions from D_mia -> n_heads for P-MHA blocks.
+            # Conv1d with mixed-sign weights turns -inf (padding marker) into NaN
+            # (-inf * w_pos + -inf * w_neg = -inf + +inf = NaN).  Zero the padding
+            # positions before the linear reduction then restore -inf afterwards.
+            padding_col_mask = ~src_mask[:, None, None, :]  # [B,1,1,N] True=padding col
+            interactions_finite = interactions.masked_fill(padding_col_mask, 0.0)
+            interactions = self.interaction_reducer(interactions_finite)
+            interactions = interactions.masked_fill(padding_col_mask, float('-inf'))
+        # Phase 2 (or full encoder for non-MIA): P-MHA blocks
         for layer in self.encoder_stack:
             memory = layer(memory, interactions)
         
