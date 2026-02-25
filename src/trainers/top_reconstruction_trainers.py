@@ -8,6 +8,19 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from pathlib import Path
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+
+
+class WarmupEarlyStopping(EarlyStopping):
+    """EarlyStopping that ignores the monitored metric for the first `warmup_epochs` epochs."""
+
+    def __init__(self, warmup_epochs: int = 0, **kwargs):
+        super().__init__(**kwargs)
+        self.warmup_epochs = warmup_epochs
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch < self.warmup_epochs:
+            return
+        super().on_validation_epoch_end(trainer, pl_module)
 from dataclasses import field
 from torchmetrics.functional import roc, precision_recall_curve, auroc
 import h5py
@@ -529,9 +542,11 @@ def train_reconstruction_model(
     # --- Config-driven callbacks ---
     cb_cfg = config.get("training_callbacks", {})
 
-    # Early stopping
+    # Early stopping — skip checks during pretraining phase
     es_cfg = cb_cfg.get("early_stopping", {})
-    callbacks.append(EarlyStopping(
+    pretrain_warmup = config.get("pretraining", {}).get("mask_pretrain_epochs", 0)
+    callbacks.append(WarmupEarlyStopping(
+        warmup_epochs=pretrain_warmup,
         monitor=es_cfg.get("monitor", "val_loss"),
         patience=es_cfg.get("patience", 10),
         min_delta=es_cfg.get("min_delta", 0.0001),
