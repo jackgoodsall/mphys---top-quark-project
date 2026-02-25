@@ -134,6 +134,87 @@ class ParticleAttentionBlock(nn.Module):
         return residual
 
 
+class MIParticleAttentionBlock(nn.Module):
+    """
+    MI-Particle Attention Block from MIParT (arXiv:2407.08682).
+
+    Replaces P-MHA with More-Interaction Attention (MIA):
+
+        MIA(U, V) = Softmax(U) · V
+
+    U [B, D_mia, N, N] is the high-dimensional interaction tensor (channels-first,
+    -inf at padding positions).  V = W_v(x) is a value projection of particle
+    features.  Each of the D_mia channels acts as an independent attention head,
+    giving the model D_mia separate soft-selection patterns over particles.
+
+    Structure mirrors ParticleAttentionBlock (NormFormer-style residuals).
+    """
+
+    def __init__(self, embedded_dim: int, feed_for_dim: int,
+                 p_dropout: float, mia_dim: int):
+        super().__init__()
+        self.embedded_dim = embedded_dim
+        self.mia_dim = mia_dim
+
+        # MIA sub-block
+        self.ln1 = nn.LayerNorm(embedded_dim)
+        self.v_proj = nn.Linear(embedded_dim, mia_dim)
+        self.mia_out_proj = nn.Linear(mia_dim, embedded_dim)
+        self.mia_dropout = nn.Dropout(p_dropout)
+
+        # Feed-forward block — same structure as ParticleAttentionBlock
+        self.ln2 = nn.LayerNorm(embedded_dim)
+        self.feed_forward_block = nn.Sequential(
+            nn.LayerNorm(embedded_dim),
+            nn.Linear(embedded_dim, feed_for_dim),
+            nn.GELU(),
+            nn.LayerNorm(feed_for_dim),
+            nn.Linear(feed_for_dim, embedded_dim),
+        )
+
+    def forward(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x : [B, N, D]        particle features
+            u : [B, D_mia, N, N] high-dim interaction tensor, channels-first.
+                                  Padding pairs must already be -inf so Softmax
+                                  assigns zero weight to them.
+        Returns:
+            [B, N, D] updated particle features
+        """
+        # channels-last view needed for the einsum: [B, N, N, D_mia]
+        u_t = u.permute(0, 2, 3, 1)
+
+        x1 = self.ln1(x)                                         # [B, N, D]
+        V  = self.v_proj(x1)                                     # [B, N, D_mia]
+        weights    = F.softmax(u_t, dim=2)                       # [B, N, N, D_mia]
+        mia_result = torch.einsum('bijn,bjn->bin', weights, V)   # [B, N, D_mia]
+        mia_result = self.mia_dropout(self.mia_out_proj(mia_result))  # [B, N, D]
+
+        post_mia = self.ln2(mia_result) + x
+        residual = self.feed_forward_block(post_mia) + post_mia
+        return residual
+
+
+class InteractionDimReducer(nn.Module):
+    """
+    Pointwise 1-D convolution that compresses the interaction tensor from
+    D_mia (used by MIParticleAttentionBlocks) down to n_heads (used by the
+    subsequent ParticleAttentionBlocks), exactly as in MIParT Fig. 1.
+
+    Input/output shape: [B, D_in, N, N] → [B, D_out, N, N].
+    """
+
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.conv = nn.Conv1d(d_in, d_out, kernel_size=1)
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        B, D, N, M = u.shape
+        u_flat = u.view(B, D, N * M)           # flatten pairs to length dim
+        return self.conv(u_flat).view(B, -1, N, M)
+
+
 class ClassAttentionBlock(nn.Module):
     """
     Implements the class attention block desribed in the paper  https://arxiv.org/abs/2202.03772 
