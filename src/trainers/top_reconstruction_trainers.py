@@ -110,6 +110,7 @@ class ReconstructionTrainer(lightning.LightningModule):
         # History tracking
         self.train_loss_history = []
         self.val_loss_history = []
+        self.lr_history = []
         self.test_metrics = {}
 
         # Mask-only pretraining config
@@ -464,6 +465,9 @@ class ReconstructionTrainer(lightning.LightningModule):
                 suffix = f'_pg{j}' if len(param_groups) > 1 else ''
                 self.log(f'lr{suffix}', pg['lr'], on_step=False,
                          on_epoch=True, prog_bar=False, sync_dist=False)
+            # Track LR of first param group for plotting
+            if param_groups:
+                self.lr_history.append(param_groups[0]['lr'])
 
         # Mask-only pretraining phase transitions
         if self._pretrain_phase_active:
@@ -499,11 +503,11 @@ class ReconstructionTrainer(lightning.LightningModule):
                  prog_bar=False, sync_dist=False)
 
     def on_train_end(self):
-        """Plot loss curves"""
+        """Plot loss curves and learning rate schedule"""
         if self.trainer.logger is None:
             return
         out_dir = Path(self.trainer.logger.log_dir)
-        
+
         fig_path = out_dir / "loss_curves.png"
         plt.figure(figsize=(10, 6))
         plt.plot(self.train_loss_history, label="train")
@@ -516,6 +520,19 @@ class ReconstructionTrainer(lightning.LightningModule):
         plt.tight_layout()
         plt.savefig(fig_path, dpi=150)
         plt.close()
+
+        if self.lr_history:
+            lr_path = out_dir / "lr_schedule.png"
+            plt.figure(figsize=(10, 4))
+            plt.plot(self.lr_history)
+            plt.xlabel("Epoch")
+            plt.ylabel("Learning Rate")
+            plt.title("Learning Rate Schedule")
+            plt.yscale("log")
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(lr_path, dpi=150)
+            plt.close()
 
 
 def train_reconstruction_model(
