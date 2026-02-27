@@ -622,6 +622,15 @@ class MaskedReconstructionPart(nn.Module):
             torch.randn((self.number_class_tokens, embedding_size)) * 0.02
         )
 
+        # Type-conditioned queries: first n_top_queries are top-designated,
+        # remainder are W-designated.  Type embeddings are added to queries
+        # before the decoder so the model can specialise each query group.
+        n_top_queries = kwargs.get('n_top_queries', number_class_tokens // 2)
+        self.type_embeddings = nn.Embedding(2, embedding_size)  # 0=top, 1=W
+        self.register_buffer('query_type_ids',
+            torch.cat([torch.zeros(n_top_queries, dtype=torch.long),
+                       torch.ones(number_class_tokens - n_top_queries, dtype=torch.long)]))
+
         # Decoder
         self.decoder_stack = nn.ModuleList(
             [nn.TransformerDecoderLayer(
@@ -756,8 +765,9 @@ class MaskedReconstructionPart(nn.Module):
         for layer in self.encoder_stack:
             memory = layer(memory, interactions)
         
-        # Initialize queries
-        tgt = self.target_tokens.expand(B, -1, -1)
+        # Initialize queries with type embeddings
+        type_emb = self.type_embeddings(self.query_type_ids)  # [Q, D]
+        tgt = (self.target_tokens + type_emb).unsqueeze(0).expand(B, -1, -1)
         layer_outputs = {}
         
         # Decode
@@ -942,6 +952,20 @@ class MaskedReconstructionPart(nn.Module):
                 predictions=final_output,
                 targets=targets_batched
             )  # [B, Q, T_max]
+
+            # Type-partitioned matching: add large penalty for cross-type
+            # assignments so top queries can only match top targets and
+            # W queries can only match W targets.
+            if hasattr(self, 'query_type_ids') and 'classes' in targets_batched:
+                classes = targets_batched['classes']  # [B, T_max]
+                # target type: top (CLASS_TOP=1) → 0, W (CLASS_W=2) → 1
+                target_type = (classes == CLASS_W).long()             # [B, T_max]
+                query_type = self.query_type_ids                      # [Q]
+
+                # [B, Q, T_max] — True where query type != target type
+                type_mismatch = (query_type[None, :, None] != target_type[:, None, :])
+
+                cost_matrix = cost_matrix + type_mismatch.float() * 1e6
 
             query_valid = targets_batched.get('query_mask')
 
