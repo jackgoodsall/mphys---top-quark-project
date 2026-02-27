@@ -159,6 +159,7 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
     slot_perfect    = errors_per_slot == 0                        # [N, Q]
 
     # In strict mode, also require the objectness head to predict the slot as real
+    pred_real = None  # set below if pred_obj is available
     if strict and pred_obj is not None:
         obj_thresh = 0.5 if use_probs else 0.0
         pred_real  = pred_obj > obj_thresh                       # [N, Q]
@@ -187,22 +188,20 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
     all_eff   = perfect_all.sum()                    / len(perfect_all)
 
     # ── Object purity (from objectness predictions) ──
-    obj_purity   = None
-    recon_purity = None
-    n_pred_real  = None
-    top_purity   = None
-    W_purity     = None
-    n_pred_top   = None
-    n_pred_W     = None
+    obj_purity    = None
+    ttbar_purity  = None
+    n_pred_real   = None
+    top_purity    = None
+    W_purity      = None
+    n_pred_top    = None
+    n_pred_W      = None
+    n_pred_both_tops = None
     if pred_obj is not None:
         obj_thresh = 0.5 if use_probs else 0.0
         pred_real  = pred_obj > obj_thresh                        # [N, Q]
         n_pred_real = int(pred_real.sum())
         # Of predicted-real slots, fraction that are actually real
         obj_purity   = float((pred_real & is_real).sum()
-                             / max(n_pred_real, 1))
-        # Of predicted-real slots, fraction perfectly reconstructed
-        recon_purity = float((pred_real & is_real & slot_perfect).sum()
                              / max(n_pred_real, 1))
         # Per-type purity: of predicted-real slots of each type, fraction perfectly reconstructed
         n_pred_top = int((pred_real & is_top).sum())
@@ -211,6 +210,12 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
                            / max(n_pred_top, 1))
         W_purity   = float((pred_real & is_W & is_real & slot_perfect).sum()
                            / max(n_pred_W, 1))
+        # ttbar purity: of events where both tops are predicted real, fraction with both correct
+        pred_both_tops   = (pred_real & is_top).sum(axis=1) == 2          # [N]
+        n_pred_both_tops = int(pred_both_tops.sum())
+        both_tops_correct = (pred_real & is_top & is_real & slot_perfect).sum(axis=1) == 2
+        ttbar_purity = float((pred_both_tops & both_tops_correct).sum()
+                             / max(n_pred_both_tops, 1))
 
     # Per-multiplicity breakdown
     multiplicity = jet_valid.sum(axis=1).astype(int)         # [N]
@@ -226,7 +231,7 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         bt  = both_tops[sel].sum()
         n_top_correct = (is_top[sel] & is_real[sel] & slot_detected_perfect[sel]).sum()
         n_top_total   = (is_top[sel] & is_real[sel]).sum()
-        breakdown[m] = {
+        row = {
             "n_events":  int(n_sel),
             "top_eff":   float(n_top_correct / max(n_top_total, 1)),
             "W_eff":     float((all_Ws_perfect[sel]   & has_W[sel]).sum()     / max(hw, 1)),
@@ -235,6 +240,23 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
             "n_W":       int(hw),
             "n_ttbar":   int(bt),
         }
+        if pred_real is not None:
+            pr = pred_real[sel]                                          # [n_sel, Q]
+            ir = is_real[sel]; it = is_top[sel]; iw = is_W[sel]
+            sp = slot_perfect[sel]
+            n_pr_top  = int((pr & it).sum())
+            n_pr_W    = int((pr & iw).sum())
+            row["top_purity"]   = float((pr & it & ir & sp).sum() / max(n_pr_top, 1))
+            row["W_purity"]     = float((pr & iw & ir & sp).sum() / max(n_pr_W, 1))
+            # ttbar purity: both tops predicted real & both correct
+            pr_both = (pr & it).sum(axis=1) == 2                        # [n_sel]
+            n_pr_both = int(pr_both.sum())
+            pr_both_correct = (pr & it & ir & sp).sum(axis=1) == 2
+            row["ttbar_purity"]     = float((pr_both & pr_both_correct).sum() / max(n_pr_both, 1))
+            row["n_pred_top"]       = n_pr_top
+            row["n_pred_W"]         = n_pr_W
+            row["n_pred_both_tops"] = n_pr_both
+        breakdown[m] = row
 
     return {
         "N": len(pred_scores),
@@ -244,13 +266,14 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         "W_eff":     float(W_eff),
         "ttbar_eff": float(ttbar_eff),
         "all_eff":   float(all_eff),
-        "obj_purity":   obj_purity,
-        "recon_purity": recon_purity,
-        "top_purity":   top_purity,
-        "W_purity":     W_purity,
-        "n_pred_real":  n_pred_real,
-        "n_pred_top":   n_pred_top,
-        "n_pred_W":     n_pred_W,
+        "obj_purity":       obj_purity,
+        "ttbar_purity":     ttbar_purity,
+        "top_purity":       top_purity,
+        "W_purity":         W_purity,
+        "n_pred_real":      n_pred_real,
+        "n_pred_top":       n_pred_top,
+        "n_pred_W":         n_pred_W,
+        "n_pred_both_tops": n_pred_both_tops,
         "n_has_top":   int(n_top_slots_total),
         "n_has_W":     int(has_W.sum()),
         "n_both_tops": int(both_tops.sum()),
@@ -297,9 +320,9 @@ def print_results(run_dir: Path, results: dict):
         print(f"\nPURITY SUMMARY (N_correct_predicted / N_all_predicted)")
         print("─" * 70)
         print(f"  Object purity      (pred real & actual real / pred real):       {results['obj_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
-        print(f"  Recon purity       (pred real & perfect / pred real):           {results['recon_purity']*100:5.2f}%")
         print(f"  Top purity         (pred real top & perfect / pred real top):   {results['top_purity']*100:5.2f}%   (N_pred_top={results['n_pred_top']:,})")
         print(f"  W purity           (pred real W & perfect / pred real W):      {results['W_purity']*100:5.2f}%   (N_pred_W={results['n_pred_W']:,})")
+        print(f"  ttbar purity       (both tops pred real & correct / pred 2t):  {results['ttbar_purity']*100:5.2f}%   (N_pred_2t={results['n_pred_both_tops']:,})")
         print("─" * 70)
 
     if br:
@@ -331,6 +354,19 @@ def _agg_bin(br: dict, mult_keys):
     ttbar_eff = sum(br[m]["ttbar_eff"] * br[m]["n_ttbar"] for m in mult_keys if m in br) / max(n_tt,  1)
     n_events  = sum(br[m]["n_events"]  for m in mult_keys if m in br)
     return {"top_eff": top_eff, "W_eff": W_eff, "ttbar_eff": ttbar_eff, "n_events": n_events}
+
+
+def _agg_purity_bin(br: dict, mult_keys):
+    """Aggregate purity across a set of multiplicity keys using weighted average."""
+    n_pr_top  = sum(br[m]["n_pred_top"]       for m in mult_keys if m in br)
+    n_pr_W    = sum(br[m]["n_pred_W"]         for m in mult_keys if m in br)
+    n_pr_both = sum(br[m]["n_pred_both_tops"] for m in mult_keys if m in br)
+    top   = sum(br[m]["top_purity"]   * br[m]["n_pred_top"]       for m in mult_keys if m in br) / max(n_pr_top,  1)
+    W     = sum(br[m]["W_purity"]     * br[m]["n_pred_W"]         for m in mult_keys if m in br) / max(n_pr_W,    1)
+    ttbar = sum(br[m]["ttbar_purity"] * br[m]["n_pred_both_tops"] for m in mult_keys if m in br) / max(n_pr_both, 1)
+    n_events = sum(br[m]["n_events"] for m in mult_keys if m in br)
+    return {"top_purity": top, "W_purity": W, "ttbar_purity": ttbar,
+            "n_pred_both_tops": n_pr_both, "n_events": n_events}
 
 
 def make_plots(run_dir: Path, results: dict):
@@ -415,6 +451,80 @@ def make_plots(run_dir: Path, results: dict):
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         out = run_dir / "eval_efficiency_vs_multiplicity.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+    # ── Purity plots (only when objectness predictions are available) ──
+    has_purity = br and "ttbar_purity" in next(iter(br.values()))
+    if has_purity:
+        # 3. Grouped bar chart: Top / W / ttbar purity in bins 6, 7, ≥8, All
+        purity_bins = {
+            "6 jets":  _agg_purity_bin(br, [6]),
+            "7 jets":  _agg_purity_bin(br, [7]),
+            "≥8 jets": _agg_purity_bin(br, ge8_keys),
+            "All":     {
+                "top_purity":       results["top_purity"],
+                "W_purity":         results["W_purity"],
+                "ttbar_purity":     results["ttbar_purity"],
+                "n_pred_both_tops": results["n_pred_both_tops"],
+                "n_events":         results["N"],
+            },
+        }
+
+        p_bin_labels    = list(purity_bins.keys())
+        p_metric_labels = ["Top", "W", "ttbar"]
+        p_metric_keys   = ["top_purity", "W_purity", "ttbar_purity"]
+        p_colors        = ["#4c72b0", "#dd8452", "#55a868"]
+
+        n_p_bins    = len(p_bin_labels)
+        n_p_metrics = len(p_metric_labels)
+        p_bar_width = 0.22
+        xp = np.arange(n_p_bins)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for i, (metric, key, color) in enumerate(zip(p_metric_labels, p_metric_keys, p_colors)):
+            offsets = xp + (i - (n_p_metrics - 1) / 2) * p_bar_width
+            vals    = [purity_bins[b][key] * 100 for b in p_bin_labels]
+            bars    = ax.bar(offsets, vals, width=p_bar_width, label=metric, color=color)
+            for bar, val in zip(bars, vals):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2, val + 0.8,
+                    f"{val:.1f}%", ha="center", va="bottom", fontsize=7, rotation=90,
+                )
+
+        p_bin_counts = [f"{purity_bins[b]['n_events']:,}" for b in p_bin_labels]
+        ax.set_xticks(xp)
+        ax.set_xticklabels([f"{lbl}\n(N={n})" for lbl, n in zip(p_bin_labels, p_bin_counts)])
+        ax.set_ylabel("Purity (%)")
+        ax.set_title("Reconstruction Purity by Jet Multiplicity Bin")
+        ax.set_ylim(0, 115)
+        ax.legend()
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        out = run_dir / "eval_purity_summary.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+        # 4. Purity vs multiplicity
+        mults = sorted(br.keys())
+        top_purities   = [br[m]["top_purity"]   * 100 for m in mults]
+        W_purities     = [br[m]["W_purity"]     * 100 for m in mults]
+        ttbar_purities = [br[m]["ttbar_purity"] * 100 for m in mults]
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(mults, top_purities,   "o-", label="Top purity",   color="#4c72b0")
+        ax.plot(mults, W_purities,     "s-", label="W purity",     color="#dd8452")
+        ax.plot(mults, ttbar_purities, "^-", label="ttbar purity", color="#55a868")
+        ax.set_xlabel("Number of valid jets (multiplicity)")
+        ax.set_ylabel("Purity (%)")
+        ax.set_title("Reconstruction Purity vs Jet Multiplicity")
+        ax.legend()
+        ax.set_ylim(0, 105)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out = run_dir / "eval_purity_vs_multiplicity.png"
         fig.savefig(out, dpi=150)
         plt.close(fig)
         print(f"  Saved: {out}")
