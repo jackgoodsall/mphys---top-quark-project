@@ -221,6 +221,12 @@ class MaskReconstructionTask(BaseTask):
         self.null_mask_penalty = null_mask_penalty
         # Set True during mask-only pretraining to remove "predict nothing" signal
         self.suppress_null_penalty = False
+
+        # Per-class Dice accumulators — GPU buffers, .item() deferred to getter
+        self.register_buffer('_top_dice_sum', torch.zeros(1), persistent=False)
+        self.register_buffer('_top_dice_count', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_w_dice_sum', torch.zeros(1), persistent=False)
+        self.register_buffer('_w_dice_count', torch.zeros(1, dtype=torch.long), persistent=False)
     
     def compute_cost(
         self,
@@ -306,6 +312,19 @@ class MaskReconstructionTask(BaseTask):
                 bce_weight = self.config.get_loss_weight('bce')
                 total_loss = dice_weight * dice_loss + bce_weight * bce_loss
 
+                # Track per-class Dice (top vs W) for monitoring
+                if getattr(self, '_stats_enabled', True) and 'classes' in targets:
+                    classes_real = targets['classes'][obj_valid]  # [N_real]
+                    with torch.no_grad():
+                        top_mask_cls = (classes_real == CLASS_TOP)
+                        w_mask_cls = (classes_real == CLASS_W)
+                        if top_mask_cls.any():
+                            self._top_dice_sum += dice[top_mask_cls].sum()
+                            self._top_dice_count += top_mask_cls.sum()
+                        if w_mask_cls.any():
+                            self._w_dice_sum += dice[w_mask_cls].sum()
+                            self._w_dice_count += w_mask_cls.sum()
+
             # Null mask penalty: encourage unmatched queries to predict empty masks.
             # Adaptive scaling: reduce penalty when most queries are null so the
             # "predict empty" signal doesn't overwhelm real-object learning.
@@ -366,6 +385,28 @@ class MaskReconstructionTask(BaseTask):
             total_loss = dice_weight * dice_loss.mean() + bce_weight * bce_loss.mean()
             return total_loss
     
+    def get_detection_stats(self) -> Dict[str, float]:
+        """Return per-class Dice since last reset (.item() called here, once per epoch)."""
+        stats = {}
+        top_count = self._top_dice_count.item()
+        w_count = self._w_dice_count.item()
+        if top_count > 0:
+            stats['top_dice'] = self._top_dice_sum.item() / top_count
+        else:
+            stats['top_dice'] = 0.0
+        if w_count > 0:
+            stats['w_dice'] = self._w_dice_sum.item() / w_count
+        else:
+            stats['w_dice'] = 0.0
+        return stats
+
+    def reset_detection_stats(self):
+        """Reset per-class Dice accumulators. Call at the start of each epoch."""
+        self._top_dice_sum.zero_()
+        self._top_dice_count.zero_()
+        self._w_dice_sum.zero_()
+        self._w_dice_count.zero_()
+
     def create_test_datasets(self, file: h5py.File, number_events: int):
         """Create HDF5 datasets for mask predictions"""
         N_particles = 20  # Adjust to your actual particle count if needed
