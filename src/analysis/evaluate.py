@@ -49,6 +49,8 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
 
     with h5py.File(obj_path, "r") as f:
         target_obj = f["target_objectness"][:]           # [N, Q]
+        pred_obj_key = "predicted_objectness_prob" if use_probs else "predicted_objectness_logit"
+        pred_obj = f[pred_obj_key][:] if pred_obj_key in f else None  # [N, Q]
 
     with h5py.File(type_path, "r") as f:
         target_cls = f["target_classes"][:]              # [N, Q]
@@ -75,7 +77,7 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
                 f"data file has {N_data}. Make sure you are using the correct test split."
             )
 
-    return pred_scores, target_masks, jet_valid, target_obj, target_cls
+    return pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +134,8 @@ def binarise_predictions(scores, jet_valid, target_cls, priors, use_probs, thres
 # ---------------------------------------------------------------------------
 
 def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, target_cls,
-                         priors=None, use_probs=False, threshold=None):
+                         pred_obj=None, priors=None, use_probs=False, threshold=None,
+                         strict=False):
     """
     Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
 
@@ -150,21 +153,30 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
     pred_bin = binarise_predictions(
         pred_scores, jet_valid, target_cls, priors or {}, use_probs, threshold=threshold
     )                                                        # [N, Q, P]
-    mismatch = (pred_bin != target_masks.astype(bool)) & valid  # [N, Q, P]
-    errors_per_slot = mismatch.sum(axis=2)                   # [N, Q]
-    slot_perfect    = errors_per_slot == 0                   # [N, Q]
+    target_b        = target_masks.astype(bool)
+    mismatch        = (pred_bin != target_b) & valid             # [N, Q, P]
+    errors_per_slot = mismatch.sum(axis=2)                       # [N, Q]
+    slot_perfect    = errors_per_slot == 0                        # [N, Q]
+
+    # In strict mode, also require the objectness head to predict the slot as real
+    if strict and pred_obj is not None:
+        obj_thresh = 0.5 if use_probs else 0.0
+        pred_real  = pred_obj > obj_thresh                       # [N, Q]
+        slot_detected_perfect = slot_perfect & pred_real
+    else:
+        slot_detected_perfect = slot_perfect
 
     # all_tops_perfect: every real top slot is perfect (used for ttbar efficiency)
-    all_tops_perfect = ((~is_top) | (~is_real) | slot_perfect).all(axis=1)  # [N]
-    all_Ws_perfect   = ((~is_W)   | (~is_real) | slot_perfect).all(axis=1)  # [N]
-    perfect_all      = (~is_real  | slot_perfect).all(axis=1)               # [N]
+    all_tops_perfect = ((~is_top) | (~is_real) | slot_detected_perfect).all(axis=1)  # [N]
+    all_Ws_perfect   = ((~is_W)   | (~is_real) | slot_detected_perfect).all(axis=1)  # [N]
+    perfect_all      = (~is_real  | slot_detected_perfect).all(axis=1)               # [N]
 
     has_top   = n_tops >= 1
     has_W     = n_Ws >= 1
     both_tops = n_tops == 2               # events with exactly 2 tops
 
     # top efficiency: per-slot — fraction of individual real top objects correctly reconstructed
-    n_top_slots_correct = (is_top & is_real & slot_perfect).sum()
+    n_top_slots_correct = (is_top & is_real & slot_detected_perfect).sum()
     n_top_slots_total   = (is_top & is_real).sum()
 
     # W efficiency:     ≥1 W present, all Ws perfectly reconstructed (event-level)
@@ -173,6 +185,32 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
     W_eff     = (all_Ws_perfect   & has_W).sum()     / max(has_W.sum(),     1)
     ttbar_eff = (all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)
     all_eff   = perfect_all.sum()                    / len(perfect_all)
+
+    # ── Object purity (from objectness predictions) ──
+    obj_purity   = None
+    recon_purity = None
+    n_pred_real  = None
+    top_purity   = None
+    W_purity     = None
+    n_pred_top   = None
+    n_pred_W     = None
+    if pred_obj is not None:
+        obj_thresh = 0.5 if use_probs else 0.0
+        pred_real  = pred_obj > obj_thresh                        # [N, Q]
+        n_pred_real = int(pred_real.sum())
+        # Of predicted-real slots, fraction that are actually real
+        obj_purity   = float((pred_real & is_real).sum()
+                             / max(n_pred_real, 1))
+        # Of predicted-real slots, fraction perfectly reconstructed
+        recon_purity = float((pred_real & is_real & slot_perfect).sum()
+                             / max(n_pred_real, 1))
+        # Per-type purity: of predicted-real slots of each type, fraction perfectly reconstructed
+        n_pred_top = int((pred_real & is_top).sum())
+        n_pred_W   = int((pred_real & is_W).sum())
+        top_purity = float((pred_real & is_top & is_real & slot_perfect).sum()
+                           / max(n_pred_top, 1))
+        W_purity   = float((pred_real & is_W & is_real & slot_perfect).sum()
+                           / max(n_pred_W, 1))
 
     # Per-multiplicity breakdown
     multiplicity = jet_valid.sum(axis=1).astype(int)         # [N]
@@ -186,7 +224,7 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
             continue
         hw  = has_W[sel].sum()
         bt  = both_tops[sel].sum()
-        n_top_correct = (is_top[sel] & is_real[sel] & slot_perfect[sel]).sum()
+        n_top_correct = (is_top[sel] & is_real[sel] & slot_detected_perfect[sel]).sum()
         n_top_total   = (is_top[sel] & is_real[sel]).sum()
         breakdown[m] = {
             "n_events":  int(n_sel),
@@ -206,6 +244,13 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         "W_eff":     float(W_eff),
         "ttbar_eff": float(ttbar_eff),
         "all_eff":   float(all_eff),
+        "obj_purity":   obj_purity,
+        "recon_purity": recon_purity,
+        "top_purity":   top_purity,
+        "W_purity":     W_purity,
+        "n_pred_real":  n_pred_real,
+        "n_pred_top":   n_pred_top,
+        "n_pred_W":     n_pred_W,
         "n_has_top":   int(n_top_slots_total),
         "n_has_W":     int(has_W.sum()),
         "n_both_tops": int(both_tops.sum()),
@@ -213,6 +258,7 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         "priors":      priors or {},
         "use_probs":   use_probs,
         "threshold":   threshold if threshold is not None else (0.5 if use_probs else 0.0),
+        "strict":      strict,
     }
 
 
@@ -236,13 +282,25 @@ def print_results(run_dir: Path, results: dict):
     print(f"Events: {N:,}  |  Query slots Q: {Q}  |  Particles P: {P}")
     print(f"Scores: {scores_str}  |  Binarisation: {prior_str}\n")
 
-    print("EFFICIENCY SUMMARY")
-    print("─" * 54)
-    print(f"  Top efficiency     (per top object):         {results['top_eff']*100:6.2f}%   (N={results['n_has_top']:,} tops)")
-    print(f"  W efficiency       (≥1 W):             {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,})")
-    print(f"  ttbar efficiency   (exactly 2 tops, both correct): {results['ttbar_eff']*100:6.2f}%   (N={results['n_both_tops']:,})")
-    print("─" * 54)
-    print(f"  All-object efficiency:                 {results['all_eff']*100:6.2f}%   (N={N:,})")
+    if results.get("strict"):
+        print("EFFICIENCY SUMMARY (strict: pred_real & correct mask / N_real)")
+    else:
+        print("EFFICIENCY SUMMARY (recall: N_correct / N_real)")
+    print("─" * 70)
+    print(f"  Top efficiency     (per top object):                  {results['top_eff']*100:6.2f}%   (N={results['n_has_top']:,} tops)")
+    print(f"  W efficiency       (>=1 W, all correct):             {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,})")
+    print(f"  ttbar efficiency   (exactly 2 tops, both correct):   {results['ttbar_eff']*100:6.2f}%   (N={results['n_both_tops']:,})")
+    print("─" * 70)
+    print(f"  All-object efficiency:                                {results['all_eff']*100:6.2f}%   (N={N:,})")
+
+    if results.get("obj_purity") is not None:
+        print(f"\nPURITY SUMMARY (N_correct_predicted / N_all_predicted)")
+        print("─" * 70)
+        print(f"  Object purity      (pred real & actual real / pred real):       {results['obj_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
+        print(f"  Recon purity       (pred real & perfect / pred real):           {results['recon_purity']*100:5.2f}%")
+        print(f"  Top purity         (pred real top & perfect / pred real top):   {results['top_purity']*100:5.2f}%   (N_pred_top={results['n_pred_top']:,})")
+        print(f"  W purity           (pred real W & perfect / pred real W):      {results['W_purity']*100:5.2f}%   (N_pred_W={results['n_pred_W']:,})")
+        print("─" * 70)
 
     if br:
         print("\nEFFICIENCY BY MULTIPLICITY (# valid jets)")
@@ -500,6 +558,10 @@ def main():
         help="Number of threshold steps in the sweep (default: 100)"
     )
     parser.add_argument(
+        "--strict", action="store_true",
+        help="Require objectness prediction to also mark the slot as real for efficiency metrics"
+    )
+    parser.add_argument(
         "--prior", nargs="+", metavar="TYPE=K", default=[],
         help=(
             "Per-type top-k binarisation prior, e.g. --prior top=3 W=2. "
@@ -528,13 +590,14 @@ def main():
     if not run_dir.is_dir():
         sys.exit(f"ERROR: --run_dir does not exist or is not a directory: {run_dir}")
 
-    pred_scores, target_masks, jet_valid, target_obj, target_cls = load_run_data(
+    pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj = load_run_data(
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
     results = compute_efficiencies(
         pred_scores, target_masks, jet_valid, target_obj, target_cls,
-        priors=priors, use_probs=args.use_probs, threshold=args.threshold,
+        pred_obj=pred_obj, priors=priors, use_probs=args.use_probs, threshold=args.threshold,
+        strict=args.strict,
     )
     print_results(run_dir, results)
 
