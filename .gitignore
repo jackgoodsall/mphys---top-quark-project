@@ -25,3 +25,8 @@ __pycache__/
 **/*.pyc
 /.claude
 ./notebooks
+/docs
+/CLAUDE.md
+/submit.sh
+/submit_lr_find.sh
+/analysis
