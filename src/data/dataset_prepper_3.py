@@ -176,7 +176,8 @@ class IndividualParticleMaskAndKinematicsProcessor(TargetProcessor):
         return targets_chunk
     
     def get_save_keys(self) -> list:
-        return ["masks_tops", "masks_Ws", "kinematics_tops", "kinematics_Ws"]
+        return ["masks_tops", "masks_Ws", "kinematics_tops", "kinematics_Ws",
+                "valid_tops", "valid_Ws"]
 
 
 class InteractionProcessor(ABC):
@@ -263,23 +264,23 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
                 - "kinematics_Ws": (B, 2, 5) kinematics for [W1, W2]
         """
         B, P, F = jet_chunk.shape
-        
+
         # --- 1. Extract Binary Masks ---
-        
+
         jet_tags = jet_chunk[..., 6]  # Shape (B, P)
-        
+
         # Create masks for each particle (B, P) -> (B, 2, P)
         top1_mask = np.isin(jet_tags, self.tag_top1).astype(np.float32)
         top2_mask = np.isin(jet_tags, self.tag_top2).astype(np.float32)
         W1_mask = np.isin(jet_tags, self.tag_W1).astype(np.float32)
         W2_mask = np.isin(jet_tags, self.tag_W2).astype(np.float32)
-        
+
         # Stack masks: (B, 2, P)
         masks_tops = np.stack([top1_mask, top2_mask], axis=1)  # (B, 2, P)
         masks_Ws = np.stack([W1_mask, W2_mask], axis=1)        # (B, 2, P)
-        
+
         # --- 2. Reconstruct Kinematics (Vectorized) ---
-        
+
         # Prepare flattened inputs
         flat_jets_vec = vector.zip({
             "pt": jet_chunk[..., 0].flatten(),
@@ -287,35 +288,55 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
             "phi": jet_chunk[..., 2].flatten(),
             "energy": jet_chunk[..., 3].flatten(),
         })
-        
+
         event_indices = np.repeat(np.arange(B), P)  # (B*P,)
         flat_tags = jet_tags.flatten()
-        
+
         # Convert to Cartesian for accurate summation
         flat_px = flat_jets_vec.px.to_numpy()
         flat_py = flat_jets_vec.py.to_numpy()
         flat_pz = flat_jets_vec.pz.to_numpy()
         flat_E = flat_jets_vec.energy.to_numpy()
-        
+
         # Initialize output arrays (B, 2, 4) for [pt, eta, phi, energy]
         reco_tops = np.zeros((B, 2, 4), dtype=np.float32)
         reco_Ws = np.zeros((B, 2, 4), dtype=np.float32)
-        
+
+        # Track which objects are reconstructable: [B, 2] bool
+        valid_tops = np.zeros((B, 2), dtype=bool)
+        valid_Ws = np.zeros((B, 2), dtype=bool)
+
         # Vectorized reconstruction for all 4 particles
         for tags, particle_type, idx in self.reco_tasks:
             # Select jets matched to current particle
             tag_mask = np.isin(flat_tags, tags)
             matched_indices = event_indices[tag_mask]
-            
+
+            # Track which events have ALL decay products matched.
+            # Each individual tag must have >= 1 matching jet.
+            # e.g. top1 tags=[1,2,3]: need at least one jet with tag 1,
+            #      at least one with tag 2, AND at least one with tag 3.
+            all_tags_present = np.ones(B, dtype=bool)
+            for tag in tags:
+                tag_specific_mask = (flat_tags == tag)
+                tag_matched_events = event_indices[tag_specific_mask]
+                tag_counts = np.bincount(tag_matched_events, minlength=B)
+                all_tags_present &= (tag_counts >= 1)
+
+            if particle_type == "tops":
+                valid_tops[:, idx] = all_tags_present
+            else:
+                valid_Ws[:, idx] = all_tags_present
+
             if matched_indices.size == 0:
                 continue
-            
+
             # Grouped reduction: sum Cartesian components by event
             sum_px = np.bincount(matched_indices, weights=flat_px[tag_mask], minlength=B)
             sum_py = np.bincount(matched_indices, weights=flat_py[tag_mask], minlength=B)
             sum_pz = np.bincount(matched_indices, weights=flat_pz[tag_mask], minlength=B)
             sum_E = np.bincount(matched_indices, weights=flat_E[tag_mask], minlength=B)
-            
+
             # Reconstruct 4-vector
             reco_vec = vector.zip({
                 "px": sum_px,
@@ -323,7 +344,7 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
                 "pz": sum_pz,
                 "E": sum_E
             })
-            
+
             # Convert to polar coordinates
             reco_polar = np.stack([
                 reco_vec.pt.to_numpy(),
@@ -331,30 +352,32 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
                 reco_vec.phi.to_numpy(),
                 reco_vec.E.to_numpy(),
             ], axis=-1)  # (B, 4)
-            
+
             # Store in appropriate array
             if particle_type == "tops":
                 reco_tops[:, idx, :] = reco_polar
             else:  # "Ws"
                 reco_Ws[:, idx, :] = reco_polar
-        
+
         # --- 3. Add Placeholder Column (5th feature = 0) ---
-        
+
         kinematics_tops = np.concatenate([
-            reco_tops, 
+            reco_tops,
             np.zeros((B, 2, 1), dtype=np.float32)
         ], axis=-1)  # (B, 2, 5)
-        
+
         kinematics_Ws = np.concatenate([
             reco_Ws,
             np.zeros((B, 2, 1), dtype=np.float32)
         ], axis=-1)  # (B, 2, 5)
-        
+
         return {
             "masks_tops": masks_tops,
             "masks_Ws": masks_Ws,
             "kinematics_tops": kinematics_tops,
             "kinematics_Ws": kinematics_Ws,
+            "valid_tops": valid_tops.astype(np.uint8),  # [B, 2]
+            "valid_Ws": valid_Ws.astype(np.uint8),      # [B, 2]
         }
 
 
@@ -386,6 +409,10 @@ class TopReconstructionDatasetFromH5:
             self.preprocessing_config.get("save_file_prefix", "processed_"),
         )
         self.stream_size = self.preprocessing_config.get("stream_size", 1000)
+        # Minimum number of reconstructable objects to keep an event.
+        # Default 4 = old behaviour (fully-reconstructable events only).
+        # Set to 1 to include all events with at least one object.
+        self.min_objects = self.preprocessing_config.get("min_objects", 4)
 
         print(f"[CONFIG] Raw path: {self.raw_file_prefix_and_path}", flush=True)
         print(f"[CONFIG] Save path: {self.save_file_prefix_and_path}", flush=True)
@@ -466,6 +493,8 @@ class TopReconstructionDatasetFromH5:
 
     def _fit_file(self, raw_path: Path):
         """Fit transformers on a single file."""
+        # Interaction min/max is stable after a small sample — only fit once.
+        interaction_fitted = False
         with h5py.File(raw_path, "r") as f:
             file_len = f["jet"].shape[0]
             print(f"[FIT] File length: {file_len}", flush=True)
@@ -476,19 +505,27 @@ class TopReconstructionDatasetFromH5:
             ):
                 jet_chunk = f["jet"][i : i + self.stream_size].copy()
                 event_chunk = f["event"][i : i + self.stream_size].copy()
-                targets_chunk = f["targets"][i : i + self.stream_size].copy()
-                
-                # Filter events
-                event_filter = event_chunk[:, 2] == 1
-                jet_chunk = jet_chunk[event_filter]
-                event_chunk = event_chunk[event_filter]
-                targets_chunk = targets_chunk[event_filter]
-                
+                # Note: f["targets"] is not read — extractor uses jet tags only
+
                 if jet_chunk.shape[0] == 0:
                     continue
 
-                # Extract targets using the configured extractor
-                targets_dict = self.target_extractor.extract_targets(jet_chunk, targets_chunk)
+                # Extract targets first (validity needed to compute the event filter)
+                targets_dict = self.target_extractor.extract_targets(jet_chunk, None)
+
+                # Compute per-event filter from validity arrays
+                if "valid_tops" in targets_dict and "valid_Ws" in targets_dict:
+                    n_valid = (targets_dict["valid_tops"].sum(axis=1)
+                               + targets_dict["valid_Ws"].sum(axis=1))  # [B]
+                    event_filter = n_valid >= self.min_objects
+                else:
+                    event_filter = event_chunk[:, 2] == 1
+
+                jet_chunk = jet_chunk[event_filter]
+                targets_dict = {k: v[event_filter] for k, v in targets_dict.items()}
+
+                if jet_chunk.shape[0] == 0:
+                    continue
 
                 # Fit jet transformers
                 self._fit_jet_transformers(jet_chunk)
@@ -496,11 +533,16 @@ class TopReconstructionDatasetFromH5:
                 # Fit target transformers
                 self._fit_target_transformers(targets_dict)
 
-                # Fit interaction transformers if needed
-                if self.interaction_processor.needs_interaction():
+                # Fit interaction transformer once on a small sample.
+                # min/max converges quickly — 5 K events is sufficient.
+                if self.interaction_processor.needs_interaction() and not interaction_fitted:
                     try:
-                        interaction_chunk = create_interaction_matrix(jet_chunk)
-                        self._fit_interaction_transformers(interaction_chunk)
+                        sample = jet_chunk[:5_000]
+                        interaction_sample = create_interaction_matrix(sample)
+                        self._fit_interaction_transformers(interaction_sample)
+                        interaction_fitted = True
+                        print("[FIT] Interaction transformer fitted on 5K-event sample",
+                              flush=True)
                     except Exception as e:
                         print(f"[WARN] Interaction fit failed: {e}", flush=True)
 
@@ -562,13 +604,39 @@ class TopReconstructionDatasetFromH5:
             print(f"[TRANSFORM] {raw_file.name} -> {save_file.name}", flush=True)
             self._transform_file(raw_file, save_file)
 
+    def _create_and_transform_interactions_batched(
+        self, jet_chunk: np.ndarray, batch_size: int = 50_000
+    ) -> np.ndarray:
+        """Compute and transform the interaction matrix in batches.
+
+        Processing the full chunk at once allocates N×P²×4×8 bytes (float64
+        intermediates in LogMinMaxScaler), which can exceed available RAM for
+        large N (e.g. 500 K events → ~25 GB).  Batching at ``batch_size``
+        events keeps the peak allocation to batch_size×P²×4×8 bytes (~2.5 GB
+        at the default of 50 K events with P=20).
+        """
+        N, P, _ = jet_chunk.shape
+        n_int_feat = 4  # ΔR, kT, z, m²
+        result = np.empty((N, P, P, n_int_feat), dtype=np.float32)
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            batch = jet_chunk[start:end]
+            int_batch = create_interaction_matrix(batch)        # [b, P, P, 4]
+            b, P_, P2_, F_ = int_batch.shape
+            flat = int_batch.reshape(-1, F_)
+            flat = self.interaction_transformers.transform(flat)
+            result[start:end] = flat.reshape(b, P_, P2_, F_)
+        return result
+
     def _transform_file(self, raw_path: Path, save_path: Path):
         """Transform a single file."""
-        
+        # Process interaction matrix in sub-chunks to avoid multi-GB allocations.
+        INTERACTION_BATCH = 50_000
+
         with h5py.File(raw_path, "r") as read_f, h5py.File(save_path, "w") as write_f:
             file_len = read_f["jet"].shape[0]
             print(f"[TRANSFORM] Total events: {file_len}", flush=True)
-            
+
             datasets_created = False
 
             for i in tqdm(
@@ -577,30 +645,39 @@ class TopReconstructionDatasetFromH5:
             ):
                 jet_chunk = read_f["jet"][i : i + self.stream_size].copy()
                 event_chunk = read_f["event"][i : i + self.stream_size].copy()
-                targets_chunk = read_f["targets"][i : i + self.stream_size].copy()
+                # Note: f["targets"] is not read — extractor uses jet tags only
 
-                # Filter events where event[:, 2] == 1
-                event_filter = event_chunk[:, 2] == 1
-                
+                # Extract targets first (validity needed to compute the event filter)
+                targets_dict = self.target_extractor.extract_targets(jet_chunk, None)
+
+                # Compute per-event filter from validity arrays
+                if "valid_tops" in targets_dict and "valid_Ws" in targets_dict:
+                    n_valid = (targets_dict["valid_tops"].sum(axis=1)
+                               + targets_dict["valid_Ws"].sum(axis=1))  # [B]
+                    event_filter = n_valid >= self.min_objects
+                else:
+                    event_filter = event_chunk[:, 2] == 1
+
                 jet_chunk = jet_chunk[event_filter]
                 event_chunk = event_chunk[event_filter]
-                targets_chunk = targets_chunk[event_filter]
+                targets_dict = {k: v[event_filter] for k, v in targets_dict.items()}
 
-                targets_dict = self.target_extractor.extract_targets(jet_chunk, targets_chunk)
-                
                 if jet_chunk.shape[0] == 0:
                     continue
-                
+
+                # Build interaction matrix from raw jets and transform in batches.
+                # Must happen BEFORE jet transformation (interactions use raw kinematics).
                 interaction_chunk = None
                 if self.interaction_processor.needs_interaction():
                     try:
-                        interaction_chunk = create_interaction_matrix(jet_chunk)
+                        interaction_chunk = self._create_and_transform_interactions_batched(
+                            jet_chunk, batch_size=INTERACTION_BATCH
+                        )
                     except Exception as e:
                         print(f"[WARN] Interaction matrix creation failed: {e}", flush=True)
 
-                jet_chunk, interaction_chunk = self._transform_data(
-                    jet_chunk, interaction_chunk
-                )
+                # Transform jet features (interaction already handled above)
+                jet_chunk, _ = self._transform_data(jet_chunk, None)
                 
                 # Transform target kinematics
                 targets_dict = self._transform_targets(targets_dict)
@@ -737,29 +814,44 @@ class TopReconstructionDatasetFromH5:
             dtype="float32",
         )
 
-        # Create datasets for masks and kinematics
+        # Create datasets for masks, kinematics, and validity arrays
+        _validity_keys = {"valid_tops", "valid_Ws"}
         for key in self.target_processor.get_save_keys():
             if key in targets_dict:
                 target_array = targets_dict[key]
-                _, M_targets, target_features = target_array.shape
-                
-                file.create_dataset(
-                    key, 
-                    shape=(0, M_targets, target_features), 
-                    maxshape=(None, M_targets, target_features), 
-                    compression="gzip", 
-                    compression_opts=4,
-                    dtype="float32",
-                )
+
+                if key in _validity_keys:
+                    # Validity arrays are 2D [B, 2] uint8
+                    _, n_cols = target_array.shape
+                    file.create_dataset(
+                        key,
+                        shape=(0, n_cols),
+                        maxshape=(None, n_cols),
+                        compression="gzip",
+                        compression_opts=4,
+                        dtype="uint8",
+                    )
+                else:
+                    # Masks and kinematics are 3D [B, M, F] float32
+                    _, M_targets, target_features = target_array.shape
+                    file.create_dataset(
+                        key,
+                        shape=(0, M_targets, target_features),
+                        maxshape=(None, M_targets, target_features),
+                        compression="gzip",
+                        compression_opts=4,
+                        dtype="float32",
+                    )
 
         if interaction_shape is not None:
             _, N, N, interaction_features = interaction_shape
+            # lzf: ~4x faster write and ~3x faster read than gzip-4, ~12% larger files.
+            # h5py ships with lzf built-in so no extra install is needed.
             file.create_dataset(
-                "interactions", 
-                shape=(0, N, N, interaction_features), 
-                maxshape=(None, N, N, interaction_features), 
-                compression="gzip", 
-                compression_opts=4,
+                "interactions",
+                shape=(0, N, N, interaction_features),
+                maxshape=(None, N, N, interaction_features),
+                compression="lzf",
                 dtype="float32",
             )
         
@@ -786,11 +878,13 @@ class TopReconstructionDatasetFromH5:
         file["event"][n0:n1] = event_chunk.astype("float32")
         file["src_mask"][n0:n1] = src_mask_chunk.astype("float32")
 
-        # Save all target types (masks and kinematics)
+        # Save all target types (masks, kinematics, and validity arrays)
+        _validity_keys = {"valid_tops", "valid_Ws"}
         for key in self.target_processor.get_save_keys():
             if key in targets_dict:
                 file[key].resize((n1,) + file[key].shape[1:])
-                file[key][n0:n1] = targets_dict[key].astype("float32")
+                dtype = "uint8" if key in _validity_keys else "float32"
+                file[key][n0:n1] = targets_dict[key].astype(dtype)
 
         if interaction_chunk is not None:
             file["interactions"].resize((n1,) + file["interactions"].shape[1:])
