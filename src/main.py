@@ -1,9 +1,18 @@
 import torch
 import lightning as pl
 from pathlib import Path
-from models.particle_transformer import  *
-from data.top_quark_reconstruction import *
-from trainers.top_reconstruction_trainers import *
+from typing import Dict, Optional
+from models.particle_transformer import (
+    ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
+)
+from data.top_quark_reconstruction import MaskedFormerTopsWsDataModule
+from trainers.top_reconstruction_trainers import (
+    ReconstructionTrainer, train_reconstruction_model,
+)
+from models.components.masked_former_tasks import (
+    TaskRegistry, TaskConfig,
+    MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
+)
 from utils.utils import load_and_split_config, load_any_config
 
 
@@ -81,42 +90,6 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
     )
     task_registry.register_task(mask_task)
     
-    # ========================================
-    # Kinematic Regression Task
-    # ========================================
-    kin_config = task_configs.get("kinematics", {})
-    
-    # Loss weights: support different loss types
-    kin_loss_weights = {}
-    if 'l1_weight' in kin_config:
-        kin_loss_weights['l1'] = kin_config['l1_weight']
-    elif 'mse_weight' in kin_config:
-        kin_loss_weights['mse'] = kin_config['mse_weight']
-    else:
-        # Default to smooth_l1
-        kin_loss_weights['smooth_l1'] = kin_config.get('smooth_l1_weight', 1.0)
-    
-    # Layer weights
-    kin_layer_weights = _build_layer_weights(
-        layer_config=kin_config.get('layer_weights'),
-        strategy=kin_config.get('layer_weight_strategy'),
-        strategy_params=kin_config.get('layer_weight_params', {}),
-        n_layers=n_decoder_layers
-    )
-    
-    kinematics_task = KinematicRegressionTask(
-        TaskConfig(
-            name='kinematics',
-            output_names=['object_kinematics'],
-            output_dims={'object_kinematics': 4},
-            cost_weights={'kinematics': kin_config.get('cost_weight', 1.0)},
-            loss_weights=kin_loss_weights,
-            max_objects=max_objects,
-            layer_weights=kin_layer_weights
-        )
-    )
-    #task_registry.register_task(kinematics_task)
-
     # ========================================
     # Objectness Task (is this query a real object?)
     # ========================================

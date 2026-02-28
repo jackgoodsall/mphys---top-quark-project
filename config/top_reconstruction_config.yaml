@@ -9,81 +9,162 @@ root_dataset_prepper:
 
 preprocessing:
   stream_size: 500000
-  save_path: "data/topquarkreconstruction/masked_targets"
+  save_path: ""
   save_file_prefix: "ttbar_preprocessed_"
+  min_objects: 1    # keep events with >= this many reconstructable objects
+                    # set to 4 to restore original fully-matched-only behaviour
 
 interactions: 
   True
 reconstruct_W: True
 use_hungarian_matching: True
+matching_solver: "gpu_bruteforce"   # "gpu_bruteforce" | "scipy"
+max_targets: 10                       # GPU fallback threshold for gpu_bruteforce
   
 
-BatchNormUsed: True
+tasks:
+  mask:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2   # base value; adaptive scaling reduces this for low-T events
+    layer_weights: {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+
+  objectness:
+    cost_weight: 0
+    loss_weight: 1.0
+    null_weight: 0.05   # base value; adaptive scaling reduces this for low-T events
+    layer_weights: {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+
+  object_type:
+    cost_weight: 0        # type separation handled by cost masking, not soft type cost
+    loss_weight: 1.0      # loss signal helps refine type embeddings
+    top_weight: 1.0
+    layer_weights: {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+
+pretraining:
+  mask_pretrain_epochs: 15  # epochs of mask-only training before enabling all tasks; 0 = disabled
+  tasks: ["mask"]            # tasks active during pretraining phase
+  transition_ramp_epochs: 5  # ramp new task weights 0→1 over this many epochs; 0 = instant
+
+
+
+
+max_objects: 4
+
 
 data_modules:
-  input_path: data/topquarkreconstruction/masked_targets
+  input_path: data/topquarkreconstruction/masked_targets_all_events
   input_prefix: "ttbar_preprocessed_"
-  mass_with_kinematics:
-    True
+  mass_with_kinematics: True
+  mask_only: True
+  # HDF5 key names for tops+Ws loading
+  tops_mask_key: "masks_tops"
+  tops_kin_key: "kinematics_tops"
+  ws_mask_key: "masks_Ws"
+  ws_kin_key: "kinematics_Ws"
   train:
-    batch_size: 1024
+    batch_size: 4096
     shuffle: True
-    num_workers: 1
+    num_workers: 4
     pin_memory: True
   test:
     batch_size: 2024
     shuffle: False
-    num_workers: 1
+    num_workers: 4
     pin_memory: False
   val:
     batch_size: 2024
     shuffle: False
-    num_workers: 1
+    num_workers: 4
     pin_memory: False
 
 model_parameters:
   particle_embedder:
     n_input: 7
-    hidden_sizes: [64, 128]
-    embedding_size: 64
+    hidden_sizes: [128, 256]
+    embedding_size: 128
     p_dropout: 0.1
-  
+
 
   interaction_embedder:
     input_features: 4
     hidden_layers: [64, 64, 64]
-    output_size: 8
+    output_size: 64   # D1 = mia_interaction_dim when use_mia_encoder: true; set to 8 for legacy mode
     p_dropout: 0.1
 
   transformer:
-    embedding_size: 64
-    n_encoder_layers: 8
-    n_decoder_layers: 4
+    embedding_size: 128
+    n_encoder_layers: 6
+    n_decoder_layers: 8
     n_heads: 8
     out_dimensions: 6
     p_dropout: 0.1
-    dim_ff: 256
-    number_class_tokens: 1
-
-  masked_prediction_head:
-    n_input: 64
-    hidden_sizes: [128, 64]
-    output_size: 20
-    p_dropout: 0
-
-  kinematic_regression_head:
-    n_input: 64
-    hidden_sizes: [128, 64]
-    output_size: 6
-    p_dropout: 0
+    dim_ff: 512
+    number_class_tokens: 4
+    n_top_queries: 2        # first 2 queries are top-designated, remainder are W-designated
+    use_mia_encoder: true   # MIParT-style encoder (arXiv:2407.08682)
+    n_mia_layers: 1         # K MIA blocks (high-dim interactions); remainder are P-MHA blocks
+    mia_interaction_dim: 64 # D1; must match interaction_embedder.output_size
 
 model_training:
-  learning_rate: 0.0005
+  seed: null
+  learning_rate: 1e-03
   weight_decay: 0.001
-  use_lookahead : True
-  min_epochs: 15
-  max_epochs: 40
-  
+  use_lookahead: True
+  gradient_clip_val: 5  # Increased from 2 to prevent gradient explosions causing NaNs
+  precision: "32-true"   # Lightning precision options:
+                            #   "32-true"    — full FP32, safest, slowest
+                            #   "16-mixed"   — FP16 mixed (fast but can overflow; needs loss scaling)
+                            #   "bf16-mixed" — BF16 mixed (A100 native, no overflow risk) [recommended]
+                            #   "bf16-true"  — pure BF16 everywhere (risky for training)
+                            #   "64-true"    — double precision (debugging only)
+  matmul_precision: "high"  # torch.set_float32_matmul_precision — affects residual FP32 matmuls:
+                            #   "highest" — full FP32, no approximation (default)
+                            #   "high"    — TF32: ~8x faster on A100, minimal precision loss [recommended]
+                            #   "medium"  — BF16 matmuls internally (redundant if using bf16-mixed)
+  min_epochs: 20
+  max_epochs: 50
+
+  scheduler:
+    type: "warmup_cosine"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
+    # WarmupCosine params (type=warmup_cosine):
+    warmup_epochs: 3        # linear ramp 0 → lr over this many epochs
+    T_max: 35               # total epochs for cosine decay
+    eta_min: 1e-6           # floor LR at end of cosine decay
+    update_interval: "step" # "step" (every batch) or "epoch" (once per epoch)
+    lr_rewarmup_epochs: 3       # re-warmup from reduced LR at phase transition; 0 = disabled
+    lr_rewarmup_fraction: 0.3   # start re-warmup at this fraction of base LR
+    # ReduceLROnPlateau params (type=plateau):
+    factor: 0.5             # halve LR on plateau
+    patience: 3             # epochs without improvement before reducing
+    plateau_monitor: "val_loss"
+    # StepLR params (type=step):
+    step_size: 4000
+    gamma: 0.7
+    # CosineAnnealingLR params (type=cosine):
+    # T_max and eta_min shared with warmup_cosine above
+
+training_callbacks:
+  checkpoint:
+    save_top_k: 3
+    monitor: "val_loss"
+    mode: "min"
+    save_weights_only: False
+    filename: "epoch={epoch}-val_loss={val_loss:.4f}"
+    save_last: True
+
+  early_stopping:
+    monitor: "val_loss"
+    patience: 15   # long enough to survive the pretraining→multi-task phase transition
+    min_delta: 0.0001
+    mode: "min"
+
+inference:
+  mode: "train"              # "train" | "test" | "resume" | "lr_find"
+  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_11711973/checkpoints/epoch=epoch=186-val_loss=val_loss=0.7130.ckpt"
+
 model_artefacts:
+  log_dir: "masked_reconstruction"
   target_transformers: "data/topquarkreconstruction/masked_targets/target_transforms.joblib"
-  invariant_mass_transformers:  "data/topquarkreconstruction/masked_targets/invariant_mass_transform.joblib"
+  invariant_mass_transformers: "data/topquarkreconstruction/masked_targets/invariant_mass_transform.joblib"
