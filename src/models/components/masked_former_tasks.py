@@ -117,6 +117,9 @@ class TaskRegistry(nn.Module):
         # Plain Python attribute so it is NOT saved in checkpoints — reconstructed
         # from config on every run, making checkpoint resume correct automatically.
         self._active_tasks: Optional[set] = None
+        # Per-task loss scales for smooth phase transitions (0.0 → 1.0 ramp).
+        # Not persisted — reconstructed each epoch by the trainer.
+        self._loss_scales: Dict[str, float] = {}
 
     def register_task(self, task: 'BaseTask'):
         """Register a new task"""
@@ -143,6 +146,14 @@ class TaskRegistry(nn.Module):
 
     def _is_active(self, task_name: str) -> bool:
         return self._active_tasks is None or task_name in self._active_tasks
+
+    def set_loss_scale(self, task_name: str, scale: float):
+        """Set a multiplicative loss scale for a task (used for smooth phase transitions)."""
+        self._loss_scales[task_name] = scale
+
+    def get_loss_scale(self, task_name: str) -> float:
+        """Get the current loss scale for a task (default 1.0)."""
+        return self._loss_scales.get(task_name, 1.0)
 
     def compute_total_cost(
         self,
@@ -204,7 +215,8 @@ class TaskRegistry(nn.Module):
             task_loss = task.compute_loss(predictions, targets, valid_mask)
             task._stats_enabled = True  # reset to safe default
 
-            task_loss = layer_weight * task_loss
+            loss_scale = self.get_loss_scale(task_name)
+            task_loss = layer_weight * loss_scale * task_loss
 
             per_task_losses[task_name] = task_loss.detach() if torch.is_tensor(task_loss) else torch.tensor(float(task_loss))
             total_loss += task_loss
@@ -219,8 +231,9 @@ class MaskReconstructionTask(BaseTask):
         super().__init__(config)
         self.eps = 1e-6  # Increased from 1e-8 for better numerical stability in Dice loss
         self.null_mask_penalty = null_mask_penalty
-        # Set True during mask-only pretraining to remove "predict nothing" signal
-        self.suppress_null_penalty = False
+        # 0.0 = suppressed (during mask-only pretraining), 1.0 = full penalty.
+        # Ramped from 0→1 during phase transition to avoid "predict nothing" snap-on.
+        self.null_penalty_scale = 1.0
 
         # Per-class Dice accumulators — GPU buffers, .item() deferred to getter
         self.register_buffer('_top_dice_sum', torch.zeros(1), persistent=False)
@@ -329,7 +342,7 @@ class MaskReconstructionTask(BaseTask):
             # Adaptive scaling: reduce penalty when most queries are null so the
             # "predict empty" signal doesn't overwhelm real-object learning.
             # Suppressed during mask-only pretraining to eliminate "predict nothing" signal.
-            if self.null_mask_penalty > 0 and not self.suppress_null_penalty and (~obj_valid).any():
+            if self.null_mask_penalty > 0 and self.null_penalty_scale > 0 and (~obj_valid).any():
                 null_logits = pred_masks[~obj_valid]           # [N_null, N]
                 null_targets = torch.zeros_like(null_logits)
                 null_loss = F.binary_cross_entropy_with_logits(
@@ -338,7 +351,7 @@ class MaskReconstructionTask(BaseTask):
                 n_real = obj_valid.sum().float()
                 n_total = obj_valid.numel()
                 adaptive_scale = (n_real / n_total).clamp(min=0.01)
-                total_loss = total_loss + self.null_mask_penalty * adaptive_scale * null_loss
+                total_loss = total_loss + self.null_mask_penalty * self.null_penalty_scale * adaptive_scale * null_loss
 
             return total_loss
         else:
@@ -569,105 +582,6 @@ class KinematicRegressionTask(BaseTask):
         end_idx = start_idx + batch_size
         file["target_kinematics"][start_idx:end_idx] = target_kin
         file["predicted_kinematics"][start_idx:end_idx] = pred_kin
-
-
-class ClassificationTask(BaseTask):
-    """Task for object classification"""
-    
-    def compute_cost(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Compute classification cost"""
-        if 'class_logits' not in predictions or 'classes' not in targets:
-            B, num_queries = predictions[list(predictions.keys())[0]].shape[:2]
-            num_targets = targets[list(targets.keys())[0]].shape[1]
-            return torch.zeros(B, num_queries, num_targets, 
-                             device=predictions[list(predictions.keys())[0]].device)
-        
-        pred_logits = predictions['class_logits']
-        target_classes = targets['classes']
-        
-        pred_probs = pred_logits.log_softmax(dim=-1)
-        
-        B, num_queries, num_classes = pred_logits.shape
-        num_targets = target_classes.shape[1]
-        
-        target_expanded = target_classes.unsqueeze(1).expand(B, num_queries, num_targets)
-        pred_expanded = pred_probs.unsqueeze(2).expand(B, num_queries, num_targets, num_classes)
-        
-        cost = -torch.gather(pred_expanded, dim=3, index=target_expanded.unsqueeze(-1)).squeeze(-1)
-        
-        return self.config.cost_weights['class'] * cost
-    
-    def compute_loss(
-        self,
-        predictions: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor],
-        valid_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Compute classification loss"""
-        if 'class_logits' not in predictions or 'classes' not in targets:
-            return torch.tensor(0.0, device=predictions[list(predictions.keys())[0]].device)
-        
-        pred_logits = predictions['class_logits']
-        target_classes = targets['classes']
-        
-        if valid_mask is not None:
-            pred_logits = pred_logits[valid_mask]
-            target_classes = target_classes[valid_mask]
-        
-        return F.cross_entropy(pred_logits, target_classes)
-    
-    def create_test_datasets(self, file: h5py.File, number_events: int):
-        """Create HDF5 datasets for classification predictions"""
-        num_classes = 2  # Adjust based on your task
-        
-        file.create_dataset(
-            "target_classes",
-            shape=(number_events, self.config.max_objects),
-            dtype='int32'
-        )
-        file.create_dataset(
-            "predicted_class_logits",
-            shape=(number_events, self.config.max_objects, num_classes),
-            dtype='float32'
-        )
-        file.create_dataset(
-            "predicted_classes",
-            shape=(number_events, self.config.max_objects),
-            dtype='int32'
-        )
-    
-    def save_test_predictions(
-        self,
-        file: h5py.File,
-        predictions: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor],
-        start_idx: int,
-        batch_size: int
-    ):
-        """Save classification predictions to HDF5"""
-        if 'class_logits' not in predictions or 'classes' not in targets:
-            return
-        
-        pred_logits = predictions['class_logits'].float().cpu().numpy()
-        pred_classes = predictions['class_logits'].argmax(dim=-1).float().cpu().numpy()
-        target_classes = targets['classes'].float().cpu().numpy()
-        
-        # Truncate to max_objects (predictions may have Q > max_objects after padding)
-        M = self.config.max_objects
-        pred_logits = pred_logits[:, :M, :]
-        pred_classes = pred_classes[:, :M]
-        target_classes = target_classes[:, :M]
-
-        # Save to HDF5
-        end_idx = start_idx + batch_size
-        file["target_classes"][start_idx:end_idx] = target_classes
-        file["predicted_class_logits"][start_idx:end_idx] = pred_logits
-        file["predicted_classes"][start_idx:end_idx] = pred_classes
-
 
 
 class MulticlassClassificationTask(BaseTask):

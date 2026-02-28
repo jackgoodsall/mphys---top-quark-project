@@ -24,7 +24,6 @@ class WarmupEarlyStopping(EarlyStopping):
 from dataclasses import field
 from torchmetrics.functional import roc, precision_recall_curve, auroc
 import h5py
-from .loss_functions import *
 import torch_optimizer
 from utils.utils import generate_reconstruction_report
 import joblib
@@ -33,11 +32,6 @@ from src.models.components.masked_former_tasks import *
 
 def _to_1d(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(-1)
-
-def _safe_all_gather(self, t: torch.Tensor) -> torch.Tensor:
-    # Works in single or multi-GPU; returns concatenated tensor on every rank
-    gathered = self.all_gather(t)
-    return gathered.reshape(-1, *t.shape[1:]).cpu()
 
 def _check_for_nans( name, x):
     """Recursively check tensors or dicts for non-finite values."""
@@ -118,6 +112,7 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.mask_pretrain_epochs = pretrain_cfg.get("mask_pretrain_epochs", 0)
         self.mask_pretrain_tasks = pretrain_cfg.get("tasks", ["mask"])
         self._pretrain_phase_active = self.mask_pretrain_epochs > 0
+        self.transition_ramp_epochs = pretrain_cfg.get("transition_ramp_epochs", 0)
 
         self.save_hyperparameters(ignore=["model", "task_registry"])
 
@@ -185,8 +180,7 @@ class ReconstructionTrainer(lightning.LightningModule):
             self.log(f'test_loss_{task_name}', task_loss, on_step=False,
                      on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
 
-        out_dir = Path(self.trainer.logger.log_dir)
-        self._save_test_predictions(outputs, targets, out_dir)
+        self._save_test_predictions(outputs, targets)
 
         return total_loss
     
@@ -306,16 +300,75 @@ class ReconstructionTrainer(lightning.LightningModule):
             warmup_epochs = _as_int(sched_cfg.get("warmup_epochs", 5), "model_training.scheduler.warmup_epochs")
             T_max = _as_int(sched_cfg.get("T_max", 50), "model_training.scheduler.T_max")
             eta_min = _as_float(sched_cfg.get("eta_min", 1e-6), "model_training.scheduler.eta_min")
+            interval = sched_cfg.get("update_interval", "step")
             base_lr = self.lr
+
+            # LR re-warmup at phase transition
+            rewarmup_epochs = _as_int(sched_cfg.get("lr_rewarmup_epochs", 0), "model_training.scheduler.lr_rewarmup_epochs")
+            rewarmup_frac = _as_float(sched_cfg.get("lr_rewarmup_fraction", 0.3), "model_training.scheduler.lr_rewarmup_fraction")
+            transition_epoch = self.mask_pretrain_epochs  # 0 if no pretraining
+
+            if interval == "step":
+                steps_per_epoch = self.trainer.estimated_stepping_batches // self.trainer.max_epochs
+                warmup_units = warmup_epochs * steps_per_epoch
+                total_units = T_max * steps_per_epoch
+                transition_unit = transition_epoch * steps_per_epoch
+                rewarmup_units = rewarmup_epochs * steps_per_epoch
+            else:
+                warmup_units = warmup_epochs
+                total_units = T_max
+                transition_unit = transition_epoch
+                rewarmup_units = rewarmup_epochs
+
+            min_factor = eta_min / base_lr
+
+            def lr_lambda(t):
+                # Two-phase schedule when re-warmup is configured
+                if rewarmup_units > 0 and transition_unit > 0 and t >= transition_unit:
+                    t_post = t - transition_unit
+                    post_total = total_units - transition_unit
+                    if t_post < rewarmup_units:
+                        # Re-warmup: ramp from rewarmup_frac → 1.0
+                        return rewarmup_frac + (1.0 - rewarmup_frac) * (t_post / rewarmup_units)
+                    # Post re-warmup cosine decay
+                    decay_start = rewarmup_units
+                    decay_total = max(1, post_total - rewarmup_units)
+                    progress = (t_post - decay_start) / decay_total
+                    cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+                    return min_factor + (1.0 - min_factor) * cosine
+
+                # Pre-transition (or no re-warmup): original warmup + cosine
+                if t < warmup_units:
+                    return max(1e-8, t / max(1, warmup_units))
+                if transition_unit > 0 and rewarmup_units > 0:
+                    # Cosine scoped to pre-transition period
+                    pre_decay_total = max(1, transition_unit - warmup_units)
+                    progress = (t - warmup_units) / pre_decay_total
+                else:
+                    progress = (t - warmup_units) / max(1, total_units - warmup_units)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+                return min_factor + (1.0 - min_factor) * cosine
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": interval},
+            }
+
+        elif sched_type == "warmup_step":
+            warmup_epochs = _as_int(sched_cfg.get("warmup_epochs", 3), "model_training.scheduler.warmup_epochs")
+            step_size = _as_int(sched_cfg.get("step_size", 10), "model_training.scheduler.step_size")
+            gamma = _as_float(sched_cfg.get("gamma", 0.5), "model_training.scheduler.gamma")
+            eta_min = _as_float(sched_cfg.get("eta_min", 1e-6), "model_training.scheduler.eta_min")
+            base_lr = self.lr
+            min_factor = eta_min / base_lr
 
             def lr_lambda(epoch):
                 if epoch < warmup_epochs:
-                    # Linear ramp: 0 → 1 over warmup_epochs
                     return max(1e-8, epoch / max(1, warmup_epochs))
-                progress = (epoch - warmup_epochs) / max(1, T_max - warmup_epochs)
-                cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-                # Scale cosine to [eta_min/base_lr, 1.0]
-                return eta_min / base_lr + (1.0 - eta_min / base_lr) * cosine
+                # Number of steps taken since warmup ended
+                n_steps = (epoch - warmup_epochs) // step_size
+                return max(min_factor, gamma ** n_steps)
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             return {
@@ -393,25 +446,32 @@ class ReconstructionTrainer(lightning.LightningModule):
         return None
     
     def on_test_start(self):
-        """Initialize HDF5 files for test predictions"""
+        """Initialize HDF5 files for test predictions and keep handles open"""
         super().on_test_start()
         out_dir = Path(self.trainer.logger.log_dir)
-        
+
         test_loaders = self.trainer.test_dataloaders
         number_events = len(test_loaders.dataset)
-        
+
+        self._test_h5_files: Dict[str, h5py.File] = {}
         for task_name, task in self.task_registry.tasks.items():
             h5_filename = f"test_outputs_{task_name}.h5"
-            with h5py.File(out_dir / h5_filename, "w") as file:
-                task.create_test_datasets(file, number_events)
-        
+            fh = h5py.File(out_dir / h5_filename, "w")
+            task.create_test_datasets(fh, number_events)
+            self._test_h5_files[task_name] = fh
+
         self.test_start_idx = 0
+
+    def on_test_end(self):
+        """Close HDF5 file handles opened during testing"""
+        for fh in self._test_h5_files.values():
+            fh.close()
+        self._test_h5_files.clear()
     
     def _save_test_predictions(
         self,
         outputs: Dict[int, Dict[str, torch.Tensor]],
         targets,
-        out_dir: Path
     ):
         """Save test predictions to HDF5"""
         final_layer = max(outputs.keys())
@@ -429,15 +489,13 @@ class ReconstructionTrainer(lightning.LightningModule):
         batch_size = predictions[list(predictions.keys())[0]].shape[0]
 
         for task_name, task in self.task_registry.tasks.items():
-            h5_filename = f"test_outputs_{task_name}.h5"
-            with h5py.File(out_dir / h5_filename, "r+") as file:
-                task.save_test_predictions(
-                    file=file,
-                    predictions=predictions,
-                    targets=save_targets,
-                    start_idx=self.test_start_idx,
-                    batch_size=batch_size
-                )
+            task.save_test_predictions(
+                file=self._test_h5_files[task_name],
+                predictions=predictions,
+                targets=save_targets,
+                start_idx=self.test_start_idx,
+                batch_size=batch_size
+            )
 
         self.test_start_idx += batch_size
     
@@ -473,22 +531,43 @@ class ReconstructionTrainer(lightning.LightningModule):
         if self._pretrain_phase_active:
             epoch = self.trainer.current_epoch
             mask_task = self.task_registry.tasks['mask'] if 'mask' in self.task_registry.tasks else None
+            pretrain_set = set(self.mask_pretrain_tasks)
+            ramp = self.transition_ramp_epochs
+
             if epoch < self.mask_pretrain_epochs:
                 # Phase 1: mask only — no objectness/type cost or loss, no null penalty
                 self.task_registry.set_active_tasks(self.mask_pretrain_tasks)
                 if mask_task is not None:
-                    mask_task.suppress_null_penalty = True
+                    mask_task.null_penalty_scale = 0.0
                 if epoch == 0:
                     print(f"\n[Pretraining] Phase 1: mask-only "
                           f"(epochs 0–{self.mask_pretrain_epochs - 1}), "
                           f"active tasks: {self.mask_pretrain_tasks}")
-            elif epoch == self.mask_pretrain_epochs:
-                # Phase 2: all tasks enabled
+            else:
+                # Phase 2+: all tasks enabled, with optional ramp
                 self.task_registry.set_active_tasks(None)
+                epochs_since = epoch - self.mask_pretrain_epochs
+                if ramp > 0 and epochs_since < ramp:
+                    alpha = min(1.0, (epochs_since + 1) / ramp)
+                else:
+                    alpha = 1.0
+
+                # Ramp loss scales for non-pretrain tasks
+                for task_name in self.task_registry.tasks:
+                    if task_name not in pretrain_set:
+                        self.task_registry.set_loss_scale(task_name, alpha)
+
+                # Ramp null penalty scale on the mask task
                 if mask_task is not None:
-                    mask_task.suppress_null_penalty = False
-                print(f"\n[Pretraining] Phase 2: full multi-task "
-                      f"(epoch {epoch}+), all tasks active")
+                    mask_task.null_penalty_scale = alpha
+
+                if epoch == self.mask_pretrain_epochs:
+                    print(f"\n[Pretraining] Phase 2: full multi-task "
+                          f"(epoch {epoch}+), all tasks active"
+                          f"{f', ramp over {ramp} epochs' if ramp > 0 else ''}")
+                if ramp > 0 and epochs_since < ramp:
+                    print(f"[Ramp] epoch {epoch}: alpha={alpha:.3f} "
+                          f"for new tasks + null penalty")
 
     def on_before_optimizer_step(self, optimizer):
         """Log gradient norm before optimizer step (after clipping)"""
