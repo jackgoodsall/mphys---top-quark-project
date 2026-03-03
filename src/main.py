@@ -84,7 +84,8 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             cost_weights={'mask': mask_config.get('cost_weight', 1.0)},
             loss_weights=mask_loss_weights,
             max_objects=max_objects,
-            layer_weights=mask_layer_weights
+            layer_weights=mask_layer_weights,
+            head_norm=mask_config.get('head_norm', False),
         ),
         null_mask_penalty=mask_config.get('null_mask_penalty', 0.1)
     )
@@ -110,7 +111,8 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             cost_weights={'objectness': obj_config.get('cost_weight', 1.0)},
             loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
             max_objects=max_objects,
-            layer_weights=obj_layer_weights
+            layer_weights=obj_layer_weights,
+            head_norm=obj_config.get('head_norm', False),
         ),
         null_weight=obj_config.get('null_weight', 0.1)
     )
@@ -136,7 +138,8 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             cost_weights={'type': type_config.get('cost_weight', 1.0)},
             loss_weights={'type': type_config.get('loss_weight', 1.0)},
             max_objects=max_objects,
-            layer_weights=type_layer_weights
+            layer_weights=type_layer_weights,
+            head_norm=type_config.get('head_norm', False),
         ),
         top_weight=type_config.get('top_weight', 1.0)
     )

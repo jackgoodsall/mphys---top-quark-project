@@ -26,26 +26,27 @@ tasks:
   mask:
     cost_weight: 1.0
     dice_weight: 1.0
-    bce_weight: 0.5
+    bce_weight: 0.4
     null_mask_penalty: 0.2   # base value; adaptive scaling reduces this for low-T events
-    layer_weights: {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+    layer_weights: {0: 0, 1: 0.25, 2: 0.5, 3: 1} #{0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
 
   objectness:
-    cost_weight: 0
-    loss_weight: 1.0
-    null_weight: 0.05   # base value; adaptive scaling reduces this for low-T events
-    layer_weights: {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+    cost_weight: 1
+    loss_weight: 1
+    null_weight: 0.2   # base value; adaptive scaling reduces this for low-T events
+    head_norm: True     # LayerNorm before prediction head MLP
+    layer_weights: {0: 0, 1: 0.25, 2: 0.5, 3: 1} #{0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
 
   object_type:
-    cost_weight: 0        # type separation handled by cost masking, not soft type cost
+    cost_weight: 0.5        # type separation handled by cost masking, not soft type cost
     loss_weight: 1.0      # loss signal helps refine type embeddings
     top_weight: 1.0
-    layer_weights: {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+    layer_weights: {0: 0, 1: 0.25, 2: 0.5, 3: 1} # {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
 
 pretraining:
-  mask_pretrain_epochs: 15  # epochs of mask-only training before enabling all tasks; 0 = disabled
+  mask_pretrain_epochs: 0  # epochs of mask-only training before enabling all tasks; 0 = disabled
   tasks: ["mask"]            # tasks active during pretraining phase
-  transition_ramp_epochs: 5  # ramp new task weights 0→1 over this many epochs; 0 = instant
+  transition_ramp_epochs: 0  # ramp new task weights 0→1 over this many epochs; 0 = instant
 
 
 
@@ -64,7 +65,7 @@ data_modules:
   ws_mask_key: "masks_Ws"
   ws_kin_key: "kinematics_Ws"
   train:
-    batch_size: 4096
+    batch_size: 2024
     shuffle: True
     num_workers: 4
     pin_memory: True
@@ -82,36 +83,36 @@ data_modules:
 model_parameters:
   particle_embedder:
     n_input: 7
-    hidden_sizes: [128, 256]
-    embedding_size: 128
+    hidden_sizes: [64, 128]
+    embedding_size: 64
     p_dropout: 0.1
 
 
   interaction_embedder:
     input_features: 4
     hidden_layers: [64, 64, 64]
-    output_size: 64   # D1 = mia_interaction_dim when use_mia_encoder: true; set to 8 for legacy mode
+    output_size: 8   # D1 = mia_interaction_dim when use_mia_encoder: true; set to 8 for legacy mode
     p_dropout: 0.1
 
   transformer:
-    embedding_size: 128
-    n_encoder_layers: 6
-    n_decoder_layers: 8
+    embedding_size: 64
+    n_encoder_layers: 4
+    n_decoder_layers: 4
     n_heads: 8
     out_dimensions: 6
     p_dropout: 0.1
-    dim_ff: 512
+    dim_ff: 256
     number_class_tokens: 4
     n_top_queries: 2        # first 2 queries are top-designated, remainder are W-designated
-    use_mia_encoder: true   # MIParT-style encoder (arXiv:2407.08682)
-    n_mia_layers: 1         # K MIA blocks (high-dim interactions); remainder are P-MHA blocks
+    use_mia_encoder: False   # MIParT-style encoder (arXiv:2407.08682)
+    n_mia_layers: 0         # K MIA blocks (high-dim interactions); remainder are P-MHA blocks
     mia_interaction_dim: 64 # D1; must match interaction_embedder.output_size
 
 model_training:
   seed: null
-  learning_rate: 1e-03
-  weight_decay: 0.001
-  use_lookahead: True
+  learning_rate: 1e-04
+  weight_decay: 0.0001
+  use_lookahead: False
   gradient_clip_val: 5  # Increased from 2 to prevent gradient explosions causing NaNs
   precision: "32-true"   # Lightning precision options:
                             #   "32-true"    — full FP32, safest, slowest
@@ -123,11 +124,11 @@ model_training:
                             #   "highest" — full FP32, no approximation (default)
                             #   "high"    — TF32: ~8x faster on A100, minimal precision loss [recommended]
                             #   "medium"  — BF16 matmuls internally (redundant if using bf16-mixed)
-  min_epochs: 20
-  max_epochs: 50
+  min_epochs: 15
+  max_epochs: 100
 
   scheduler:
-    type: "warmup_cosine"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
+    type: "step"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
     # WarmupCosine params (type=warmup_cosine):
     warmup_epochs: 3        # linear ramp 0 → lr over this many epochs
     T_max: 35               # total epochs for cosine decay
@@ -140,8 +141,8 @@ model_training:
     patience: 3             # epochs without improvement before reducing
     plateau_monitor: "val_loss"
     # StepLR params (type=step):
-    step_size: 4000
-    gamma: 0.7
+    step_size: 3000
+    gamma: 0.8
     # CosineAnnealingLR params (type=cosine):
     # T_max and eta_min shared with warmup_cosine above
 

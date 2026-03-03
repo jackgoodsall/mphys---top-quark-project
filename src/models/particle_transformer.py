@@ -281,27 +281,29 @@ class MaskedReconstructionPart(nn.Module):
         heads = nn.ModuleDict()
         
         # Collect all unique output names from all tasks
-        output_specs = {}  # {output_name: output_dim}
-        
+        output_specs = {}  # {output_name: (output_dim, head_norm)}
+
         for task in self.task_registry.tasks.values():
             for output_name in task.config.output_names:
                 if output_name not in output_specs:
-                    # Get dimension from task config
                     output_dim = task.config.output_dims.get(output_name)
-                    output_specs[output_name] = output_dim
-        
+                    output_specs[output_name] = (output_dim, task.config.head_norm)
+
         # Build heads for each output type
-        for output_name, output_dim in output_specs.items():
+        for output_name, (output_dim, head_norm) in output_specs.items():
             if output_name == 'mask_predictions':
                 # Special case: computed via einsum with memory
                 heads[output_name] = nn.Identity()
             elif output_dim is not None:
-                # Standard prediction head
-                heads[output_name] = nn.Sequential(
+                layers = []
+                if head_norm:
+                    layers.append(nn.LayerNorm(embedding_size))
+                layers.extend([
                     nn.Linear(embedding_size, embedding_size),
                     nn.GELU(),
-                    nn.Linear(embedding_size, output_dim)
-                )
+                    nn.Linear(embedding_size, output_dim),
+                ])
+                heads[output_name] = nn.Sequential(*layers)
             else:
                 raise ValueError(
                     f"Task requires output '{output_name}' but didn't specify "

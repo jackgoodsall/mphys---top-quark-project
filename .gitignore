@@ -30,3 +30,5 @@ __pycache__/
 /submit.sh
 /submit_lr_find.sh
 /analysis
+/failed_experiments
+/ExperimentOutputs

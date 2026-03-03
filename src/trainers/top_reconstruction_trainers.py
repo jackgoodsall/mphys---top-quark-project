@@ -267,12 +267,13 @@ class ReconstructionTrainer(lightning.LightningModule):
         sched_type = sched_cfg.get("type", "step")
 
         if sched_type == "step":
+            interval = sched_cfg.get("update_interval", "epoch")
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
                 step_size=_as_int(sched_cfg.get("step_size", 2000), "model_training.scheduler.step_size"),
                 gamma=_as_float(sched_cfg.get("gamma", 0.7), "model_training.scheduler.gamma"),
             )
-            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler}}
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": interval}}
 
         elif sched_type == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
