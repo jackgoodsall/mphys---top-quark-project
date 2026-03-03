@@ -54,6 +54,8 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
 
     with h5py.File(type_path, "r") as f:
         target_cls = f["target_classes"][:]              # [N, Q]
+        type_scores_key = "predicted_type_prob" if use_probs else "predicted_type_logit"
+        pred_type = f[type_scores_key][:] if type_scores_key in f else None  # [N, Q]
 
     # Fall back to external data file for src_mask
     if jet_valid is None:
@@ -77,7 +79,7 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
                 f"data file has {N_data}. Make sure you are using the correct test split."
             )
 
-    return pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj
+    return pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj, pred_type
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +136,8 @@ def binarise_predictions(scores, jet_valid, target_cls, priors, use_probs, thres
 # ---------------------------------------------------------------------------
 
 def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, target_cls,
-                         pred_obj=None, priors=None, use_probs=False, threshold=None,
-                         strict=False):
+                         pred_obj=None, pred_type=None, priors=None, use_probs=False,
+                         threshold=None, strict=False):
     """
     Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
 
@@ -196,6 +198,8 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
     n_pred_top    = None
     n_pred_W      = None
     n_pred_both_tops = None
+    pred_is_top = None
+    pred_is_W   = None
     if pred_obj is not None:
         obj_thresh = 0.5 if use_probs else 0.0
         pred_real  = pred_obj > obj_thresh                        # [N, Q]
@@ -203,17 +207,27 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         # Of predicted-real slots, fraction that are actually real
         obj_purity   = float((pred_real & is_real).sum()
                              / max(n_pred_real, 1))
-        # Per-type purity: of predicted-real slots of each type, fraction perfectly reconstructed
-        n_pred_top = int((pred_real & is_top).sum())
-        n_pred_W   = int((pred_real & is_W).sum())
-        top_purity = float((pred_real & is_top & is_real & slot_perfect).sum()
+        # Per-type purity using predicted type (positive logit/prob>0.5 → top, else W)
+        if pred_type is not None:
+            type_thresh  = 0.5 if use_probs else 0.0
+            pred_is_top  = pred_type > type_thresh                # [N, Q]
+            pred_is_W    = ~pred_is_top                           # [N, Q]
+        else:
+            # Fall back to ground-truth type if type predictions unavailable
+            pred_is_top = is_top
+            pred_is_W   = is_W
+        # Denominator: predicted-real slots of predicted type
+        n_pred_top = int((pred_real & pred_is_top).sum())
+        n_pred_W   = int((pred_real & pred_is_W).sum())
+        # Numerator: predicted-real, predicted correct type, actually correct type, correct mask
+        top_purity = float((pred_real & pred_is_top & is_top & is_real & slot_detected_perfect).sum()
                            / max(n_pred_top, 1))
-        W_purity   = float((pred_real & is_W & is_real & slot_perfect).sum()
+        W_purity   = float((pred_real & pred_is_W & is_W & is_real & slot_detected_perfect).sum()
                            / max(n_pred_W, 1))
-        # ttbar purity: of events where both tops are predicted real, fraction with both correct
-        pred_both_tops   = (pred_real & is_top).sum(axis=1) == 2          # [N]
+        # ttbar purity: of events where model predicts >=2 real predicted-top slots, fraction with both correct
+        pred_both_tops   = (pred_real & pred_is_top).sum(axis=1) >= 2    # [N]
         n_pred_both_tops = int(pred_both_tops.sum())
-        both_tops_correct = (pred_real & is_top & is_real & slot_perfect).sum(axis=1) == 2
+        both_tops_correct = (pred_real & pred_is_top & is_top & is_real & slot_detected_perfect).sum(axis=1) == 2
         ttbar_purity = float((pred_both_tops & both_tops_correct).sum()
                              / max(n_pred_both_tops, 1))
 
@@ -241,17 +255,19 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
             "n_ttbar":   int(bt),
         }
         if pred_real is not None:
-            pr = pred_real[sel]                                          # [n_sel, Q]
-            ir = is_real[sel]; it = is_top[sel]; iw = is_W[sel]
-            sp = slot_perfect[sel]
-            n_pr_top  = int((pr & it).sum())
-            n_pr_W    = int((pr & iw).sum())
-            row["top_purity"]   = float((pr & it & ir & sp).sum() / max(n_pr_top, 1))
-            row["W_purity"]     = float((pr & iw & ir & sp).sum() / max(n_pr_W, 1))
-            # ttbar purity: both tops predicted real & both correct
-            pr_both = (pr & it).sum(axis=1) == 2                        # [n_sel]
+            pr   = pred_real[sel]                                        # [n_sel, Q]
+            ir   = is_real[sel]; it = is_top[sel]; iw = is_W[sel]
+            sdp  = slot_detected_perfect[sel]
+            pit  = pred_is_top[sel]                                      # predicted top
+            piw  = pred_is_W[sel]                                        # predicted W
+            n_pr_top  = int((pr & pit).sum())
+            n_pr_W    = int((pr & piw).sum())
+            row["top_purity"]   = float((pr & pit & it & ir & sdp).sum() / max(n_pr_top, 1))
+            row["W_purity"]     = float((pr & piw & iw & ir & sdp).sum() / max(n_pr_W, 1))
+            # ttbar purity: events where model predicts >=2 predicted-top real slots, both correct
+            pr_both = (pr & pit).sum(axis=1) >= 2                       # [n_sel]
             n_pr_both = int(pr_both.sum())
-            pr_both_correct = (pr & it & ir & sp).sum(axis=1) == 2
+            pr_both_correct = (pr & pit & it & ir & sdp).sum(axis=1) == 2
             row["ttbar_purity"]     = float((pr_both & pr_both_correct).sum() / max(n_pr_both, 1))
             row["n_pred_top"]       = n_pr_top
             row["n_pred_W"]         = n_pr_W
@@ -700,14 +716,14 @@ def main():
     if not run_dir.is_dir():
         sys.exit(f"ERROR: --run_dir does not exist or is not a directory: {run_dir}")
 
-    pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj = load_run_data(
+    pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj, pred_type = load_run_data(
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
     results = compute_efficiencies(
         pred_scores, target_masks, jet_valid, target_obj, target_cls,
-        pred_obj=pred_obj, priors=priors, use_probs=args.use_probs, threshold=args.threshold,
-        strict=args.strict,
+        pred_obj=pred_obj, pred_type=pred_type, priors=priors,
+        use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
     )
     print_results(run_dir, results)
 
