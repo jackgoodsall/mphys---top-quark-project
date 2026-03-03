@@ -230,13 +230,32 @@ class MaskedReconstructionPart(nn.Module):
             torch.cat([torch.zeros(n_top_queries, dtype=torch.long),
                        torch.ones(number_class_tokens - n_top_queries, dtype=torch.long)]))
 
+        # Store query split for hierarchical decoding
+        self.n_top_queries = n_top_queries
+        self.n_w_queries = number_class_tokens - n_top_queries
+        self.hierarchical_decoding = kwargs.get('hierarchical_decoding', False)
+
         # Decoder
-        self.decoder_stack = nn.ModuleList(
-            [nn.TransformerDecoderLayer(
-                embedding_size, n_heads, dim_ff, p_dropout,
-                activation=activation_function, batch_first=True
-            ) for _ in range(n_decoder_layers)]
-        )
+        if self.hierarchical_decoding:
+            self.w_decoder_stack = nn.ModuleList(
+                [nn.TransformerDecoderLayer(
+                    embedding_size, n_heads, dim_ff, p_dropout,
+                    activation=activation_function, batch_first=True
+                ) for _ in range(n_decoder_layers)]
+            )
+            self.top_decoder_stack = nn.ModuleList(
+                [nn.TransformerDecoderLayer(
+                    embedding_size, n_heads, dim_ff, p_dropout,
+                    activation=activation_function, batch_first=True
+                ) for _ in range(n_decoder_layers)]
+            )
+        else:
+            self.decoder_stack = nn.ModuleList(
+                [nn.TransformerDecoderLayer(
+                    embedding_size, n_heads, dim_ff, p_dropout,
+                    activation=activation_function, batch_first=True
+                ) for _ in range(n_decoder_layers)]
+            )
 
         # Build prediction heads from task registry
         self.prediction_heads = self._build_prediction_heads(embedding_size)
@@ -372,11 +391,27 @@ class MaskedReconstructionPart(nn.Module):
         layer_outputs = {}
         
         # Decode
-        for i, layer in enumerate(self.decoder_stack):
-            tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
+        if self.hierarchical_decoding:
+            # Split initial queries by type
+            w_tgt = tgt[:, self.n_top_queries:, :]   # [B, Q_W, D]
+            top_tgt = tgt[:, :self.n_top_queries, :]  # [B, Q_top, D]
 
-            # Only compute heads needed at this layer (zero-weight layers are skipped)
-            layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i)
+            # W slots are always valid — build extended key_padding_mask for top decoder
+            w_valid = src_mask.new_ones(B, self.n_w_queries)  # [B, Q_W] True=valid
+            extended_src_mask = torch.cat([src_mask, w_valid], dim=1)  # [B, N+Q_W]
+
+            for i, (w_layer, top_layer) in enumerate(zip(self.w_decoder_stack, self.top_decoder_stack)):
+                w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
+                extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q_W, D]
+                top_tgt = top_layer(top_tgt, extended_memory, memory_key_padding_mask=~extended_src_mask)
+                combined = torch.cat([top_tgt, w_tgt], dim=1)  # [B, Q, D] — tops first, Ws second
+                layer_outputs[i] = self._compute_layer_outputs(combined, memory, layer_id=i)
+        else:
+            for i, layer in enumerate(self.decoder_stack):
+                tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
+
+                # Only compute heads needed at this layer (zero-weight layers are skipped)
+                layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i)
         
         # Apply matching using task registry
         if self.use_hungarian_matching and targets is not None:
