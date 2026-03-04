@@ -237,17 +237,18 @@ class MaskedReconstructionPart(nn.Module):
 
         # Decoder
         if self.hierarchical_decoding:
+            n_phase_layers = n_decoder_layers // 2
             self.w_decoder_stack = nn.ModuleList(
                 [nn.TransformerDecoderLayer(
                     embedding_size, n_heads, dim_ff, p_dropout,
                     activation=activation_function, batch_first=True
-                ) for _ in range(n_decoder_layers)]
+                ) for _ in range(n_phase_layers)]
             )
             self.top_decoder_stack = nn.ModuleList(
                 [nn.TransformerDecoderLayer(
                     embedding_size, n_heads, dim_ff, p_dropout,
                     activation=activation_function, batch_first=True
-                ) for _ in range(n_decoder_layers)]
+                ) for _ in range(n_phase_layers)]
             )
         else:
             self.decoder_stack = nn.ModuleList(
@@ -395,17 +396,26 @@ class MaskedReconstructionPart(nn.Module):
             # Split initial queries by type
             w_tgt = tgt[:, self.n_top_queries:, :]   # [B, Q_W, D]
             top_tgt = tgt[:, :self.n_top_queries, :]  # [B, Q_top, D]
+            n_w_layers = len(self.w_decoder_stack)
 
-            # W slots are always valid — build extended key_padding_mask for top decoder
-            w_valid = src_mask.new_ones(B, self.n_w_queries)  # [B, Q_W] True=valid
-            extended_src_mask = torch.cat([src_mask, w_valid], dim=1)  # [B, N+Q_W]
-
-            for i, (w_layer, top_layer) in enumerate(zip(self.w_decoder_stack, self.top_decoder_stack)):
+            # --- Phase 1: W decoding ---
+            for i, w_layer in enumerate(self.w_decoder_stack):
                 w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
-                extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q_W, D]
-                top_tgt = top_layer(top_tgt, extended_memory, memory_key_padding_mask=~extended_src_mask)
-                combined = torch.cat([top_tgt, w_tgt], dim=1)  # [B, Q, D] — tops first, Ws second
+                combined = torch.cat([top_tgt, w_tgt], dim=1)  # top_tgt still at init
                 layer_outputs[i] = self._compute_layer_outputs(combined, memory, layer_id=i)
+
+            # Build extended memory once from final W states
+            w_valid = src_mask.new_ones(B, self.n_w_queries)
+            extended_src_mask = torch.cat([src_mask, w_valid], dim=1)
+            extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q_W, D]
+
+            # --- Phase 2: Top decoding ---
+            for j, top_layer in enumerate(self.top_decoder_stack):
+                layer_id = n_w_layers + j
+                top_tgt = top_layer(top_tgt, extended_memory,
+                                    memory_key_padding_mask=~extended_src_mask)
+                combined = torch.cat([top_tgt, w_tgt], dim=1)  # w_tgt frozen
+                layer_outputs[layer_id] = self._compute_layer_outputs(combined, memory, layer_id=layer_id)
         else:
             for i, layer in enumerate(self.decoder_stack):
                 tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
