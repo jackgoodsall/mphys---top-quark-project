@@ -79,7 +79,14 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
                 f"data file has {N_data}. Make sure you are using the correct test split."
             )
 
-    return pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj, pred_type
+    # Load original (pre-signal-jet-filtering) multiplicities if available
+    orig_mult_path = run_dir / "event_multiplicities.npz"
+    original_mult = None
+    if orig_mult_path.exists():
+        d = np.load(orig_mult_path)
+        original_mult = d["original_mult"].astype(int)
+
+    return pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj, pred_type, original_mult
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +142,53 @@ def binarise_predictions(scores, jet_valid, target_cls, priors, use_probs, thres
 # Core efficiency computation
 # ---------------------------------------------------------------------------
 
+def _compute_breakdown(multiplicity_arr, is_top, is_W, is_real, slot_detected_perfect,
+                        all_tops_perfect, all_Ws_perfect, pred_real, pred_is_top, pred_is_W):
+    """Compute per-multiplicity efficiency/purity rows for a given multiplicity array."""
+    mult_values = sorted(np.unique(multiplicity_arr).tolist())
+    breakdown = {}
+    for m in mult_values:
+        sel = multiplicity_arr == m
+        n_sel = sel.sum()
+        if n_sel == 0:
+            continue
+        hw = (is_W[sel] & is_real[sel]).any(axis=1).sum()
+        bt = ((is_top[sel] & is_real[sel]).sum(axis=1) == 2).sum()
+        n_top_correct = (is_top[sel] & is_real[sel] & slot_detected_perfect[sel]).sum()
+        n_top_total   = (is_top[sel] & is_real[sel]).sum()
+        row = {
+            "n_events":  int(n_sel),
+            "top_eff":   float(n_top_correct / max(n_top_total, 1)),
+            "W_eff":     float((all_Ws_perfect[sel]   & (is_W[sel] & is_real[sel]).any(axis=1)).sum() / max(hw, 1)),
+            "ttbar_eff": float((all_tops_perfect[sel] & ((is_top[sel] & is_real[sel]).sum(axis=1) == 2)).sum() / max(bt, 1)),
+            "n_top":     int(n_top_total),
+            "n_W":       int(hw),
+            "n_ttbar":   int(bt),
+        }
+        if pred_real is not None:
+            pr   = pred_real[sel]
+            ir   = is_real[sel]; it = is_top[sel]; iw = is_W[sel]
+            sdp  = slot_detected_perfect[sel]
+            pit  = pred_is_top[sel]
+            piw  = pred_is_W[sel]
+            n_pr_top  = int((pr & pit).sum())
+            n_pr_W    = int((pr & piw).sum())
+            row["top_purity"]   = float((pr & pit & it & ir & sdp).sum() / max(n_pr_top, 1))
+            row["W_purity"]     = float((pr & piw & iw & ir & sdp).sum() / max(n_pr_W, 1))
+            pr_both = (pr & pit).sum(axis=1) >= 2
+            n_pr_both = int(pr_both.sum())
+            pr_both_correct = (pr & pit & it & ir & sdp).sum(axis=1) == 2
+            row["ttbar_purity"]     = float((pr_both & pr_both_correct).sum() / max(n_pr_both, 1))
+            row["n_pred_top"]       = n_pr_top
+            row["n_pred_W"]         = n_pr_W
+            row["n_pred_both_tops"] = n_pr_both
+        breakdown[m] = row
+    return breakdown
+
+
 def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, target_cls,
                          pred_obj=None, pred_type=None, priors=None, use_probs=False,
-                         threshold=None, strict=False):
+                         threshold=None, strict=False, original_mult=None):
     """
     Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
 
@@ -231,48 +282,20 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         ttbar_purity = float((pred_both_tops & both_tops_correct).sum()
                              / max(n_pred_both_tops, 1))
 
-    # Per-multiplicity breakdown
+    # Per-multiplicity breakdown (by signal jet count)
     multiplicity = jet_valid.sum(axis=1).astype(int)         # [N]
-    mult_values  = sorted(np.unique(multiplicity).tolist())
+    breakdown = _compute_breakdown(
+        multiplicity, is_top, is_W, is_real, slot_detected_perfect,
+        all_tops_perfect, all_Ws_perfect, pred_real, pred_is_top, pred_is_W,
+    )
 
-    breakdown = {}
-    for m in mult_values:
-        sel  = multiplicity == m
-        n_sel = sel.sum()
-        if n_sel == 0:
-            continue
-        hw  = has_W[sel].sum()
-        bt  = both_tops[sel].sum()
-        n_top_correct = (is_top[sel] & is_real[sel] & slot_detected_perfect[sel]).sum()
-        n_top_total   = (is_top[sel] & is_real[sel]).sum()
-        row = {
-            "n_events":  int(n_sel),
-            "top_eff":   float(n_top_correct / max(n_top_total, 1)),
-            "W_eff":     float((all_Ws_perfect[sel]   & has_W[sel]).sum()     / max(hw, 1)),
-            "ttbar_eff": float((all_tops_perfect[sel] & both_tops[sel]).sum() / max(bt, 1)),
-            "n_top":     int(n_top_total),
-            "n_W":       int(hw),
-            "n_ttbar":   int(bt),
-        }
-        if pred_real is not None:
-            pr   = pred_real[sel]                                        # [n_sel, Q]
-            ir   = is_real[sel]; it = is_top[sel]; iw = is_W[sel]
-            sdp  = slot_detected_perfect[sel]
-            pit  = pred_is_top[sel]                                      # predicted top
-            piw  = pred_is_W[sel]                                        # predicted W
-            n_pr_top  = int((pr & pit).sum())
-            n_pr_W    = int((pr & piw).sum())
-            row["top_purity"]   = float((pr & pit & it & ir & sdp).sum() / max(n_pr_top, 1))
-            row["W_purity"]     = float((pr & piw & iw & ir & sdp).sum() / max(n_pr_W, 1))
-            # ttbar purity: events where model predicts >=2 predicted-top real slots, both correct
-            pr_both = (pr & pit).sum(axis=1) >= 2                       # [n_sel]
-            n_pr_both = int(pr_both.sum())
-            pr_both_correct = (pr & pit & it & ir & sdp).sum(axis=1) == 2
-            row["ttbar_purity"]     = float((pr_both & pr_both_correct).sum() / max(n_pr_both, 1))
-            row["n_pred_top"]       = n_pr_top
-            row["n_pred_W"]         = n_pr_W
-            row["n_pred_both_tops"] = n_pr_both
-        breakdown[m] = row
+    # Per-original-multiplicity breakdown (grouped by true event jet count before signal filtering)
+    breakdown_orig = {}
+    if original_mult is not None:
+        breakdown_orig = _compute_breakdown(
+            original_mult, is_top, is_W, is_real, slot_detected_perfect,
+            all_tops_perfect, all_Ws_perfect, pred_real, pred_is_top, pred_is_W,
+        )
 
     return {
         "N": len(pred_scores),
@@ -293,7 +316,8 @@ def compute_efficiencies(pred_scores, target_masks, jet_valid, target_obj, targe
         "n_has_top":   int(n_top_slots_total),
         "n_has_W":     int(has_W.sum()),
         "n_both_tops": int(both_tops.sum()),
-        "breakdown":   breakdown,
+        "breakdown":      breakdown,
+        "breakdown_orig": breakdown_orig,
         "priors":      priors or {},
         "use_probs":   use_probs,
         "threshold":   threshold if threshold is not None else (0.5 if use_probs else 0.0),
@@ -341,18 +365,23 @@ def print_results(run_dir: Path, results: dict):
         print(f"  ttbar purity       (both tops pred real & correct / pred 2t):  {results['ttbar_purity']*100:5.2f}%   (N_pred_2t={results['n_pred_both_tops']:,})")
         print("─" * 70)
 
-    if br:
-        print("\nEFFICIENCY BY MULTIPLICITY (# valid jets)")
+    def _print_mult_table(label, table):
+        if not table:
+            return
+        print(f"\n{label}")
         header = f"  {'Jets':>5}   {'Top eff':>8}   {'W eff':>8}   {'ttbar eff':>9}   {'Events':>8}"
         print(header)
         print("  " + "-" * (len(header) - 2))
-        for m, row in sorted(br.items()):
+        for m, row in sorted(table.items()):
             print(
                 f"  {m:>5}   {row['top_eff']*100:>7.2f}%   "
                 f"{row['W_eff']*100:>7.2f}%   "
                 f"{row['ttbar_eff']*100:>8.2f}%   "
                 f"{row['n_events']:>8,}"
             )
+
+    _print_mult_table("EFFICIENCY BY SIGNAL JET MULTIPLICITY (jets fed to model)", br)
+    _print_mult_table("EFFICIENCY BY ORIGINAL JET MULTIPLICITY (all jets in event)", results.get("breakdown_orig", {}))
     print()
 
 
@@ -448,23 +477,36 @@ def make_plots(run_dir: Path, results: dict):
     plt.close(fig)
     print(f"  Saved: {out}")
 
-    # 2. Efficiency vs multiplicity
-    if br:
-        mults = sorted(br.keys())
-        top_effs   = [br[m]["top_eff"]   * 100 for m in mults]
-        W_effs     = [br[m]["W_eff"]     * 100 for m in mults]
-        ttbar_effs = [br[m]["ttbar_eff"] * 100 for m in mults]
-
-        fig, ax = plt.subplots(figsize=(8, 4))
+    def _plot_eff_vs_mult(ax, table, xlabel, title):
+        mults      = sorted(table.keys())
+        top_effs   = [table[m]["top_eff"]   * 100 for m in mults]
+        W_effs     = [table[m]["W_eff"]     * 100 for m in mults]
+        ttbar_effs = [table[m]["ttbar_eff"] * 100 for m in mults]
         ax.plot(mults, top_effs,   "o-", label="Top efficiency",   color="#4c72b0")
         ax.plot(mults, W_effs,     "s-", label="W efficiency",     color="#dd8452")
         ax.plot(mults, ttbar_effs, "^-", label="ttbar efficiency", color="#55a868")
-        ax.set_xlabel("Number of valid jets (multiplicity)")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("Efficiency (%)")
-        ax.set_title("Reconstruction Efficiency vs Jet Multiplicity")
+        ax.set_title(title)
         ax.legend()
         ax.set_ylim(0, 105)
         ax.grid(True, alpha=0.3)
+
+    # 2. Efficiency vs multiplicity
+    br_orig = results.get("breakdown_orig", {})
+    if br or br_orig:
+        n_panels = (1 if br else 0) + (1 if br_orig else 0)
+        fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 4), squeeze=False)
+        panel = 0
+        if br:
+            _plot_eff_vs_mult(axes[0, panel], br,
+                              "Number of signal jets (fed to model)",
+                              "Reconstruction Efficiency vs Signal Jet Multiplicity")
+            panel += 1
+        if br_orig:
+            _plot_eff_vs_mult(axes[0, panel], br_orig,
+                              "Number of jets in full event (original multiplicity)",
+                              "Reconstruction Efficiency vs Original Jet Multiplicity")
         fig.tight_layout()
         out = run_dir / "eval_efficiency_vs_multiplicity.png"
         fig.savefig(out, dpi=150)
@@ -716,7 +758,7 @@ def main():
     if not run_dir.is_dir():
         sys.exit(f"ERROR: --run_dir does not exist or is not a directory: {run_dir}")
 
-    pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj, pred_type = load_run_data(
+    pred_scores, target_masks, jet_valid, target_obj, target_cls, pred_obj, pred_type, original_mult = load_run_data(
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
@@ -724,6 +766,7 @@ def main():
         pred_scores, target_masks, jet_valid, target_obj, target_cls,
         pred_obj=pred_obj, pred_type=pred_type, priors=priors,
         use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
+        original_mult=original_mult,
     )
     print_results(run_dir, results)
 
