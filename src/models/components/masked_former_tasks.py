@@ -1315,3 +1315,70 @@ class ObjectTypeTask(BaseTask):
         file["predicted_type_prob"][start_idx:end_idx] = pred_prob[:, :M].float().cpu().numpy()
         file["target_type"][start_idx:end_idx] = type_labels[:, :M].float().cpu().numpy()
         file["target_classes"][start_idx:end_idx] = classes[:, :M].float().cpu().numpy()
+
+
+class BackgroundSuppressionTask(BaseTask):
+    """
+    Penalises high mask logits for background particles (not in any real GT mask)
+    across all real query slots. This provides Q× stronger gradient than the
+    per-matched-slot BCE in MaskReconstructionTask.
+    """
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        # No influence on Hungarian matching
+        B, Q, _ = predictions['mask_predictions'].shape
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=predictions['mask_predictions'].device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        pred_masks    = predictions['mask_predictions']   # [B, Q, N]
+        jet_mask_true = targets['jet_mask_true']          # [B, Q, N]
+        obj_valid     = targets.get('obj_valid_mask')     # [B, Q] bool or None
+
+        if jet_mask_true.ndim == 2:
+            jet_mask_true = jet_mask_true.unsqueeze(1)
+
+        B, Q, N = pred_masks.shape
+
+        # Signal particle: appears in ANY real object's GT mask
+        if obj_valid is not None:
+            real_masks = jet_mask_true * obj_valid.float().unsqueeze(-1)  # [B, Q, N]
+        else:
+            real_masks = jet_mask_true
+        signal = real_masks.any(dim=1)   # [B, N]  True = signal
+        bg     = ~signal                 # [B, N]  True = background
+
+        # Exclude padding positions
+        if valid_mask is not None:
+            bg = bg & valid_mask.bool()
+
+        if not bg.any():
+            return pred_masks.new_tensor(0.0)
+
+        # Only fire on real query slots (null slots covered by null_mask_penalty)
+        if obj_valid is not None:
+            real_query = obj_valid                        # [B, Q]
+        else:
+            real_query = torch.ones(B, Q, dtype=torch.bool, device=pred_masks.device)
+
+        # suppress_mask: [B, Q, N] — positions where we apply the loss
+        suppress_mask = real_query.unsqueeze(-1) & bg.unsqueeze(1)  # [B, Q, N]
+
+        bce = F.binary_cross_entropy_with_logits(
+            pred_masks, torch.zeros_like(pred_masks), reduction='none'
+        )                                                # [B, Q, N]
+        bce = bce * suppress_mask.float()
+
+        n = suppress_mask.float().sum().clamp(min=1)
+        loss = bce.sum() / n
+
+        return self.config.get_loss_weight('bg_suppress') * loss

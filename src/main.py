@@ -12,6 +12,7 @@ from trainers.top_reconstruction_trainers import (
 from models.components.masked_former_tasks import (
     TaskRegistry, TaskConfig,
     MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
+    BackgroundSuppressionTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
@@ -144,6 +145,29 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         top_weight=type_config.get('top_weight', 1.0)
     )
     task_registry.register_task(object_type_task)
+
+    # ========================================
+    # Background Suppression Task
+    # ========================================
+    bg_config = task_configs.get("background_suppression", {})
+    if bg_config:
+        bg_task = BackgroundSuppressionTask(
+            TaskConfig(
+                name='background_suppression',
+                output_names=['mask_predictions'],   # reuses existing head, no new head needed
+                output_dims={},
+                cost_weights={},
+                loss_weights={'bg_suppress': bg_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=_build_layer_weights(
+                    layer_config=bg_config.get('layer_weights'),
+                    strategy=bg_config.get('layer_weight_strategy', 'uniform'),
+                    strategy_params=bg_config.get('layer_weight_params', {}),
+                    n_layers=n_decoder_layers,
+                ),
+            )
+        )
+        task_registry.register_task(bg_task)
 
     return task_registry
 
