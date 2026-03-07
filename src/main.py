@@ -45,11 +45,12 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         task_registry: Configured TaskRegistry with all tasks
     """
     task_registry = TaskRegistry()
-    
+
     # Get general settings
     max_objects = config.get("max_objects", 2)
     n_decoder_layers = config["model_parameters"]["transformer"]["n_decoder_layers"]
-    
+    chain_queries = config["model_parameters"]["transformer"].get("chain_queries", False)
+
     # Get task-specific configurations
     task_configs = config.get("tasks", {})
     
@@ -91,7 +92,41 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         null_mask_penalty=mask_config.get('null_mask_penalty', 0.1)
     )
     task_registry.register_task(mask_task)
-    
+
+    # ========================================
+    # W Mask Task (chain_queries mode only)
+    # Each chain query also predicts the W mask in the W-decoder phase.
+    # Uses 'mask_W' output (W layers) and 'jet_mask_true_W' target (top-half split).
+    # ========================================
+    if chain_queries:
+        mask_W_config = task_configs.get("mask_W", mask_config)
+        mask_W_loss_weights = {
+            'dice': mask_W_config.get('dice_weight', mask_config.get('dice_weight', 1.0)),
+            'bce':  mask_W_config.get('bce_weight',  mask_config.get('bce_weight',  0.5)),
+        }
+        mask_W_layer_weights = _build_layer_weights(
+            layer_config=mask_W_config.get('layer_weights'),
+            strategy=mask_W_config.get('layer_weight_strategy', 'uniform'),
+            strategy_params=mask_W_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers,
+        )
+        mask_W_task = MaskReconstructionTask(
+            TaskConfig(
+                name='mask_W',
+                output_names=['mask_W'],
+                output_dims={},
+                cost_weights={'mask': mask_W_config.get('cost_weight', mask_config.get('cost_weight', 1.0))},
+                loss_weights=mask_W_loss_weights,
+                max_objects=max_objects,
+                layer_weights=mask_W_layer_weights,
+                head_norm=mask_W_config.get('head_norm', False),
+            ),
+            null_mask_penalty=mask_W_config.get('null_mask_penalty', mask_config.get('null_mask_penalty', 0.1)),
+            pred_key='mask_W',
+            target_key='jet_mask_true_W',
+        )
+        task_registry.register_task(mask_W_task)
+
     # ========================================
     # Objectness Task (is this query a real object?)
     # ========================================
@@ -121,30 +156,32 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
 
     # ========================================
     # Object Type Task (top vs W classification)
+    # Not used in chain_queries mode — all queries are the same "chain" type.
     # ========================================
-    type_config = task_configs.get("object_type", {})
+    if not chain_queries:
+        type_config = task_configs.get("object_type", {})
 
-    type_layer_weights = _build_layer_weights(
-        layer_config=type_config.get('layer_weights'),
-        strategy=type_config.get('layer_weight_strategy'),
-        strategy_params=type_config.get('layer_weight_params', {}),
-        n_layers=n_decoder_layers
-    )
+        type_layer_weights = _build_layer_weights(
+            layer_config=type_config.get('layer_weights'),
+            strategy=type_config.get('layer_weight_strategy'),
+            strategy_params=type_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers
+        )
 
-    object_type_task = ObjectTypeTask(
-        TaskConfig(
-            name='object_type',
-            output_names=['type_logit'],
-            output_dims={'type_logit': 1},
-            cost_weights={'type': type_config.get('cost_weight', 1.0)},
-            loss_weights={'type': type_config.get('loss_weight', 1.0)},
-            max_objects=max_objects,
-            layer_weights=type_layer_weights,
-            head_norm=type_config.get('head_norm', False),
-        ),
-        top_weight=type_config.get('top_weight', 1.0)
-    )
-    task_registry.register_task(object_type_task)
+        object_type_task = ObjectTypeTask(
+            TaskConfig(
+                name='object_type',
+                output_names=['type_logit'],
+                output_dims={'type_logit': 1},
+                cost_weights={'type': type_config.get('cost_weight', 1.0)},
+                loss_weights={'type': type_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=type_layer_weights,
+                head_norm=type_config.get('head_norm', False),
+            ),
+            top_weight=type_config.get('top_weight', 1.0)
+        )
+        task_registry.register_task(object_type_task)
 
     # ========================================
     # Background Suppression Task

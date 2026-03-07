@@ -224,19 +224,25 @@ class MaskedReconstructionPart(nn.Module):
             torch.randn((self.number_class_tokens, embedding_size)) * 0.02
         )
 
-        # Type-conditioned queries: first n_top_queries are top-designated,
-        # remainder are W-designated.  Type embeddings are added to queries
-        # before the decoder so the model can specialise each query group.
-        n_top_queries = kwargs.get('n_top_queries', number_class_tokens // 2)
-        self.type_embeddings = nn.Embedding(2, embedding_size)  # 0=top, 1=W
-        self.register_buffer('query_type_ids',
-            torch.cat([torch.zeros(n_top_queries, dtype=torch.long),
-                       torch.ones(number_class_tokens - n_top_queries, dtype=torch.long)]))
-
-        # Store query split for hierarchical decoding
-        self.n_top_queries = n_top_queries
-        self.n_w_queries = number_class_tokens - n_top_queries
         self.hierarchical_decoding = kwargs.get('hierarchical_decoding', False)
+        # chain_queries: single query per top-decay chain (W-phase → top-phase same token).
+        # When True, number_class_tokens = n_chains (e.g. 2).  No top/W query split.
+        self.chain_queries = kwargs.get('chain_queries', False)
+
+        if self.chain_queries:
+            # All queries are chain queries — no type distinction needed.
+            self.n_top_queries = number_class_tokens
+            self.n_w_queries = number_class_tokens
+        else:
+            # Type-conditioned queries: first n_top_queries are top-designated,
+            # remainder are W-designated.
+            n_top_queries = kwargs.get('n_top_queries', number_class_tokens // 2)
+            self.type_embeddings = nn.Embedding(2, embedding_size)  # 0=top, 1=W
+            self.register_buffer('query_type_ids',
+                torch.cat([torch.zeros(n_top_queries, dtype=torch.long),
+                           torch.ones(number_class_tokens - n_top_queries, dtype=torch.long)]))
+            self.n_top_queries = n_top_queries
+            self.n_w_queries = number_class_tokens - n_top_queries
 
         # Decoder
         if self.hierarchical_decoding:
@@ -320,9 +326,10 @@ class MaskedReconstructionPart(nn.Module):
                     output_specs[output_name] = (output_dim, task.config.head_norm)
 
         # Build heads for each output type
+        MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
         for output_name, (output_dim, head_norm) in output_specs.items():
-            if output_name == 'mask_predictions':
-                # Special case: computed via einsum with memory
+            if output_name in MASK_OUTPUT_NAMES:
+                # Mask logits computed via query-memory dot product (einsum), not a learned head.
                 heads[output_name] = nn.Identity()
             elif output_dim is not None:
                 layers = []
@@ -401,14 +408,46 @@ class MaskedReconstructionPart(nn.Module):
         if self.particle_gating is not None:
             gate_relevance, memory = self.particle_gating(memory, src_key_padding_mask=~src_mask)
 
-        # Initialize queries with type embeddings
-        type_emb = self.type_embeddings(self.query_type_ids)  # [Q, D]
-        tgt = (self.target_tokens + type_emb).unsqueeze(0).expand(B, -1, -1)
+        # Initialize queries
+        if self.chain_queries:
+            tgt = self.target_tokens.unsqueeze(0).expand(B, -1, -1)  # [B, Q, D]
+        else:
+            type_emb = self.type_embeddings(self.query_type_ids)  # [Q, D]
+            tgt = (self.target_tokens + type_emb).unsqueeze(0).expand(B, -1, -1)
         layer_outputs = {}
-        
+
         # Decode
-        if self.hierarchical_decoding:
-            # Split initial queries by type
+        if self.hierarchical_decoding and self.chain_queries:
+            # --- Chain-query hierarchical decode ---
+            # All Q queries are chain queries (one per top-decay chain).
+            # Phase 1 (W decoder): queries attend to particle memory → W representations.
+            # Phase 2 (top decoder): SAME queries warm-started from Phase-1 state
+            #   attend to extended memory (particles + W states) → top representations.
+            # The single query token carries both the W and top prediction for chain j.
+            n_w_layers = len(self.w_decoder_stack)
+
+            w_tgt = tgt  # [B, Q, D] — all queries start as W queries
+            for i, w_layer in enumerate(self.w_decoder_stack):
+                w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
+                layer_outputs[i] = self._compute_layer_outputs(
+                    w_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
+
+            # Extended memory: particles + final W states
+            w_chain_valid = src_mask.new_ones(B, self.number_class_tokens)
+            extended_src_mask = torch.cat([src_mask, w_chain_valid], dim=1)
+            extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q, D]
+
+            # Warm-start: top queries begin from the same token that decoded the W.
+            top_tgt = w_tgt
+            for j, top_layer in enumerate(self.top_decoder_stack):
+                layer_id = n_w_layers + j
+                top_tgt = top_layer(top_tgt, extended_memory,
+                                    memory_key_padding_mask=~extended_src_mask)
+                layer_outputs[layer_id] = self._compute_layer_outputs(
+                    top_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
+
+        elif self.hierarchical_decoding:
+            # --- Original 4-query hierarchical decode (top + W split) ---
             w_tgt = tgt[:, self.n_top_queries:, :]   # [B, Q_W, D]
             top_tgt = tgt[:, :self.n_top_queries, :]  # [B, Q_top, D]
             n_w_layers = len(self.w_decoder_stack)
@@ -462,11 +501,12 @@ class MaskedReconstructionPart(nn.Module):
         """
         needed = self._layer_output_map[layer_id]
 
+        MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
         outputs = {}
         for output_name, head in self.prediction_heads.items():
             if output_name not in needed:
                 continue
-            if output_name == 'mask_predictions':
+            if output_name in MASK_OUTPUT_NAMES:
                 outputs[output_name] = torch.einsum("bnd,bmd->bnm", queries, memory)
             else:
                 outputs[output_name] = head(queries)
@@ -607,19 +647,54 @@ class MaskedReconstructionPart(nn.Module):
                     'jet_mask_true'
                 ].unsqueeze(1)
 
+        # ---- 1b. Chain-query target splitting ----
+        # In chain_queries mode the merged target tensor [B, T_merged, N] has
+        # tops in the first half and Ws in the second half.  We split them so
+        # the cost matrix runs over T_chains chains instead of T_merged objects,
+        # and the W mask task can access 'jet_mask_true_W' in targets.
+        if self.chain_queries:
+            T_merged = targets_batched['jet_mask_true'].shape[1]
+            T_chains = T_merged // 2
+
+            targets_batched = dict(targets_batched)  # shallow copy to avoid mutating input
+            jmt = targets_batched['jet_mask_true']
+            targets_batched['jet_mask_true'] = jmt[:, :T_chains, :]    # top masks
+            targets_batched['jet_mask_true_W'] = jmt[:, T_chains:, :]  # W masks
+
+            # Chain j is valid only when both top_j and W_j are present.
+            top_valid = target_valid_mask[:, :T_chains]
+            w_valid_tgt = target_valid_mask[:, T_chains:]
+            target_valid_mask = top_valid & w_valid_tgt  # [B, T_chains]
+
+            # Remove the merged 'classes' field — no per-query type in chain mode.
+            targets_batched.pop('classes', None)
+
         # ---- 2. Compute matching indices (no gradients) ----
         with torch.no_grad():
             final_layer = max(decoder_outputs.keys())
-            final_output = decoder_outputs[final_layer]
+
+            if self.chain_queries:
+                # Matching cost must combine:
+                #   - W masks from the W-phase final output (last W-decoder layer)
+                #   - Top masks + objectness from the top-phase final output (last top-decoder layer)
+                # Using top-phase queries for mask_W would be incorrect.
+                n_w_layers = len(self.w_decoder_stack)
+                w_phase_final_id = n_w_layers - 1
+                final_output = dict(decoder_outputs[final_layer])  # copy top-phase outputs
+                if w_phase_final_id in decoder_outputs and 'mask_W' in decoder_outputs[w_phase_final_id]:
+                    final_output['mask_W'] = decoder_outputs[w_phase_final_id]['mask_W']
+            else:
+                final_output = decoder_outputs[final_layer]
 
             cost_matrix = self.task_registry.compute_total_cost(
                 predictions=final_output,
                 targets=targets_batched
-            )  # [B, Q, T_max]
+            )  # [B, Q, T_chains]  (or T_max in non-chain mode)
 
             # Type-partitioned matching: add large penalty for cross-type
             # assignments so top queries can only match top targets and
             # W queries can only match W targets.
+            # (Skipped in chain_queries mode — no type split.)
             if hasattr(self, 'query_type_ids') and 'classes' in targets_batched:
                 classes = targets_batched['classes']  # [B, T_max]
                 # target type: top (CLASS_TOP=1) → 0, W (CLASS_W=2) → 1
@@ -704,6 +779,13 @@ class MaskedReconstructionPart(nn.Module):
             )
         else:
             padded_targets['jet_mask_true'] = jmt
+
+        # Chain mode: also pad W masks
+        if 'jet_mask_true_W' in targets_batched:
+            jmt_W = targets_batched['jet_mask_true_W']
+            padded_targets['jet_mask_true_W'] = (
+                F.pad(jmt_W, (0, 0, 0, pad_q), value=0.0) if pad_q > 0 else jmt_W
+            )
 
         # Pad target_kinematics if present
         if 'target_kinematics' in targets_batched:

@@ -23,43 +23,41 @@ max_targets: 10                       # GPU fallback threshold for gpu_bruteforc
   
 
 tasks:
+  # Top mask: W-decoder produces W masks (layers 0-3); top-decoder produces top masks (layers 4-7).
+  # In chain_queries mode layer_weights are phase-split so each mask head only fires during
+  # its own decoder phase.
   mask:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
-    null_mask_penalty: 0.2   # base value; adaptive scaling reduces this for low-T events
-    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+
+  mask_W:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
 
   objectness:
     cost_weight: 1
     loss_weight: 1
-    null_weight: 0.2   # base value; adaptive scaling reduces this for low-T events
-    head_norm: True     # LayerNorm before prediction head MLP
-    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+    null_weight: 0.2
+    head_norm: True
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
-  object_type:
-    cost_weight: 0.5        # type separation handled by cost masking, not soft type cost
-    loss_weight: 1.0      # loss signal helps refine type embeddings
-    top_weight: 1.0
-    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
-
-  background_suppression:
-    loss_weight: 1.0
-    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
-
-  particle_gating:
-    loss_weight: 0.5
-    layer_weights: null   # fires at all layers but task self-gates to final layer only
+  # object_type: not registered in chain_queries mode
 
 pretraining:
-  mask_pretrain_epochs: 10 # epochs of mask-only training before enabling all tasks; 0 = disabled
-  tasks: ["mask"]            # tasks active during pretraining phase
-  transition_ramp_epochs: 5 # ramp new task weights 0→1 over this many epochs; 0 = instant
+  mask_pretrain_epochs: 0   # disabled for R&D — train all tasks from the start
+  tasks: ["mask", "mask_W"]
+  transition_ramp_epochs: 0
 
 
 
 
-max_objects: 4
+max_objects: 2   # chain_queries: one query per decay chain
 
 
 data_modules:
@@ -110,13 +108,13 @@ model_parameters:
     out_dimensions: 6
     p_dropout: 0.1
     dim_ff: 256
-    number_class_tokens: 4
-    n_top_queries: 2        # first 2 queries are top-designated, remainder are W-designated
-    use_mia_encoder: False   # MIParT-style encoder (arXiv:2407.08682)
-    n_mia_layers: 0         # K MIA blocks (high-dim interactions); remainder are P-MHA blocks
-    mia_interaction_dim: 64 # D1; must match interaction_embedder.output_size
-    hierarchical_decoding: True  # W-then-Top parallel ladder decoder
-    use_particle_gating: true
+    number_class_tokens: 2   # one query per top-decay chain (W->top from same token)
+    hierarchical_decoding: True
+    chain_queries: True       # W-phase then top-phase from the SAME query token
+    use_mia_encoder: False
+    n_mia_layers: 0
+    mia_interaction_dim: 64
+    use_particle_gating: false  # disabled for clean R&D baseline
     n_gating_layers: 2
     n_gate_queries: 1
 
