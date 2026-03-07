@@ -1,6 +1,6 @@
 # Top Quark Reconstruction with Transformers
 
-> MPhys project (2025–2026) — applying transformer-based set prediction to semi-leptonic tt̄ events at the LHC.
+> MPhys project (2025–2026) — applying transformer-based set prediction to tt̄ events at the LHC.
 
 ## Overview
 
