@@ -1,0 +1,22 @@
+# Pinned requirements — generated from .transformer_env
+# Python 3.9 | CUDA 12.9
+# Install: pip install -r requirements.lock --extra-index-url https://download.pytorch.org/whl/cu129
+
+torch==2.8.0+cu129
+torchvision==0.23.0+cu129
+pytorch-lightning==2.5.5
+lightning==2.5.5
+lightning-utilities==0.15.2
+torchmetrics==1.8.2
+torch-optimizer==0.3.0
+
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+h5py==3.11.0
+matplotlib==3.9.2
+pydantic==2.8.2
+pydantic-core==2.20.1
+PyYAML==6.0.1
+joblib==1.4.2
+vector==1.7.0
