@@ -7,7 +7,6 @@
 This project develops a **DETR-style MaskedFormer** model for reconstructing top quark decay chains from jet-level inputs. The model uses learnable query tokens and Hungarian matching to assign jets to decay products (W bosons and top quarks) in a permutation-invariant way, without relying on explicit jet ordering.
 
 Key features:
-- **Hierarchical chain-query decoding** — a single query token first reconstructs the W, then the parent top from the same token, enforcing the decay topology
 - **Multi-task learning** — mask prediction, objectness scoring, and kinematic regression trained jointly with layer-wise supervision
 - **Interaction-modulated attention** — pairwise jet features (ΔR, k_T, z, m²) bias the encoder attention maps
 - **Hungarian bipartite matching** — permutation-invariant set loss with GPU-accelerated brute-force solver
@@ -135,16 +134,6 @@ model_training:
     warmup_epochs: 3
     T_max: 50
 ```
-
-## Datasets
-
-Three event topologies are included:
-
-| Dataset | Description |
-|---|---|
-| `semi_leptonic_ttbar` | Standard Model tt̄ (training baseline) |
-| `semi_leptonic_ttH` | tt̄H associated production |
-| `semi_leptonic_zprime` | Z′ → tt̄ BSM signal at 500/700/900 GeV |
 
 ## Dependencies
 
