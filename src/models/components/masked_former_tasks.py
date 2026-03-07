@@ -1382,3 +1382,52 @@ class BackgroundSuppressionTask(BaseTask):
         loss = bce.sum() / n
 
         return self.config.get_loss_weight('bg_suppress') * loss
+
+
+class ParticleGatingTask(BaseTask):
+    """
+    Binary BCE loss on gate relevance scores: signal particles → 1, background → 0.
+    Only fires at the final decoder layer where gate_relevance is injected.
+    """
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        B, Q, _ = predictions['mask_predictions'].shape
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=predictions['mask_predictions'].device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if 'gate_relevance' not in predictions:
+            return predictions['mask_predictions'].new_tensor(0.0)
+
+        relevance = predictions['gate_relevance']   # [B, N]
+        jet_mask_true = targets['jet_mask_true']    # [B, Q, N]
+        obj_valid = targets.get('obj_valid_mask')   # [B, Q]
+
+        if jet_mask_true.ndim == 2:
+            jet_mask_true = jet_mask_true.unsqueeze(1)
+
+        if obj_valid is not None:
+            real = jet_mask_true * obj_valid.float().unsqueeze(-1)
+        else:
+            real = jet_mask_true
+        particle_target = real.any(dim=1).float()  # [B, N]  1=signal, 0=background
+
+        if valid_mask is not None:
+            vm = valid_mask.float()
+            n = vm.sum().clamp(min=1)
+            loss = (F.binary_cross_entropy(relevance.clamp(1e-6, 1 - 1e-6),
+                                           particle_target, reduction='none') * vm).sum() / n
+        else:
+            loss = F.binary_cross_entropy(relevance.clamp(1e-6, 1 - 1e-6),
+                                          particle_target, reduction='mean')
+
+        return self.config.get_loss_weight('gate') * loss

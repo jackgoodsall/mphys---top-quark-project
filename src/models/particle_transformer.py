@@ -5,7 +5,7 @@ import sys
 from typing import List
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from src.models.components.attention_layers import ParticleAttentionBlock, MIParticleAttentionBlock, InteractionDimReducer
+from src.models.components.attention_layers import ParticleAttentionBlock, MIParticleAttentionBlock, InteractionDimReducer, ParticleGatingModule
 from src.models.components.masked_former_tasks import *
 from src.models.components.matcher import *
 from typing import Dict, Optional, Union
@@ -175,6 +175,9 @@ class MaskedReconstructionPart(nn.Module):
                  use_mia_encoder: bool = False,
                  n_mia_layers: int = 5,
                  mia_interaction_dim: int = 64,
+                 use_particle_gating: bool = False,
+                 n_gating_layers: int = 2,
+                 n_gate_queries: int = 1,
                  *args,
                  **kwargs
                  ):
@@ -257,6 +260,13 @@ class MaskedReconstructionPart(nn.Module):
                     activation=activation_function, batch_first=True
                 ) for _ in range(n_decoder_layers)]
             )
+
+        # Particle gating (optional): scale encoder memory by learned per-particle relevance
+        self.particle_gating = (
+            ParticleGatingModule(embedding_size, n_gating_layers, n_gate_queries, n_heads, dim_ff)
+            if use_particle_gating else None
+        )
+        self._final_layer_id = n_decoder_layers - 1
 
         # Build prediction heads from task registry
         self.prediction_heads = self._build_prediction_heads(embedding_size)
@@ -386,6 +396,11 @@ class MaskedReconstructionPart(nn.Module):
         for layer in self.encoder_stack:
             memory = layer(memory, interactions)
         
+        # Particle gating: scale encoder memory by learned per-particle relevance
+        gate_relevance = None
+        if self.particle_gating is not None:
+            gate_relevance, memory = self.particle_gating(memory, src_key_padding_mask=~src_mask)
+
         # Initialize queries with type embeddings
         type_emb = self.type_embeddings(self.query_type_ids)  # [Q, D]
         tgt = (self.target_tokens + type_emb).unsqueeze(0).expand(B, -1, -1)
@@ -402,7 +417,7 @@ class MaskedReconstructionPart(nn.Module):
             for i, w_layer in enumerate(self.w_decoder_stack):
                 w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
                 combined = torch.cat([top_tgt, w_tgt], dim=1)  # top_tgt still at init
-                layer_outputs[i] = self._compute_layer_outputs(combined, memory, layer_id=i)
+                layer_outputs[i] = self._compute_layer_outputs(combined, memory, layer_id=i, gate_relevance=gate_relevance)
 
             # Build extended memory once from final W states
             w_valid = src_mask.new_ones(B, self.n_w_queries)
@@ -415,13 +430,13 @@ class MaskedReconstructionPart(nn.Module):
                 top_tgt = top_layer(top_tgt, extended_memory,
                                     memory_key_padding_mask=~extended_src_mask)
                 combined = torch.cat([top_tgt, w_tgt], dim=1)  # w_tgt frozen
-                layer_outputs[layer_id] = self._compute_layer_outputs(combined, memory, layer_id=layer_id)
+                layer_outputs[layer_id] = self._compute_layer_outputs(combined, memory, layer_id=layer_id, gate_relevance=gate_relevance)
         else:
             for i, layer in enumerate(self.decoder_stack):
                 tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
 
                 # Only compute heads needed at this layer (zero-weight layers are skipped)
-                layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i)
+                layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i, gate_relevance=gate_relevance)
         
         # Apply matching using task registry
         if self.use_hungarian_matching and targets is not None:
@@ -438,6 +453,7 @@ class MaskedReconstructionPart(nn.Module):
         queries: torch.Tensor,  # [B, num_queries, embedding_size]
         memory: torch.Tensor,   # [B, N_particles, embedding_size]
         layer_id: int = 0,
+        gate_relevance: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute outputs for tasks needed at this layer.
@@ -454,6 +470,9 @@ class MaskedReconstructionPart(nn.Module):
                 outputs[output_name] = torch.einsum("bnd,bmd->bnm", queries, memory)
             else:
                 outputs[output_name] = head(queries)
+
+        if gate_relevance is not None and layer_id == self._final_layer_id:
+            outputs['gate_relevance'] = gate_relevance
 
         return outputs
     def _collate_targets(
@@ -634,9 +653,18 @@ class MaskedReconstructionPart(nn.Module):
         for lid in layer_ids:
             all_output_names.update(decoder_outputs[lid].keys())
 
+        # gate_relevance is [B, N] (per-particle), not [B, Q, D] — pass through directly
+        # without permutation (particle order is fixed and doesn't need reordering).
+        NON_QUERY_OUTPUTS = {'gate_relevance', '__targets__'}
+
         for output_name in all_output_names:
             layers_with = [lid for lid in layer_ids if output_name in decoder_outputs[lid]]
             if not layers_with:
+                continue
+
+            if output_name in NON_QUERY_OUTPUTS:
+                for lid in layers_with:
+                    permuted_outputs[lid][output_name] = decoder_outputs[lid][output_name]
                 continue
 
             stacked = torch.stack([decoder_outputs[lid][output_name] for lid in layers_with])

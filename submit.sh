@@ -1,5 +1,5 @@
 #!/bin/bash --login
-#SBATCH -p gpuA               # Partition: A100 GPU / V100 GPU
+#SBATCH -p gpuA             # Partition: A100 GPU / V100 GPU
 #SBATCH --gres=gpu:1          # Request 2 GPUs / 1 GPU
 #SBATCH --time=3-00:00:00     # Wall time: 3 days
 #SBATCH --ntasks=1            # One task

@@ -12,7 +12,7 @@ from trainers.top_reconstruction_trainers import (
 from models.components.masked_former_tasks import (
     TaskRegistry, TaskConfig,
     MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
-    BackgroundSuppressionTask,
+    BackgroundSuppressionTask, ParticleGatingTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
@@ -168,6 +168,29 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             )
         )
         task_registry.register_task(bg_task)
+
+    # ========================================
+    # Particle Gating Task
+    # ========================================
+    gate_config = task_configs.get("particle_gating", {})
+    if gate_config:
+        gate_task = ParticleGatingTask(
+            TaskConfig(
+                name='particle_gating',
+                output_names=['mask_predictions'],  # no new head; uses gate_relevance key
+                output_dims={},
+                cost_weights={},
+                loss_weights={'gate': gate_config.get('loss_weight', 0.5)},
+                max_objects=max_objects,
+                layer_weights=_build_layer_weights(
+                    layer_config=gate_config.get('layer_weights'),
+                    strategy=gate_config.get('layer_weight_strategy', 'uniform'),
+                    strategy_params=gate_config.get('layer_weight_params', {}),
+                    n_layers=n_decoder_layers,
+                ),
+            )
+        )
+        task_registry.register_task(gate_task)
 
     return task_registry
 

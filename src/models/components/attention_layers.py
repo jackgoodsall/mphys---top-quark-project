@@ -134,6 +134,35 @@ class ParticleAttentionBlock(nn.Module):
         return residual
 
 
+class ParticleGatingModule(nn.Module):
+    """
+    Learns a per-particle relevance score in [0, 1] via a small cross-attention
+    stack over encoder memory.  Gated memory = memory * relevance, suppressing
+    background particles before the decoder cross-attends to them.
+    """
+
+    def __init__(self, d_model, n_gating_layers=2, n_gate_queries=1, nhead=8, dim_feedforward=256):
+        super().__init__()
+        self.gate_queries = nn.Parameter(0.01 * torch.randn(n_gate_queries, d_model))
+        self.gating_layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, batch_first=True)
+            for _ in range(n_gating_layers)
+        ])
+
+    def forward(self, memory, src_key_padding_mask=None):
+        # memory: [B, N, D],  src_key_padding_mask: [B, N] True=PADDING
+        B = memory.size(0)
+        gate_q = self.gate_queries.unsqueeze(0).expand(B, -1, -1)  # [B, G, D]
+        for layer in self.gating_layers:
+            gate_q = layer(gate_q, memory, memory_key_padding_mask=src_key_padding_mask)
+        scores = torch.einsum('bgd,bnd->bgn', gate_q, memory) / (memory.size(-1) ** 0.5)  # [B, G, N]
+        if src_key_padding_mask is not None:
+            scores = scores.masked_fill(src_key_padding_mask.unsqueeze(1), float('-inf'))
+        relevance = torch.sigmoid(scores.max(dim=1).values)  # [B, N]
+        gated_memory = memory * relevance.unsqueeze(-1)
+        return relevance, gated_memory
+
+
 class MIParticleAttentionBlock(nn.Module):
     """
     MI-Particle Attention Block from MIParT (arXiv:2407.08682).

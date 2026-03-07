@@ -26,27 +26,35 @@ tasks:
   mask:
     cost_weight: 1.0
     dice_weight: 1.0
-    bce_weight: 0.4
+    bce_weight: 0.5
     null_mask_penalty: 0.2   # base value; adaptive scaling reduces this for low-T events
-    layer_weights: {0: 0, 1: 0.25, 2: 0.5, 3: 1} #{0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
   objectness:
     cost_weight: 1
     loss_weight: 1
     null_weight: 0.2   # base value; adaptive scaling reduces this for low-T events
     head_norm: True     # LayerNorm before prediction head MLP
-    layer_weights: {0: 0, 1: 0.25, 2: 0.5, 3: 1} #{0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
   object_type:
     cost_weight: 0.5        # type separation handled by cost masking, not soft type cost
     loss_weight: 1.0      # loss signal helps refine type embeddings
     top_weight: 1.0
-    layer_weights: {0: 0, 1: 0.25, 2: 0.5, 3: 1} # {0: 0, 1: 0, 2: 0.2, 3: 0.2, 4: 0.5, 5: 0.5, 6: 1.0, 7: 1.0}
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+
+  background_suppression:
+    loss_weight: 1.0
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+
+  particle_gating:
+    loss_weight: 0.5
+    layer_weights: null   # fires at all layers but task self-gates to final layer only
 
 pretraining:
-  mask_pretrain_epochs: 0  # epochs of mask-only training before enabling all tasks; 0 = disabled
+  mask_pretrain_epochs: 10 # epochs of mask-only training before enabling all tasks; 0 = disabled
   tasks: ["mask"]            # tasks active during pretraining phase
-  transition_ramp_epochs: 0  # ramp new task weights 0→1 over this many epochs; 0 = instant
+  transition_ramp_epochs: 5 # ramp new task weights 0→1 over this many epochs; 0 = instant
 
 
 
@@ -96,8 +104,8 @@ model_parameters:
 
   transformer:
     embedding_size: 64
-    n_encoder_layers: 4
-    n_decoder_layers: 4
+    n_encoder_layers: 8
+    n_decoder_layers: 8
     n_heads: 8
     out_dimensions: 6
     p_dropout: 0.1
@@ -107,12 +115,16 @@ model_parameters:
     use_mia_encoder: False   # MIParT-style encoder (arXiv:2407.08682)
     n_mia_layers: 0         # K MIA blocks (high-dim interactions); remainder are P-MHA blocks
     mia_interaction_dim: 64 # D1; must match interaction_embedder.output_size
+    hierarchical_decoding: True  # W-then-Top parallel ladder decoder
+    use_particle_gating: true
+    n_gating_layers: 2
+    n_gate_queries: 1
 
 model_training:
   seed: null
-  learning_rate: 1e-04
+  learning_rate: 5e-4
   weight_decay: 0.0001
-  use_lookahead: False
+  use_lookahead: True
   gradient_clip_val: 5  # Increased from 2 to prevent gradient explosions causing NaNs
   precision: "32-true"   # Lightning precision options:
                             #   "32-true"    — full FP32, safest, slowest
@@ -128,10 +140,10 @@ model_training:
   max_epochs: 100
 
   scheduler:
-    type: "step"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
+    type: "warmup_cosine"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
     # WarmupCosine params (type=warmup_cosine):
-    warmup_epochs: 3        # linear ramp 0 → lr over this many epochs
-    T_max: 35               # total epochs for cosine decay
+    warmup_epochs: 3       # linear ramp 0 → lr over this many epochs
+    T_max: 50               # total epochs for cosine decay
     eta_min: 1e-6           # floor LR at end of cosine decay
     update_interval: "step" # "step" (every batch) or "epoch" (once per epoch)
     lr_rewarmup_epochs: 3       # re-warmup from reduced LR at phase transition; 0 = disabled
@@ -142,7 +154,7 @@ model_training:
     plateau_monitor: "val_loss"
     # StepLR params (type=step):
     step_size: 3000
-    gamma: 0.8
+    gamma: 0.9
     # CosineAnnealingLR params (type=cosine):
     # T_max and eta_min shared with warmup_cosine above
 
