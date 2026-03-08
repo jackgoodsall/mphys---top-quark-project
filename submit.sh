@@ -1,5 +1,5 @@
 #!/bin/bash --login
-#SBATCH -p gpuA             # Partition: A100 GPU / V100 GPU
+#SBATCH -p gpuL           # Partition: A100 GPU / V100 GPU
 #SBATCH --gres=gpu:1          # Request 2 GPUs / 1 GPU
 #SBATCH --time=3-00:00:00     # Wall time: 3 days
 #SBATCH --ntasks=1            # One task
@@ -10,6 +10,7 @@ module purge
 module load libs/cuda
 
 export CUDA_VISsIBLE_DEVICES=0,1
+export UV_PROJECT_ENVIRONMENT=.transformer_env
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 echo "Job is using $SLURM_GPUS GPU(s) with ID(s) $CUDA_VISIBLE_DEVICES and $SLURM_CPUS_PER_TASK CPU core(s)"
