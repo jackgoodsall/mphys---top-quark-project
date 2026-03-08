@@ -174,8 +174,8 @@ training_callbacks:
     mode: "min"
 
 inference:
-  mode: "train"              # "train" | "test" | "resume" | "lr_find"
-  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_11711973/checkpoints/epoch=epoch=186-val_loss=val_loss=0.7130.ckpt"
+  mode: "test"              # "train" | "test" | "resume" | "lr_find"
+  checkpoint_path: "masked_reconstruction/lightning_logs/version_11875105/checkpoints/epoch=epoch=70-val_loss=val_loss=1.1572.ckpt"
 
 model_artefacts:
   log_dir: "masked_reconstruction"
