@@ -1,7 +1,9 @@
+import os
 import torch
 import lightning as pl
 from pathlib import Path
 from typing import Dict, Optional
+from lightning.pytorch.loggers import TensorBoardLogger
 from models.particle_transformer import (
     ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
 )
@@ -364,7 +366,10 @@ if __name__ == "__main__":
             task_registry=task_registry,
             config=config,
         )
-        trainer = pl.Trainer(default_root_dir=log_dir)
+        slurm_id = os.environ.get("SLURM_JOB_ID")
+        version = int(slurm_id) if slurm_id else None
+        logger = TensorBoardLogger(log_dir, version=version)
+        trainer = pl.Trainer(default_root_dir=log_dir, logger=logger)
         trainer.test(lightning_model, datamodule=topantitopquark)
 
     elif mode == "resume":
