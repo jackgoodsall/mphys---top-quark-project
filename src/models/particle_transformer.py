@@ -175,6 +175,7 @@ class MaskedReconstructionPart(nn.Module):
                  use_mia_encoder: bool = False,
                  n_mia_layers: int = 5,
                  mia_interaction_dim: int = 64,
+                 use_vanilla_attention: bool = False,
                  use_particle_gating: bool = False,
                  n_gating_layers: int = 2,
                  n_gate_queries: int = 1,
@@ -190,8 +191,17 @@ class MaskedReconstructionPart(nn.Module):
         self.use_hungarian_matching = use_hungarian_matching
         self.task_registry = task_registry
         self.use_mia_encoder = use_mia_encoder
+        self.use_vanilla_attention = use_vanilla_attention
 
-        if use_mia_encoder:
+        if use_vanilla_attention:
+            # Native torch encoder → gets flash attention automatically
+            self.encoder_stack = nn.ModuleList(
+                [nn.TransformerEncoderLayer(
+                    embedding_size, n_heads, dim_ff, p_dropout,
+                    activation=activation_function, batch_first=True
+                ) for _ in range(n_encoder_layers)]
+            )
+        elif use_mia_encoder:
             # MIParT-style encoder:
             #   K x MIParticleAttentionBlock  (high-dim interaction D1=mia_interaction_dim)
             #   InteractionDimReducer         (D1 -> n_heads = D2)
@@ -373,21 +383,28 @@ class MaskedReconstructionPart(nn.Module):
         
         # Embed
         jet = self.particle_embedder(jet, src_mask=~src_mask)
-        interactions = self.interaction_embedder(interactions, src_mask=~src_mask)
-        
+
         # NaN detection after embeddings (-inf is allowed for attention masking)
         if torch.isnan(jet).any():
             raise RuntimeError(f"NaN after particle embedder!")
-        if torch.isnan(interactions).any():
-            # Count actual NaNs vs -inf (which is expected for masking)
-            nan_mask = torch.isnan(interactions)
-            raise RuntimeError(f"NaN after interaction embedder! Found {nan_mask.sum()} NaN values")
-        
+
+        if self.use_vanilla_attention:
+            interactions = None
+        else:
+            interactions = self.interaction_embedder(interactions, src_mask=~src_mask)
+            if torch.isnan(interactions).any():
+                nan_mask = torch.isnan(interactions)
+                raise RuntimeError(f"NaN after interaction embedder! Found {nan_mask.sum()} NaN values")
+
         B, N, F = jet.shape
-        
+
         # Encode
         memory = jet
-        if self.use_mia_encoder:
+        if self.use_vanilla_attention:
+            # Native flash attention path — no interactions needed
+            for layer in self.encoder_stack:
+                memory = layer(memory, src_key_padding_mask=~src_mask)
+        elif self.use_mia_encoder:
             # Phase 1: MIA blocks with high-dim interactions
             for layer in self.mia_encoder_stack:
                 memory = layer(memory, interactions)

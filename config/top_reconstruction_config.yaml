@@ -50,9 +50,9 @@ tasks:
   # object_type: not registered in chain_queries mode
 
 pretraining:
-  mask_pretrain_epochs: 0   # disabled for R&D — train all tasks from the start
-  tasks: ["mask", "mask_W"]
-  transition_ramp_epochs: 0
+  mask_pretrain_epochs: 20   # disabled for R&D — train all tasks from the start
+  tasks: ["mask_W"]
+  transition_ramp_epochs: 5
 
 
 
@@ -114,6 +114,7 @@ model_parameters:
     use_mia_encoder: False
     n_mia_layers: 0
     mia_interaction_dim: 64
+    use_vanilla_attention: true  # true = skip interaction embedder, use native flash attention encoder (faster R&D)
     use_particle_gating: false  # disabled for clean R&D baseline
     n_gating_layers: 2
     n_gate_queries: 1
