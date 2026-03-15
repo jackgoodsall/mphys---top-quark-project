@@ -1015,13 +1015,14 @@ class ObjectnessTask(BaseTask):
     Binary classification: is this query a real object?
     Runs over ALL Q queries (this is the object-count signal).
 
-    Predictions: "objectness_logit" [B, Q, 1]
+    Predictions: config.output_names[0] (e.g. "objectness_logit" or "objectness_W_logit") [B, Q, 1]
     Targets: derived from targets["classes"] — real=1.0, null=0.0
     """
 
     def __init__(self, config: TaskConfig, null_weight: float = 0.1):
         super().__init__(config)
         self.null_weight = null_weight
+        self.pred_key = config.output_names[0]  # e.g. 'objectness_logit' or 'objectness_W_logit'
         # Detection stats accumulators — GPU buffers so .item() is deferred to
         # get_detection_stats() (called once per epoch, not per step)
         self.register_buffer('_tp_buf', torch.zeros(1, dtype=torch.long), persistent=False)
@@ -1038,13 +1039,13 @@ class ObjectnessTask(BaseTask):
         All real targets have objectness=1 so cost is uniform across T columns.
         Biases the matcher toward queries already predicting "real".
         """
-        if 'objectness_logit' not in predictions:
+        if self.pred_key not in predictions:
             first = next(iter(predictions.values()))
             B, Q = first.shape[:2]
             T = next(iter(targets.values())).shape[1]
             return torch.zeros(B, Q, T, device=first.device)
 
-        pred_logit = predictions['objectness_logit']  # [B, Q, 1]
+        pred_logit = predictions[self.pred_key]  # [B, Q, 1]
         prob_real = pred_logit.squeeze(-1).sigmoid()   # [B, Q]
         neg_log_prob = -torch.log(prob_real.clamp(min=1e-8))  # [B, Q]
 
@@ -1068,11 +1069,11 @@ class ObjectnessTask(BaseTask):
         Real slots (obj_valid=True)  -> weight = 1.0
         Null slots (obj_valid=False) -> weight = null_weight
         """
-        if 'objectness_logit' not in predictions:
+        if self.pred_key not in predictions:
             first = next(iter(predictions.values()))
             return torch.tensor(0.0, device=first.device)
 
-        pred_logit = predictions['objectness_logit'].squeeze(-1)  # [B, Q]
+        pred_logit = predictions[self.pred_key].squeeze(-1)  # [B, Q]
 
         obj_valid = targets.get('obj_valid_mask')
         if obj_valid is None:
@@ -1135,9 +1136,10 @@ class ObjectnessTask(BaseTask):
     def create_test_datasets(self, file: h5py.File, number_events: int):
         """Create HDF5 datasets for objectness predictions."""
         M = self.config.max_objects
-        file.create_dataset("predicted_objectness_logit", shape=(number_events, M), dtype='float32')
-        file.create_dataset("predicted_objectness_prob", shape=(number_events, M), dtype='float32')
-        file.create_dataset("target_objectness", shape=(number_events, M), dtype='float32')
+        prefix = f"predicted_{self.config.name}"
+        file.create_dataset(f"{prefix}_logit", shape=(number_events, M), dtype='float32')
+        file.create_dataset(f"{prefix}_prob", shape=(number_events, M), dtype='float32')
+        file.create_dataset(f"target_{self.config.name}", shape=(number_events, M), dtype='float32')
 
     def save_test_predictions(
         self,
@@ -1148,10 +1150,10 @@ class ObjectnessTask(BaseTask):
         batch_size: int
     ):
         """Save objectness predictions to HDF5."""
-        if 'objectness_logit' not in predictions:
+        if self.pred_key not in predictions:
             return
 
-        pred_logit = predictions['objectness_logit'].squeeze(-1)  # [B, Q]
+        pred_logit = predictions[self.pred_key].squeeze(-1)  # [B, Q]
         pred_prob = pred_logit.sigmoid()
 
         obj_valid = targets.get('obj_valid_mask')
@@ -1161,10 +1163,11 @@ class ObjectnessTask(BaseTask):
             target_obj = torch.ones_like(pred_logit)
 
         M = self.config.max_objects
+        prefix = f"predicted_{self.config.name}"
         end_idx = start_idx + batch_size
-        file["predicted_objectness_logit"][start_idx:end_idx] = pred_logit[:, :M].float().cpu().numpy()
-        file["predicted_objectness_prob"][start_idx:end_idx] = pred_prob[:, :M].float().cpu().numpy()
-        file["target_objectness"][start_idx:end_idx] = target_obj[:, :M].float().cpu().numpy()
+        file[f"{prefix}_logit"][start_idx:end_idx] = pred_logit[:, :M].float().cpu().numpy()
+        file[f"{prefix}_prob"][start_idx:end_idx] = pred_prob[:, :M].float().cpu().numpy()
+        file[f"target_{self.config.name}"][start_idx:end_idx] = target_obj[:, :M].float().cpu().numpy()
 
 
 class ObjectTypeTask(BaseTask):
