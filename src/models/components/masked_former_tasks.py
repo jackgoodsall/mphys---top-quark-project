@@ -228,8 +228,16 @@ class TaskRegistry(nn.Module):
 class MaskReconstructionTask(BaseTask):
     """Task for mask reconstruction"""
 
-    def __init__(self, config: TaskConfig, null_mask_penalty: float = 0.1):
+    def __init__(
+        self,
+        config: TaskConfig,
+        null_mask_penalty: float = 0.1,
+        pred_key: str = 'mask_predictions',
+        target_key: str = 'jet_mask_true',
+    ):
         super().__init__(config)
+        self.pred_key = pred_key
+        self.target_key = target_key
         self.eps = 1e-6  # Increased from 1e-8 for better numerical stability in Dice loss
         self.null_mask_penalty = null_mask_penalty
         # 0.0 = suppressed (during mask-only pretraining), 1.0 = full penalty.
@@ -248,8 +256,8 @@ class MaskReconstructionTask(BaseTask):
         targets: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """Compute mask cost using Dice coefficient"""
-        pred_masks = predictions['mask_predictions'].sigmoid()
-        target_masks = targets['jet_mask_true'].float()
+        pred_masks = predictions[self.pred_key].sigmoid()
+        target_masks = targets[self.target_key].float()
         
         # Handle 2D targets
         if target_masks.ndim == 2:
@@ -278,8 +286,8 @@ class MaskReconstructionTask(BaseTask):
         valid_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Compute mask loss (Dice + BCE)"""
-        pred_masks = predictions['mask_predictions']
-        target_masks = targets['jet_mask_true']
+        pred_masks = predictions[self.pred_key]
+        target_masks = targets[self.target_key]
 
         if target_masks.ndim == 2:
             target_masks = target_masks.unsqueeze(1)
@@ -455,9 +463,9 @@ class MaskReconstructionTask(BaseTask):
         batch_size: int
     ):
         """Save mask predictions to HDF5"""
-        pred_masks_logits = predictions['mask_predictions'].float().cpu().numpy()
-        pred_masks_prob = predictions['mask_predictions'].sigmoid().float().cpu().numpy()
-        target_masks = targets['jet_mask_true'].float().cpu().numpy()
+        pred_masks_logits = predictions[self.pred_key].float().cpu().numpy()
+        pred_masks_prob = predictions[self.pred_key].sigmoid().float().cpu().numpy()
+        target_masks = targets[self.target_key].float().cpu().numpy()
         jet_valid_mask = targets.get('jet_valid_mask')
         
         # Handle 2D targets

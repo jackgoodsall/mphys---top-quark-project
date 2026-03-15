@@ -1,6 +1,8 @@
+import os
 import math
 import lightning
 from lightning import Trainer
+from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics import Accuracy
 from torchmetrics.classification import BinaryAccuracy
 import torch
@@ -487,6 +489,7 @@ class ReconstructionTrainer(lightning.LightningModule):
             save_targets = targets
             predictions = layer_dict
 
+
         batch_size = predictions[list(predictions.keys())[0]].shape[0]
 
         for task_name, task in self.task_registry.tasks.items():
@@ -665,6 +668,11 @@ def train_reconstruction_model(
     log_dir = config.get("model_artefacts", {}).get("log_dir", "lightning_logs")
     grad_clip = config.get("model_training", {}).get("gradient_clip_val", 1.0)
     precision = config.get("model_training", {}).get("precision", "32-true")
+
+    if logger is None:
+        slurm_id = os.environ.get("SLURM_JOB_ID")
+        version = int(slurm_id) if slurm_id else None
+        logger = TensorBoardLogger(log_dir, version=version)
 
     lightning_trainer = lightning.Trainer(
         num_nodes=1,
