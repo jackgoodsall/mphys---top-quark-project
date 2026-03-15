@@ -130,6 +130,34 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         task_registry.register_task(mask_W_task)
 
     # ========================================
+    # W Objectness Task (chain_queries: W-phase objectness signal)
+    # ========================================
+    if chain_queries:
+        obj_W_config = task_configs.get("objectness_W", {})
+
+        obj_W_layer_weights = _build_layer_weights(
+            layer_config=obj_W_config.get('layer_weights'),
+            strategy=obj_W_config.get('layer_weight_strategy'),
+            strategy_params=obj_W_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers,
+        )
+
+        objectness_W_task = ObjectnessTask(
+            TaskConfig(
+                name='objectness_W',
+                output_names=['objectness_W_logit'],
+                output_dims={'objectness_W_logit': 1},
+                cost_weights={'objectness': obj_W_config.get('cost_weight', 0.0)},
+                loss_weights={'objectness': obj_W_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=obj_W_layer_weights,
+                head_norm=obj_W_config.get('head_norm', True),
+            ),
+            null_weight=obj_W_config.get('null_weight', 0.2)
+        )
+        task_registry.register_task(objectness_W_task)
+
+    # ========================================
     # Objectness Task (is this query a real object?)
     # ========================================
     obj_config = task_configs.get("objectness", {})
