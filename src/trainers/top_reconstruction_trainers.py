@@ -489,6 +489,7 @@ class ReconstructionTrainer(lightning.LightningModule):
             save_targets = targets
             predictions = layer_dict
 
+
         batch_size = predictions[list(predictions.keys())[0]].shape[0]
 
         for task_name, task in self.task_registry.tasks.items():

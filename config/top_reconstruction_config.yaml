@@ -142,11 +142,11 @@ model_training:
     type: "warmup_cosine"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
     # WarmupCosine params (type=warmup_cosine):
     warmup_epochs: 3       # linear ramp 0 → lr over this many epochs
-    T_max: 50               # total epochs for cosine decay
+    T_max: 100               # total epochs for cosine decay
     eta_min: 1e-6           # floor LR at end of cosine decay
     update_interval: "step" # "step" (every batch) or "epoch" (once per epoch)
-    lr_rewarmup_epochs: 3       # re-warmup from reduced LR at phase transition; 0 = disabled
-    lr_rewarmup_fraction: 0.3   # start re-warmup at this fraction of base LR
+    lr_rewarmup_epochs: 5      # re-warmup from reduced LR at phase transition; 0 = disabled
+    lr_rewarmup_fraction: 1.5   # start re-warmup at this fraction of base LR
     # ReduceLROnPlateau params (type=plateau):
     factor: 0.5             # halve LR on plateau
     patience: 3             # epochs without improvement before reducing
@@ -168,13 +168,13 @@ training_callbacks:
 
   early_stopping:
     monitor: "val_loss"
-    patience: 15   # long enough to survive the pretraining→multi-task phase transition
+    patience: 20  # long enough to survive the pretraining→multi-task phase transition
     min_delta: 0.0001
     mode: "min"
 
 inference:
   mode: "train"              # "train" | "test" | "resume" | "lr_find"
-  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_11711973/checkpoints/epoch=epoch=186-val_loss=val_loss=0.7130.ckpt"
+  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_12138448/checkpoints/epoch=epoch=19-val_loss=val_loss=0.6539.ckpt"
 
 model_artefacts:
   log_dir: "masked_reconstruction"

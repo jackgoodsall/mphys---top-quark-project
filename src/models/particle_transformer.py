@@ -463,6 +463,14 @@ class MaskedReconstructionPart(nn.Module):
                 layer_outputs[layer_id] = self._compute_layer_outputs(
                     top_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
 
+            # Fix: _compute_layer_outputs forces all heads at the final layer,
+            # so mask_W gets recomputed using top-decoder queries (wrong).
+            # Replace it with the correct mask_W from the W-phase final layer.
+            w_phase_final = n_w_layers - 1
+            final_top_layer = n_w_layers + len(self.top_decoder_stack) - 1
+            if 'mask_W' in layer_outputs.get(w_phase_final, {}):
+                layer_outputs[final_top_layer]['mask_W'] = layer_outputs[w_phase_final]['mask_W']
+
         elif self.hierarchical_decoding:
             # --- Original 4-query hierarchical decode (top + W split) ---
             w_tgt = tgt[:, self.n_top_queries:, :]   # [B, Q_W, D]

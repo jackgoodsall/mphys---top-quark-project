@@ -1,0 +1,830 @@
+"""
+Evaluate top/W/ttbar reconstruction efficiency from saved test outputs
+for chain_queries models.
+
+In chain_queries mode there is no object_type task — type is implicit:
+  - test_outputs_mask.h5   → top predictions  [N, Q, P]
+  - test_outputs_mask_W.h5 → W predictions    [N, Q, P]
+  - test_outputs_objectness.h5 → objectness   [N, Q]  (one score per chain query)
+
+Each query token is a full chain (top + W pair).  A chain is "real" when
+the W-mask target has ≥1 assigned particle (matching target_objectness).
+
+Usage:
+    python analysis/evaluate_chain.py --run_dir <path/to/version_X>
+    python analysis/evaluate_chain.py --run_dir <path/to/version_X> --plot
+    python analysis/evaluate_chain.py --run_dir <path/to/version_X> \\
+        --data_file <path/to/ttbar_preprocessed_test.h5> --plot
+
+Custom threshold (overrides the default 0.0 for logits / 0.5 for probs):
+    python analysis/evaluate_chain.py --run_dir ... --threshold 0.3
+    python analysis/evaluate_chain.py --run_dir ... --use_probs --threshold 0.6
+
+Prior-based binarisation (top-k particles per mask type):
+    python analysis/evaluate_chain.py --run_dir ... --prior top=3 W=2
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import h5py
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
+    """Load all arrays needed for efficiency evaluation."""
+
+    mask_top_path = run_dir / "test_outputs_mask.h5"
+    mask_W_path   = run_dir / "test_outputs_mask_W.h5"
+    obj_path      = run_dir / "test_outputs_objectness.h5"
+
+    for p in (mask_top_path, mask_W_path, obj_path):
+        if not p.exists():
+            sys.exit(f"ERROR: required file not found: {p}")
+
+    scores_key = "predicted_masks_prob" if use_probs else "predicted_masks_logits"
+
+    with h5py.File(mask_top_path, "r") as f:
+        if scores_key not in f:
+            sys.exit(f"ERROR: key '{scores_key}' not found in {mask_top_path}")
+        pred_scores_top = f[scores_key][:]                # [N, Q, P]
+        target_masks_top = f["target_masks"][:]            # [N, Q, P]
+        jet_valid = f["jet_valid_mask"][:] if "jet_valid_mask" in f else None
+
+    with h5py.File(mask_W_path, "r") as f:
+        if scores_key not in f:
+            sys.exit(f"ERROR: key '{scores_key}' not found in {mask_W_path}")
+        pred_scores_W = f[scores_key][:]                  # [N, Q, P]
+        target_masks_W = f["target_masks"][:]              # [N, Q, P]
+
+    with h5py.File(obj_path, "r") as f:
+        target_obj = f["target_objectness"][:]             # [N, Q]
+        pred_obj_key = "predicted_objectness_prob" if use_probs else "predicted_objectness_logit"
+        pred_obj = f[pred_obj_key][:] if pred_obj_key in f else None
+
+    # Fall back to external data file for src_mask
+    if jet_valid is None:
+        if data_file is None:
+            sys.exit(
+                "ERROR: 'jet_valid_mask' not found in test_outputs_mask.h5 and "
+                "--data_file was not provided.\n"
+                "Re-run with --data_file pointing to the corresponding HDF5 data file."
+            )
+        if not data_file.exists():
+            sys.exit(f"ERROR: data file not found: {data_file}")
+        with h5py.File(data_file, "r") as f:
+            if "src_mask" not in f:
+                sys.exit(f"ERROR: 'src_mask' key not found in {data_file}")
+            jet_valid = f["src_mask"][:]
+        N_run = pred_scores_top.shape[0]
+        N_data = jet_valid.shape[0]
+        if N_data != N_run:
+            sys.exit(
+                f"ERROR: event count mismatch — run has {N_run} events but "
+                f"data file has {N_data}. Make sure you are using the correct test split."
+            )
+
+    # Load original (pre-signal-jet-filtering) multiplicities if available
+    orig_mult_path = run_dir / "event_multiplicities.npz"
+    original_mult = None
+    if orig_mult_path.exists():
+        d = np.load(orig_mult_path)
+        original_mult = d["original_mult"].astype(int)
+
+    return (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+            jet_valid, target_obj, pred_obj, original_mult)
+
+
+# ---------------------------------------------------------------------------
+# Prediction binarisation
+# ---------------------------------------------------------------------------
+
+def binarise_predictions(scores, jet_valid, prior_k, use_probs, threshold=None):
+    """
+    Convert raw scores to a binary [N, Q, P] prediction array.
+
+    Default threshold: 0.0 for logits, 0.5 for probs.
+    Pass an explicit `threshold` to override the default.
+
+    prior_k: int or None
+        If given, select exactly the k highest-scoring *valid* particles
+        per slot instead of thresholding.
+    """
+    N, Q, P = scores.shape
+    valid = jet_valid.astype(bool)                        # [N, P]
+
+    if threshold is None:
+        threshold = 0.5 if use_probs else 0.0
+
+    if prior_k is not None:
+        # Mask padding positions to -inf so they are never top-k selected
+        masked_scores = np.where(valid[:, np.newaxis, :], scores, -np.inf)
+        topk_idx = np.argsort(masked_scores, axis=-1)[:, :, -prior_k:]  # [N, Q, k]
+        pred_bin = np.zeros((N, Q, P), dtype=bool)
+        np.put_along_axis(pred_bin, topk_idx, True, axis=-1)
+        pred_bin &= valid[:, np.newaxis, :]
+    else:
+        pred_bin = (scores > threshold).copy()
+
+    return pred_bin
+
+
+# ---------------------------------------------------------------------------
+# Core efficiency computation
+# ---------------------------------------------------------------------------
+
+def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, is_perfect_top, is_perfect_W,
+                       all_tops_perfect, all_Ws_perfect, pred_real):
+    """Compute per-multiplicity efficiency/purity rows for a given multiplicity array."""
+    mult_values = sorted(np.unique(multiplicity_arr).tolist())
+    breakdown = {}
+    for m in mult_values:
+        sel = multiplicity_arr == m
+        n_sel = sel.sum()
+        if n_sel == 0:
+            continue
+
+        ir  = is_real[sel]
+        teg = top_eff_gate[sel]
+        ipt = is_perfect_top[sel]
+        ipw = is_perfect_W[sel]
+
+        has_W     = ir.any(axis=1)
+        both_tops = ir.sum(axis=1) == 2
+
+        n_top_correct = int((teg & ipt).sum())
+        n_top_total   = int(teg.sum())
+        hw = int(has_W.sum())
+        bt = int(both_tops.sum())
+
+        row = {
+            "n_events":  int(n_sel),
+            "top_eff":   float(n_top_correct / max(n_top_total, 1)),
+            "W_eff":     float((all_Ws_perfect[sel] & has_W).sum() / max(hw, 1)),
+            "ttbar_eff": float((all_tops_perfect[sel] & both_tops).sum() / max(bt, 1)),
+            "n_top":     n_top_total,
+            "n_W":       hw,
+            "n_ttbar":   bt,
+        }
+
+        if pred_real is not None:
+            pr = pred_real[sel]
+            n_pr = int(pr.sum())
+            row["top_purity"]       = float((pr & ir & ipt).sum() / max(n_pr, 1))
+            row["W_purity"]         = float((pr & ir & ipw).sum() / max(n_pr, 1))
+            pr_both = pr.sum(axis=1) >= 2
+            n_pr_both = int(pr_both.sum())
+            both_ok = (pr & ir & ipt).sum(axis=1) == 2
+            row["ttbar_purity"]     = float((pr_both & both_ok).sum() / max(n_pr_both, 1))
+            row["n_pred_real"]      = n_pr
+            row["n_pred_both_tops"] = n_pr_both
+
+        breakdown[m] = row
+    return breakdown
+
+
+def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+                         jet_valid, target_obj, pred_obj=None,
+                         prior_top=None, prior_W=None, use_probs=False,
+                         threshold=None, strict=False, joint=False, original_mult=None):
+    """
+    Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
+
+    Chain queries: each query predicts both a top mask and a W mask.
+    A chain is "real" when the W-mask target has ≥1 assigned particle.
+    """
+    N, Q, P = pred_scores_top.shape
+
+    # Chain is real if W target has particles
+    is_real = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
+    n_real  = is_real.sum(axis=1)                          # [N]
+
+    valid = jet_valid[:, np.newaxis, :].astype(bool)       # [N, 1, P]
+
+    # Binarise top and W masks separately
+    pred_bin_top = binarise_predictions(
+        pred_scores_top, jet_valid, prior_top, use_probs, threshold=threshold
+    )
+    pred_bin_W = binarise_predictions(
+        pred_scores_W, jet_valid, prior_W, use_probs, threshold=threshold
+    )
+
+    # Slot-level correctness
+    target_top_b = target_masks_top.astype(bool)
+    target_W_b   = target_masks_W.astype(bool)
+
+    mismatch_top     = (pred_bin_top != target_top_b) & valid
+    mismatch_W       = (pred_bin_W   != target_W_b)   & valid
+    slot_perfect_top = mismatch_top.sum(axis=2) == 0       # [N, Q]
+    slot_perfect_W   = mismatch_W.sum(axis=2) == 0         # [N, Q]
+
+    # In joint mode, top is only correct if its associated W is also correct.
+    # W condition is vacuously satisfied for chains with no real W target.
+    if joint:
+        slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real)
+
+    # In strict mode, also require objectness head to predict the slot as real
+    pred_real = None
+    if strict and pred_obj is not None:
+        obj_thresh = 0.5 if use_probs else 0.0
+        pred_real = pred_obj > obj_thresh
+        detected_top = slot_perfect_top & pred_real
+        detected_W   = slot_perfect_W   & pred_real
+    else:
+        detected_top = slot_perfect_top
+        detected_W   = slot_perfect_W
+
+    # Event-level aggregates — use is_real (W-based) as the chain gate throughout
+    all_tops_perfect = ((~is_real) | detected_top).all(axis=1)   # [N]
+    all_Ws_perfect   = ((~is_real) | detected_W).all(axis=1)     # [N]
+    perfect_all      = ((~is_real) | (detected_top & detected_W)).all(axis=1)
+
+    has_W     = is_real.any(axis=1)
+    both_tops = n_real == 2
+
+    # Top efficiency gate: is_real (W-based) by default, matching original behaviour.
+    # When prior_top is given, further restrict to chains where the top target has
+    # exactly prior_top particles — chains with fewer particles always fail the prior
+    # (b-jet outside acceptance etc.) and should not count against efficiency.
+    if prior_top is not None:
+        top_counts    = target_top_b.sum(axis=-1)          # [N, Q]
+        top_eff_gate  = is_real & (top_counts == prior_top)
+    else:
+        top_eff_gate  = is_real
+
+    n_top_correct = (top_eff_gate & detected_top).sum()
+    n_top_total   = top_eff_gate.sum()
+
+    # W efficiency: event-level — all Ws correct among events with ≥1 real chain
+    # ttbar efficiency: event-level — both tops correct among events with exactly 2 real chains
+    top_eff   = n_top_correct / max(n_top_total, 1)
+    W_eff     = (all_Ws_perfect & has_W).sum()     / max(has_W.sum(),     1)
+    ttbar_eff = (all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)
+    all_eff   = perfect_all.sum()                    / len(perfect_all)
+
+    # ── Purity (from objectness predictions) ──
+    obj_purity       = None
+    ttbar_purity     = None
+    n_pred_real      = None
+    top_purity       = None
+    W_purity         = None
+    n_pred_both_tops = None
+    if pred_obj is not None:
+        obj_thresh = 0.5 if use_probs else 0.0
+        pred_real  = pred_obj > obj_thresh                     # [N, Q]
+        n_pred_real = int(pred_real.sum())
+
+        # Of predicted-real chains, fraction that are actually real
+        obj_purity = float((pred_real & is_real).sum() / max(n_pred_real, 1))
+
+        # Top purity: of predicted-real chains, fraction with perfect top mask
+        top_purity = float((pred_real & is_real & slot_perfect_top).sum()
+                           / max(n_pred_real, 1))
+
+        # W purity: of predicted-real chains, fraction with perfect W mask
+        W_purity = float((pred_real & is_real & slot_perfect_W).sum()
+                         / max(n_pred_real, 1))
+
+        # ttbar purity: events with ≥2 chains predicted real, both tops correct
+        pred_both_tops   = pred_real.sum(axis=1) >= 2
+        n_pred_both_tops = int(pred_both_tops.sum())
+        both_tops_correct = (pred_real & is_real & slot_perfect_top).sum(axis=1) == 2
+        ttbar_purity = float((pred_both_tops & both_tops_correct).sum()
+                             / max(n_pred_both_tops, 1))
+
+    # Per-multiplicity breakdown (by signal jet count)
+    multiplicity = jet_valid.sum(axis=1).astype(int)
+    breakdown = _compute_breakdown(
+        multiplicity, is_real, top_eff_gate, detected_top, detected_W,
+        all_tops_perfect, all_Ws_perfect, pred_real,
+    )
+
+    # Per-original-multiplicity breakdown
+    breakdown_orig = {}
+    if original_mult is not None:
+        breakdown_orig = _compute_breakdown(
+            original_mult, is_real, top_eff_gate, detected_top, detected_W,
+            all_tops_perfect, all_Ws_perfect, pred_real,
+        )
+
+    return {
+        "N": N,
+        "Q": Q,
+        "P": P,
+        "top_eff":   float(top_eff),
+        "W_eff":     float(W_eff),
+        "ttbar_eff": float(ttbar_eff),
+        "all_eff":   float(all_eff),
+        "obj_purity":       obj_purity,
+        "ttbar_purity":     ttbar_purity,
+        "top_purity":       top_purity,
+        "W_purity":         W_purity,
+        "n_pred_real":      n_pred_real,
+        "n_pred_both_tops": n_pred_both_tops,
+        "n_has_top":   int(n_top_total),   # chains with non-empty top target
+        "n_has_W":     int(has_W.sum()),
+        "n_both_tops": int(both_tops.sum()),
+        "breakdown":      breakdown,
+        "breakdown_orig": breakdown_orig,
+        "prior_top":   prior_top,
+        "prior_W":     prior_W,
+        "use_probs":   use_probs,
+        "threshold":   threshold if threshold is not None else (0.5 if use_probs else 0.0),
+        "strict":      strict,
+        "joint":       joint,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Text output
+# ---------------------------------------------------------------------------
+
+def print_results(run_dir: Path, results: dict):
+    N  = results["N"]
+    Q  = results["Q"]
+    P  = results["P"]
+    br = results["breakdown"]
+
+    prior_parts = []
+    if results["prior_top"] is not None:
+        prior_parts.append(f"top={results['prior_top']}")
+    if results["prior_W"] is not None:
+        prior_parts.append(f"W={results['prior_W']}")
+    prior_str = ", ".join(prior_parts) if prior_parts else f"threshold={results['threshold']}"
+    scores_str = "probs" if results["use_probs"] else "logits"
+
+    print(f"\n=== Evaluation (chain_queries): {run_dir} ===")
+    print(f"Events: {N:,}  |  Query slots Q: {Q}  |  Particles P: {P}")
+    print(f"Scores: {scores_str}  |  Binarisation: {prior_str}\n")
+
+    mode_parts = []
+    if results.get("strict"):
+        mode_parts.append("strict: pred_real & correct mask / N_real")
+    else:
+        mode_parts.append("recall: N_correct / N_real")
+    if results.get("joint"):
+        mode_parts.append("joint: top correct only if W also correct")
+    print(f"EFFICIENCY SUMMARY ({'; '.join(mode_parts)})")
+    print("─" * 70)
+    top_label = "top+W masks correct" if results.get("joint") else "top mask correct"
+    print(f"  Top efficiency     (per chain, {top_label}):  {results['top_eff']*100:6.2f}%   (N={results['n_has_top']:,} chains)")
+    print(f"  W efficiency       (>=1 chain, all W masks correct):   {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,})")
+    print(f"  ttbar efficiency   (exactly 2 chains, both correct):   {results['ttbar_eff']*100:6.2f}%   (N={results['n_both_tops']:,})")
+    print("─" * 70)
+    print(f"  All-object efficiency:                                  {results['all_eff']*100:6.2f}%   (N={N:,})")
+
+    if results.get("obj_purity") is not None:
+        print(f"\nPURITY SUMMARY (N_correct_predicted / N_all_predicted)")
+        print("─" * 70)
+        print(f"  Object purity      (pred real & actual real / pred real):       {results['obj_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
+        print(f"  Top purity         (pred real & perfect top / pred real):       {results['top_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
+        print(f"  W purity           (pred real & perfect W / pred real):         {results['W_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
+        print(f"  ttbar purity       (both tops correct / pred >=2 real):         {results['ttbar_purity']*100:5.2f}%   (N_pred_2t={results['n_pred_both_tops']:,})")
+        print("─" * 70)
+
+    def _print_mult_table(label, table):
+        if not table:
+            return
+        print(f"\n{label}")
+        header = f"  {'Jets':>5}   {'Top eff':>8}   {'W eff':>8}   {'ttbar eff':>9}   {'Events':>8}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for m, row in sorted(table.items()):
+            print(
+                f"  {m:>5}   {row['top_eff']*100:>7.2f}%   "
+                f"{row['W_eff']*100:>7.2f}%   "
+                f"{row['ttbar_eff']*100:>8.2f}%   "
+                f"{row['n_events']:>8,}"
+            )
+
+    _print_mult_table("EFFICIENCY BY SIGNAL JET MULTIPLICITY (jets fed to model)", br)
+    _print_mult_table("EFFICIENCY BY ORIGINAL JET MULTIPLICITY (all jets in event)", results.get("breakdown_orig", {}))
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+def _agg_bin(br: dict, mult_keys):
+    """Aggregate efficiency across a set of multiplicity keys using weighted average."""
+    n_top = sum(br[m]["n_top"]   for m in mult_keys if m in br)
+    n_W   = sum(br[m]["n_W"]     for m in mult_keys if m in br)
+    n_tt  = sum(br[m]["n_ttbar"] for m in mult_keys if m in br)
+    top_eff   = sum(br[m]["top_eff"]   * br[m]["n_top"]   for m in mult_keys if m in br) / max(n_top, 1)
+    W_eff     = sum(br[m]["W_eff"]     * br[m]["n_W"]     for m in mult_keys if m in br) / max(n_W,   1)
+    ttbar_eff = sum(br[m]["ttbar_eff"] * br[m]["n_ttbar"] for m in mult_keys if m in br) / max(n_tt,  1)
+    n_events  = sum(br[m]["n_events"]  for m in mult_keys if m in br)
+    return {"top_eff": top_eff, "W_eff": W_eff, "ttbar_eff": ttbar_eff, "n_events": n_events}
+
+
+def _agg_purity_bin(br: dict, mult_keys):
+    """Aggregate purity across a set of multiplicity keys using weighted average."""
+    n_pr      = sum(br[m]["n_pred_real"]       for m in mult_keys if m in br)
+    n_pr_both = sum(br[m]["n_pred_both_tops"]  for m in mult_keys if m in br)
+    top   = sum(br[m]["top_purity"]   * br[m]["n_pred_real"]       for m in mult_keys if m in br) / max(n_pr,      1)
+    W     = sum(br[m]["W_purity"]     * br[m]["n_pred_real"]       for m in mult_keys if m in br) / max(n_pr,      1)
+    ttbar = sum(br[m]["ttbar_purity"] * br[m]["n_pred_both_tops"]  for m in mult_keys if m in br) / max(n_pr_both, 1)
+    n_events = sum(br[m]["n_events"] for m in mult_keys if m in br)
+    return {"top_purity": top, "W_purity": W, "ttbar_purity": ttbar,
+            "n_pred_both_tops": n_pr_both, "n_events": n_events}
+
+
+def make_plots(run_dir: Path, results: dict):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: matplotlib not available — skipping plots.")
+        return
+
+    br = results["breakdown"]
+
+    # 1. Grouped bar chart: Top / W / ttbar efficiency in bins 6, 7, >=8, All
+    all_mults = sorted(br.keys())
+    ge8_keys  = [m for m in all_mults if m >= 8]
+
+    bins = {
+        "6 jets":  _agg_bin(br, [6]),
+        "7 jets":  _agg_bin(br, [7]),
+        "\u22658 jets": _agg_bin(br, ge8_keys),
+        "All":     {
+            "top_eff":   results["top_eff"],
+            "W_eff":     results["W_eff"],
+            "ttbar_eff": results["ttbar_eff"],
+            "n_events":  results["N"],
+        },
+    }
+
+    bin_labels    = list(bins.keys())
+    metric_labels = ["Top", "W", "ttbar"]
+    metric_keys   = ["top_eff", "W_eff", "ttbar_eff"]
+    colors        = ["#4c72b0", "#dd8452", "#55a868"]
+
+    n_bins    = len(bin_labels)
+    n_metrics = len(metric_labels)
+    bar_width = 0.22
+    x = np.arange(n_bins)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for i, (metric, key, color) in enumerate(zip(metric_labels, metric_keys, colors)):
+        offsets = x + (i - (n_metrics - 1) / 2) * bar_width
+        vals    = [bins[b][key] * 100 for b in bin_labels]
+        bars    = ax.bar(offsets, vals, width=bar_width, label=metric, color=color)
+        for bar, val in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2, val + 0.8,
+                f"{val:.1f}%", ha="center", va="bottom", fontsize=7, rotation=90,
+            )
+
+    bin_counts = [f"{bins[b]['n_events']:,}" for b in bin_labels]
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{lbl}\n(N={n})" for lbl, n in zip(bin_labels, bin_counts)])
+    ax.set_ylabel("Efficiency (%)")
+    ax.set_title("Chain Queries: Reconstruction Efficiency by Jet Multiplicity Bin")
+    ax.set_ylim(0, 115)
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    out = run_dir / "eval_efficiency_summary.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+    def _plot_eff_vs_mult(ax, table, xlabel, title):
+        mults      = sorted(table.keys())
+        top_effs   = [table[m]["top_eff"]   * 100 for m in mults]
+        W_effs     = [table[m]["W_eff"]     * 100 for m in mults]
+        ttbar_effs = [table[m]["ttbar_eff"] * 100 for m in mults]
+        ax.plot(mults, top_effs,   "o-", label="Top efficiency",   color="#4c72b0")
+        ax.plot(mults, W_effs,     "s-", label="W efficiency",     color="#dd8452")
+        ax.plot(mults, ttbar_effs, "^-", label="ttbar efficiency", color="#55a868")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Efficiency (%)")
+        ax.set_title(title)
+        ax.legend()
+        ax.set_ylim(0, 105)
+        ax.grid(True, alpha=0.3)
+
+    # 2. Efficiency vs multiplicity
+    br_orig = results.get("breakdown_orig", {})
+    if br or br_orig:
+        n_panels = (1 if br else 0) + (1 if br_orig else 0)
+        fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 4), squeeze=False)
+        panel = 0
+        if br:
+            _plot_eff_vs_mult(axes[0, panel], br,
+                              "Number of signal jets (fed to model)",
+                              "Chain Queries: Efficiency vs Signal Jet Multiplicity")
+            panel += 1
+        if br_orig:
+            _plot_eff_vs_mult(axes[0, panel], br_orig,
+                              "Number of jets in full event (original multiplicity)",
+                              "Chain Queries: Efficiency vs Original Jet Multiplicity")
+        fig.tight_layout()
+        out = run_dir / "eval_efficiency_vs_multiplicity.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+    # ── Purity plots (only when objectness predictions are available) ──
+    has_purity = br and "ttbar_purity" in next(iter(br.values()))
+    if has_purity:
+        # 3. Grouped bar chart: Top / W / ttbar purity in bins 6, 7, >=8, All
+        purity_bins = {
+            "6 jets":  _agg_purity_bin(br, [6]),
+            "7 jets":  _agg_purity_bin(br, [7]),
+            "\u22658 jets": _agg_purity_bin(br, ge8_keys),
+            "All":     {
+                "top_purity":       results["top_purity"],
+                "W_purity":         results["W_purity"],
+                "ttbar_purity":     results["ttbar_purity"],
+                "n_pred_both_tops": results["n_pred_both_tops"],
+                "n_events":         results["N"],
+            },
+        }
+
+        p_bin_labels    = list(purity_bins.keys())
+        p_metric_labels = ["Top", "W", "ttbar"]
+        p_metric_keys   = ["top_purity", "W_purity", "ttbar_purity"]
+        p_colors        = ["#4c72b0", "#dd8452", "#55a868"]
+
+        n_p_bins    = len(p_bin_labels)
+        n_p_metrics = len(p_metric_labels)
+        p_bar_width = 0.22
+        xp = np.arange(n_p_bins)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for i, (metric, key, color) in enumerate(zip(p_metric_labels, p_metric_keys, p_colors)):
+            offsets = xp + (i - (n_p_metrics - 1) / 2) * p_bar_width
+            vals    = [purity_bins[b][key] * 100 for b in p_bin_labels]
+            bars    = ax.bar(offsets, vals, width=p_bar_width, label=metric, color=color)
+            for bar, val in zip(bars, vals):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2, val + 0.8,
+                    f"{val:.1f}%", ha="center", va="bottom", fontsize=7, rotation=90,
+                )
+
+        p_bin_counts = [f"{purity_bins[b]['n_events']:,}" for b in p_bin_labels]
+        ax.set_xticks(xp)
+        ax.set_xticklabels([f"{lbl}\n(N={n})" for lbl, n in zip(p_bin_labels, p_bin_counts)])
+        ax.set_ylabel("Purity (%)")
+        ax.set_title("Chain Queries: Reconstruction Purity by Jet Multiplicity Bin")
+        ax.set_ylim(0, 115)
+        ax.legend()
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        out = run_dir / "eval_purity_summary.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+        # 4. Purity vs multiplicity
+        mults = sorted(br.keys())
+        top_purities   = [br[m]["top_purity"]   * 100 for m in mults]
+        W_purities     = [br[m]["W_purity"]     * 100 for m in mults]
+        ttbar_purities = [br[m]["ttbar_purity"] * 100 for m in mults]
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(mults, top_purities,   "o-", label="Top purity",   color="#4c72b0")
+        ax.plot(mults, W_purities,     "s-", label="W purity",     color="#dd8452")
+        ax.plot(mults, ttbar_purities, "^-", label="ttbar purity", color="#55a868")
+        ax.set_xlabel("Number of valid jets (multiplicity)")
+        ax.set_ylabel("Purity (%)")
+        ax.set_title("Chain Queries: Reconstruction Purity vs Jet Multiplicity")
+        ax.legend()
+        ax.set_ylim(0, 105)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        out = run_dir / "eval_purity_vs_multiplicity.png"
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+
+# ---------------------------------------------------------------------------
+# Threshold sweep
+# ---------------------------------------------------------------------------
+
+def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+                                  jet_valid, target_obj, use_probs=False,
+                                  t_min=None, t_max=None, n_steps=100,
+                                  prior_top=None, prior_W=None, joint=False):
+    """
+    Evaluate efficiency metrics across a range of thresholds.
+
+    Returns arrays (thresholds, top_effs, W_effs, ttbar_effs) each of length n_steps.
+    """
+    if t_min is None:
+        t_min = 0.0 if use_probs else -5.0
+    if t_max is None:
+        t_max = 1.0 if use_probs else 5.0
+
+    thresholds = np.linspace(t_min, t_max, n_steps)
+
+    # Pre-compute masks that don't depend on threshold
+    is_real      = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
+    n_real       = is_real.sum(axis=1)
+    has_W        = is_real.any(axis=1)
+    both_tops    = n_real == 2
+    valid        = jet_valid[:, np.newaxis, :].astype(bool)
+    target_top_b = target_masks_top.astype(bool)
+    target_W_b   = target_masks_W.astype(bool)
+    if prior_top is not None:
+        top_eff_gate = is_real & (target_top_b.sum(axis=-1) == prior_top)
+    else:
+        top_eff_gate = is_real
+    n_top_total  = int(top_eff_gate.sum())
+
+    top_effs, W_effs, ttbar_effs = [], [], []
+
+    for t in thresholds:
+        pred_bin_top = binarise_predictions(
+            pred_scores_top, jet_valid, prior_top, use_probs, threshold=t
+        )
+        pred_bin_W = binarise_predictions(
+            pred_scores_W, jet_valid, prior_W, use_probs, threshold=t
+        )
+
+        slot_perfect_top = ((pred_bin_top != target_top_b) & valid).sum(axis=2) == 0
+        slot_perfect_W   = ((pred_bin_W   != target_W_b)   & valid).sum(axis=2) == 0
+
+        if joint:
+            slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real)
+
+        all_tops_perfect = ((~is_real) | slot_perfect_top).all(axis=1)
+        all_Ws_perfect   = ((~is_real) | slot_perfect_W).all(axis=1)
+
+        n_top_correct = (top_eff_gate & slot_perfect_top).sum()
+
+        top_effs.append(float(n_top_correct / max(n_top_total, 1)))
+        W_effs.append(float((all_Ws_perfect & has_W).sum() / max(has_W.sum(), 1)))
+        ttbar_effs.append(float((all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)))
+
+    return np.array(thresholds), np.array(top_effs), np.array(W_effs), np.array(ttbar_effs)
+
+
+def plot_threshold_sweep(run_dir: Path, thresholds, top_effs, W_effs, ttbar_effs,
+                         use_probs=False):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: matplotlib not available — skipping threshold sweep plot.")
+        return
+
+    x_label = "Threshold (probability)" if use_probs else "Threshold (logit)"
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(thresholds, ttbar_effs * 100, "^-", label="ttbar efficiency", color="#55a868", lw=1.5)
+    ax.plot(thresholds, top_effs   * 100, "o-", label="Top efficiency",   color="#4c72b0", lw=1.5)
+    ax.plot(thresholds, W_effs     * 100, "s-", label="W efficiency",     color="#dd8452", lw=1.5)
+
+    best_idx = np.argmax(ttbar_effs)
+    ax.axvline(thresholds[best_idx], color="#55a868", linestyle="--", alpha=0.6,
+               label=f"Best ttbar @ {thresholds[best_idx]:.3f} ({ttbar_effs[best_idx]*100:.1f}%)")
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Efficiency (%)")
+    ax.set_title("Chain Queries: Efficiency vs Binarisation Threshold")
+    ax.set_ylim(0, 105)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    out = run_dir / "eval_threshold_sweep.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+    print(f"  Best ttbar efficiency: {ttbar_effs[best_idx]*100:.2f}% at threshold={thresholds[best_idx]:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compute top/W/ttbar reconstruction efficiency from chain_queries test outputs."
+    )
+    parser.add_argument(
+        "--run_dir", required=True, type=Path,
+        help="Path to lightning_logs/version_X directory containing test_outputs_*.h5"
+    )
+    parser.add_argument(
+        "--data_file", default=None, type=Path,
+        help="HDF5 data file with 'src_mask' key (required if jet_valid_mask absent in outputs)"
+    )
+    parser.add_argument(
+        "--plot", action="store_true",
+        help="Save PNG efficiency plots to --run_dir"
+    )
+    parser.add_argument(
+        "--use_probs", action="store_true",
+        help="Use saved sigmoid probabilities instead of raw logits (default threshold 0.5)"
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=None, metavar="T",
+        help=(
+            "Binarisation threshold applied to scores (logits or probs). "
+            "Overrides the default (0.0 for logits, 0.5 for probs). "
+            "Ignored when --prior is used for the corresponding mask type."
+        ),
+    )
+    parser.add_argument(
+        "--threshold_sweep", action="store_true",
+        help="Plot efficiency vs threshold curve (saved to --run_dir)"
+    )
+    parser.add_argument(
+        "--sweep_range", nargs=2, type=float, metavar=("MIN", "MAX"), default=None,
+        help=(
+            "Threshold range for sweep. "
+            "Defaults: [0, 1] for probs, [-5, 5] for logits."
+        ),
+    )
+    parser.add_argument(
+        "--sweep_steps", type=int, default=100, metavar="N",
+        help="Number of threshold steps in the sweep (default: 100)"
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="Require objectness prediction to also mark the slot as real for efficiency metrics"
+    )
+    parser.add_argument(
+        "--joint", action="store_true",
+        help="Count a top as correctly reconstructed only if its associated W is also correct"
+    )
+    parser.add_argument(
+        "--prior", nargs="+", metavar="TYPE=K", default=[],
+        help=(
+            "Per-type top-k binarisation prior, e.g. --prior top=3 W=2. "
+            "For each mask type, select the K highest-scoring valid particles "
+            "instead of thresholding."
+        ),
+    )
+    args = parser.parse_args()
+
+    # Parse --prior top=3 W=2
+    prior_top = None
+    prior_W   = None
+    for item in args.prior:
+        if "=" not in item:
+            sys.exit(f"ERROR: --prior entries must be TYPE=K, got '{item}'")
+        name, k_str = item.split("=", 1)
+        if name not in ("top", "W"):
+            sys.exit(f"ERROR: unknown type '{name}' in --prior. Valid: top, W")
+        try:
+            k = int(k_str)
+        except ValueError:
+            sys.exit(f"ERROR: K must be an integer in --prior, got '{k_str}'")
+        if name == "top":
+            prior_top = k
+        else:
+            prior_W = k
+
+    run_dir = args.run_dir.resolve()
+    if not run_dir.is_dir():
+        sys.exit(f"ERROR: --run_dir does not exist or is not a directory: {run_dir}")
+
+    (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+     jet_valid, target_obj, pred_obj, original_mult) = load_run_data(
+        run_dir, args.data_file, use_probs=args.use_probs
+    )
+
+    results = compute_efficiencies(
+        pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+        jet_valid, target_obj,
+        pred_obj=pred_obj, prior_top=prior_top, prior_W=prior_W,
+        use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
+        joint=args.joint, original_mult=original_mult,
+    )
+    print_results(run_dir, results)
+
+    if args.plot:
+        make_plots(run_dir, results)
+
+    if args.threshold_sweep:
+        t_min, t_max = args.sweep_range if args.sweep_range else (None, None)
+        print(f"\nRunning threshold sweep ({args.sweep_steps} steps)...")
+        thresholds, top_effs, W_effs, ttbar_effs = sweep_threshold_efficiencies(
+            pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+            jet_valid, target_obj,
+            use_probs=args.use_probs,
+            t_min=t_min, t_max=t_max,
+            n_steps=args.sweep_steps,
+            prior_top=prior_top, prior_W=prior_W,
+            joint=args.joint,
+        )
+        plot_threshold_sweep(run_dir, thresholds, top_effs, W_effs, ttbar_effs,
+                             use_probs=args.use_probs)
+
+
+if __name__ == "__main__":
+    main()
