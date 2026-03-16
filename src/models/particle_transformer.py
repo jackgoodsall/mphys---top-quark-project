@@ -238,6 +238,7 @@ class MaskedReconstructionPart(nn.Module):
         # chain_queries: single query per top-decay chain (W-phase → top-phase same token).
         # When True, number_class_tokens = n_chains (e.g. 2).  No top/W query split.
         self.chain_queries = kwargs.get('chain_queries', False)
+        self.hierarchy_order = kwargs.get('hierarchy_order', 'w_first')
 
         if self.chain_queries:
             # All queries are chain queries — no type distinction needed.
@@ -436,40 +437,48 @@ class MaskedReconstructionPart(nn.Module):
         # Decode
         if self.hierarchical_decoding and self.chain_queries:
             # --- Chain-query hierarchical decode ---
-            # All Q queries are chain queries (one per top-decay chain).
-            # Phase 1 (W decoder): queries attend to particle memory → W representations.
-            # Phase 2 (top decoder): SAME queries warm-started from Phase-1 state
-            #   attend to extended memory (particles + W states) → top representations.
-            # The single query token carries both the W and top prediction for chain j.
-            n_w_layers = len(self.w_decoder_stack)
+            # Order-aware: hierarchy_order controls which decoder runs first.
+            # Phase 1 decoder produces its object type, phase 2 attends to
+            # extended memory (particles + phase-1 states) for the other type.
+            if self.hierarchy_order == "top_first":
+                phase1_stack = self.top_decoder_stack
+                phase2_stack = self.w_decoder_stack
+                phase1_mask_key = 'mask_predictions'  # top mask output
+            else:  # "w_first" (original default)
+                phase1_stack = self.w_decoder_stack
+                phase2_stack = self.top_decoder_stack
+                phase1_mask_key = 'mask_W'
 
-            w_tgt = tgt  # [B, Q, D] — all queries start as W queries
-            for i, w_layer in enumerate(self.w_decoder_stack):
-                w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
+            n_phase1_layers = len(phase1_stack)
+
+            # Phase 1: queries attend to particle memory
+            phase1_tgt = tgt
+            for i, layer in enumerate(phase1_stack):
+                phase1_tgt = layer(phase1_tgt, memory, memory_key_padding_mask=~src_mask)
                 layer_outputs[i] = self._compute_layer_outputs(
-                    w_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
+                    phase1_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
 
-            # Extended memory: particles + final W states
-            w_chain_valid = src_mask.new_ones(B, self.number_class_tokens)
-            extended_src_mask = torch.cat([src_mask, w_chain_valid], dim=1)
-            extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q, D]
+            # Extended memory: particles + phase-1 states
+            chain_valid = src_mask.new_ones(B, self.number_class_tokens)
+            extended_src_mask = torch.cat([src_mask, chain_valid], dim=1)
+            extended_memory = torch.cat([memory, phase1_tgt], dim=1)  # [B, N+Q, D]
 
-            # Warm-start: top queries begin from the same token that decoded the W.
-            top_tgt = w_tgt
-            for j, top_layer in enumerate(self.top_decoder_stack):
-                layer_id = n_w_layers + j
-                top_tgt = top_layer(top_tgt, extended_memory,
-                                    memory_key_padding_mask=~extended_src_mask)
+            # Phase 2: warm-started queries attend to extended memory
+            phase2_tgt = phase1_tgt
+            for j, layer in enumerate(phase2_stack):
+                layer_id = n_phase1_layers + j
+                phase2_tgt = layer(phase2_tgt, extended_memory,
+                                   memory_key_padding_mask=~extended_src_mask)
                 layer_outputs[layer_id] = self._compute_layer_outputs(
-                    top_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
+                    phase2_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
 
             # Fix: _compute_layer_outputs forces all heads at the final layer,
-            # so mask_W gets recomputed using top-decoder queries (wrong).
-            # Replace it with the correct mask_W from the W-phase final layer.
-            w_phase_final = n_w_layers - 1
-            final_top_layer = n_w_layers + len(self.top_decoder_stack) - 1
-            if 'mask_W' in layer_outputs.get(w_phase_final, {}):
-                layer_outputs[final_top_layer]['mask_W'] = layer_outputs[w_phase_final]['mask_W']
+            # so phase-1 mask gets recomputed using phase-2 queries (wrong).
+            # Replace it with the correct output from the phase-1 final layer.
+            phase1_final = n_phase1_layers - 1
+            final_layer = n_phase1_layers + len(phase2_stack) - 1
+            if phase1_mask_key in layer_outputs.get(phase1_final, {}):
+                layer_outputs[final_layer][phase1_mask_key] = layer_outputs[phase1_final][phase1_mask_key]
 
         elif self.hierarchical_decoding:
             # --- Original 4-query hierarchical decode (top + W split) ---
@@ -699,15 +708,20 @@ class MaskedReconstructionPart(nn.Module):
             final_layer = max(decoder_outputs.keys())
 
             if self.chain_queries:
-                # Matching cost must combine:
-                #   - W masks from the W-phase final output (last W-decoder layer)
-                #   - Top masks + objectness from the top-phase final output (last top-decoder layer)
-                # Using top-phase queries for mask_W would be incorrect.
-                n_w_layers = len(self.w_decoder_stack)
-                w_phase_final_id = n_w_layers - 1
-                final_output = dict(decoder_outputs[final_layer])  # copy top-phase outputs
-                if w_phase_final_id in decoder_outputs and 'mask_W' in decoder_outputs[w_phase_final_id]:
-                    final_output['mask_W'] = decoder_outputs[w_phase_final_id]['mask_W']
+                # Matching cost must use phase-1 mask from the phase-1 final layer,
+                # not from phase-2 queries (which would be incorrect).
+                if self.hierarchy_order == "top_first":
+                    phase1_stack_ref = self.top_decoder_stack
+                    phase1_mask_key = 'mask_predictions'
+                else:
+                    phase1_stack_ref = self.w_decoder_stack
+                    phase1_mask_key = 'mask_W'
+
+                n_phase1 = len(phase1_stack_ref)
+                phase1_final_id = n_phase1 - 1
+                final_output = dict(decoder_outputs[final_layer])
+                if phase1_final_id in decoder_outputs and phase1_mask_key in decoder_outputs[phase1_final_id]:
+                    final_output[phase1_mask_key] = decoder_outputs[phase1_final_id][phase1_mask_key]
             else:
                 final_output = decoder_outputs[final_layer]
 

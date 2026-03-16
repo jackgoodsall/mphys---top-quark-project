@@ -23,25 +23,42 @@ max_targets: 10                       # GPU fallback threshold for gpu_bruteforc
   
 
 tasks:
-  # Top mask: W-decoder produces W masks (layers 0-3); top-decoder produces top masks (layers 4-7).
-  # In chain_queries mode layer_weights are phase-split so each mask head only fires during
-  # its own decoder phase.
-  mask:
-    cost_weight: 1.0
-    dice_weight: 1.0
-    bce_weight: 0.5
-    null_mask_penalty: 0.2
-    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+  # In chain_queries mode layer_weights are phase-split so each task head only fires
+  # during its own decoder phase.  hierarchy_order controls execution order:
+  #   top_first: top-decoder (layers 0-3) → W-decoder (layers 4-7)
+  #   w_first:   W-decoder (layers 0-3) → top-decoder (layers 4-7)
+  # Layer weights MUST match hierarchy_order — swap both together.
+  #
+  # --- w_first layer weights (use with hierarchy_order: "w_first") ---
+  # mask:         layer_weights: {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0.33, 6: 0.67, 7: 1.0}
+  # mask_W:       layer_weights: {0: 0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0, 5: 0, 6: 0, 7: 0}
+  # objectness:   layer_weights: {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0.33, 6: 0.67, 7: 1.0}
+  # objectness_W: layer_weights: {0: 0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0, 5: 0, 6: 0, 7: 0}
 
-  mask_W:
+  # --- top_first layer weights (active) ---
+  mask:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
     null_mask_penalty: 0.2
     layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
 
+  mask_W:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+
   objectness:
     cost_weight: 1
+    loss_weight: 1
+    null_weight: 0.2
+    head_norm: True
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
+
+  objectness_W:
+    cost_weight: 0      # matching already handled by top-phase objectness
     loss_weight: 1
     null_weight: 0.2
     head_norm: True
@@ -50,7 +67,7 @@ tasks:
   # object_type: not registered in chain_queries mode
 
 pretraining:
-  mask_pretrain_epochs: 20   # disabled for R&D — train all tasks from the start
+  mask_pretrain_epochs: 0   # disabled for R&D — train all tasks from the start
   tasks: ["mask_W"]
   transition_ramp_epochs: 5
 
@@ -111,6 +128,7 @@ model_parameters:
     number_class_tokens: 2   # one query per top-decay chain (W->top from same token)
     hierarchical_decoding: True
     chain_queries: True       # W-phase then top-phase from the SAME query token
+    hierarchy_order: "top_first"  # "top_first" | "w_first" — controls which decoder phase runs first
     use_mia_encoder: False
     n_mia_layers: 0
     mia_interaction_dim: 64
