@@ -153,7 +153,6 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
                 layer_weights=obj_W_layer_weights,
                 head_norm=obj_W_config.get('head_norm', True),
             ),
-            null_weight=obj_W_config.get('null_weight', 0.2)
         )
         task_registry.register_task(objectness_W_task)
 
@@ -180,7 +179,6 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             layer_weights=obj_layer_weights,
             head_norm=obj_config.get('head_norm', False),
         ),
-        null_weight=obj_config.get('null_weight', 0.1)
     )
     task_registry.register_task(objectness_task)
 
