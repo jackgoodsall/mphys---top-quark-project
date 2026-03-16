@@ -3,9 +3,10 @@ Evaluate top/W/ttbar reconstruction efficiency from saved test outputs
 for chain_queries models.
 
 In chain_queries mode there is no object_type task — type is implicit:
-  - test_outputs_mask.h5   → top predictions  [N, Q, P]
-  - test_outputs_mask_W.h5 → W predictions    [N, Q, P]
-  - test_outputs_objectness.h5 → objectness   [N, Q]  (one score per chain query)
+  - test_outputs_mask.h5           → top predictions       [N, Q, P]
+  - test_outputs_mask_W.h5         → W predictions         [N, Q, P]
+  - test_outputs_objectness.h5     → top objectness        [N, Q]
+  - test_outputs_objectness_W.h5   → W objectness          [N, Q]
 
 Each query token is a full chain (top + W pair).  A chain is "real" when
 the W-mask target has ≥1 assigned particle (matching target_objectness).
@@ -36,16 +37,40 @@ import numpy as np
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _load_objectness(path: Path, use_probs: bool, task_name: str = "objectness"):
+    """Load target and predicted objectness from an HDF5 file.
+
+    Keys follow the task naming convention:
+      target_{task_name}, predicted_{task_name}_logit, predicted_{task_name}_prob
+    """
+    with h5py.File(path, "r") as f:
+        target_key = f"target_{task_name}"
+        if target_key not in f:
+            sys.exit(f"ERROR: key '{target_key}' not found in {path}")
+        target = f[target_key][:]                          # [N, Q]
+        pred_key = f"predicted_{task_name}_prob" if use_probs else f"predicted_{task_name}_logit"
+        pred = f[pred_key][:] if pred_key in f else None
+    return target, pred
+
+
 def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
     """Load all arrays needed for efficiency evaluation."""
 
     mask_top_path = run_dir / "test_outputs_mask.h5"
     mask_W_path   = run_dir / "test_outputs_mask_W.h5"
-    obj_path      = run_dir / "test_outputs_objectness.h5"
+    obj_top_path  = run_dir / "test_outputs_objectness.h5"
+    obj_W_path    = run_dir / "test_outputs_objectness_W.h5"
 
-    for p in (mask_top_path, mask_W_path, obj_path):
+    for p in (mask_top_path, mask_W_path):
         if not p.exists():
             sys.exit(f"ERROR: required file not found: {p}")
+
+    # At least one objectness file must exist
+    if not obj_top_path.exists() and not obj_W_path.exists():
+        sys.exit(
+            f"ERROR: no objectness files found. Expected at least one of:\n"
+            f"  {obj_top_path}\n  {obj_W_path}"
+        )
 
     scores_key = "predicted_masks_prob" if use_probs else "predicted_masks_logits"
 
@@ -62,10 +87,20 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
         pred_scores_W = f[scores_key][:]                  # [N, Q, P]
         target_masks_W = f["target_masks"][:]              # [N, Q, P]
 
-    with h5py.File(obj_path, "r") as f:
-        target_obj = f["target_objectness"][:]             # [N, Q]
-        pred_obj_key = "predicted_objectness_prob" if use_probs else "predicted_objectness_logit"
-        pred_obj = f[pred_obj_key][:] if pred_obj_key in f else None
+    # Load separate top / W objectness
+    target_obj_top, pred_obj_top = None, None
+    target_obj_W,   pred_obj_W   = None, None
+
+    if obj_top_path.exists():
+        target_obj_top, pred_obj_top = _load_objectness(obj_top_path, use_probs, task_name="objectness")
+    if obj_W_path.exists():
+        target_obj_W, pred_obj_W = _load_objectness(obj_W_path, use_probs, task_name="objectness_W")
+
+    # If only one file exists, use it for both (backward compat)
+    if target_obj_top is None:
+        target_obj_top, pred_obj_top = target_obj_W, pred_obj_W
+    if target_obj_W is None:
+        target_obj_W, pred_obj_W = target_obj_top, pred_obj_top
 
     # Fall back to external data file for src_mask
     if jet_valid is None:
@@ -97,7 +132,8 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
         original_mult = d["original_mult"].astype(int)
 
     return (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-            jet_valid, target_obj, pred_obj, original_mult)
+            jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
+            original_mult)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +225,8 @@ def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, is_perfect_top, 
 
 
 def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-                         jet_valid, target_obj, pred_obj=None,
+                         jet_valid, target_obj_top, pred_obj_top=None,
+                         target_obj_W=None, pred_obj_W=None,
                          prior_top=None, prior_W=None, use_probs=False,
                          threshold=None, strict=False, joint=False, original_mult=None):
     """
@@ -197,6 +234,9 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
 
     Chain queries: each query predicts both a top mask and a W mask.
     A chain is "real" when the W-mask target has ≥1 assigned particle.
+
+    Separate objectness heads for tops and Ws are used for strict gating
+    and purity: pred_obj_top gates top metrics, pred_obj_W gates W metrics.
     """
     N, Q, P = pred_scores_top.shape
 
@@ -228,16 +268,20 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     if joint:
         slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real)
 
-    # In strict mode, also require objectness head to predict the slot as real
-    pred_real = None
-    if strict and pred_obj is not None:
-        obj_thresh = 0.5 if use_probs else 0.0
-        pred_real = pred_obj > obj_thresh
-        detected_top = slot_perfect_top & pred_real
-        detected_W   = slot_perfect_W   & pred_real
+    # In strict mode, require the corresponding objectness head to predict real
+    obj_thresh = 0.5 if use_probs else 0.0
+    pred_real_top = None
+    pred_real_W   = None
+    if strict and pred_obj_top is not None:
+        pred_real_top = pred_obj_top > obj_thresh
+        detected_top = slot_perfect_top & pred_real_top
     else:
         detected_top = slot_perfect_top
-        detected_W   = slot_perfect_W
+    if strict and pred_obj_W is not None:
+        pred_real_W = pred_obj_W > obj_thresh
+        detected_W = slot_perfect_W & pred_real_W
+    else:
+        detected_W = slot_perfect_W
 
     # Event-level aggregates — use is_real (W-based) as the chain gate throughout
     all_tops_perfect = ((~is_real) | detected_top).all(axis=1)   # [N]
@@ -268,40 +312,50 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     all_eff   = perfect_all.sum()                    / len(perfect_all)
 
     # ── Purity (from objectness predictions) ──
+    # Use top objectness for top purity, W objectness for W purity.
+    # "obj_purity" (chain-level) uses top objectness as the primary indicator.
     obj_purity       = None
     ttbar_purity     = None
-    n_pred_real      = None
+    n_pred_real_top  = None
+    n_pred_real_W    = None
     top_purity       = None
     W_purity         = None
     n_pred_both_tops = None
-    if pred_obj is not None:
-        obj_thresh = 0.5 if use_probs else 0.0
-        pred_real  = pred_obj > obj_thresh                     # [N, Q]
-        n_pred_real = int(pred_real.sum())
 
-        # Of predicted-real chains, fraction that are actually real
-        obj_purity = float((pred_real & is_real).sum() / max(n_pred_real, 1))
+    if pred_obj_top is not None:
+        pred_real_top = pred_obj_top > obj_thresh              # [N, Q]
+        n_pred_real_top = int(pred_real_top.sum())
 
-        # Top purity: of predicted-real chains, fraction with perfect top mask
-        top_purity = float((pred_real & is_real & slot_perfect_top).sum()
-                           / max(n_pred_real, 1))
+        # Of predicted-real-top chains, fraction that are actually real
+        obj_purity = float((pred_real_top & is_real).sum() / max(n_pred_real_top, 1))
 
-        # W purity: of predicted-real chains, fraction with perfect W mask
-        W_purity = float((pred_real & is_real & slot_perfect_W).sum()
-                         / max(n_pred_real, 1))
+        # Top purity: of predicted-real-top chains, fraction with perfect top mask
+        top_purity = float((pred_real_top & is_real & slot_perfect_top).sum()
+                           / max(n_pred_real_top, 1))
 
-        # ttbar purity: events with ≥2 chains predicted real, both tops correct
-        pred_both_tops   = pred_real.sum(axis=1) >= 2
+        # ttbar purity: events with ≥2 chains predicted real (top), both tops correct
+        pred_both_tops   = pred_real_top.sum(axis=1) >= 2
         n_pred_both_tops = int(pred_both_tops.sum())
-        both_tops_correct = (pred_real & is_real & slot_perfect_top).sum(axis=1) == 2
+        both_tops_correct = (pred_real_top & is_real & slot_perfect_top).sum(axis=1) == 2
         ttbar_purity = float((pred_both_tops & both_tops_correct).sum()
                              / max(n_pred_both_tops, 1))
+
+    if pred_obj_W is not None:
+        pred_real_W = pred_obj_W > obj_thresh                  # [N, Q]
+        n_pred_real_W = int(pred_real_W.sum())
+
+        # W purity: of predicted-real-W chains, fraction with perfect W mask
+        W_purity = float((pred_real_W & is_real & slot_perfect_W).sum()
+                         / max(n_pred_real_W, 1))
+
+    # For breakdown purity, use top objectness as the gating prediction
+    pred_real_for_breakdown = pred_real_top
 
     # Per-multiplicity breakdown (by signal jet count)
     multiplicity = jet_valid.sum(axis=1).astype(int)
     breakdown = _compute_breakdown(
         multiplicity, is_real, top_eff_gate, detected_top, detected_W,
-        all_tops_perfect, all_Ws_perfect, pred_real,
+        all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
     )
 
     # Per-original-multiplicity breakdown
@@ -309,7 +363,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     if original_mult is not None:
         breakdown_orig = _compute_breakdown(
             original_mult, is_real, top_eff_gate, detected_top, detected_W,
-            all_tops_perfect, all_Ws_perfect, pred_real,
+            all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
         )
 
     return {
@@ -324,7 +378,8 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         "ttbar_purity":     ttbar_purity,
         "top_purity":       top_purity,
         "W_purity":         W_purity,
-        "n_pred_real":      n_pred_real,
+        "n_pred_real_top":  n_pred_real_top,
+        "n_pred_real_W":    n_pred_real_W,
         "n_pred_both_tops": n_pred_both_tops,
         "n_has_top":   int(n_top_total),   # chains with non-empty top target
         "n_has_W":     int(has_W.sum()),
@@ -378,13 +433,19 @@ def print_results(run_dir: Path, results: dict):
     print("─" * 70)
     print(f"  All-object efficiency:                                  {results['all_eff']*100:6.2f}%   (N={N:,})")
 
-    if results.get("obj_purity") is not None:
+    has_top_purity = results.get("obj_purity") is not None
+    has_W_purity   = results.get("W_purity") is not None
+    if has_top_purity or has_W_purity:
         print(f"\nPURITY SUMMARY (N_correct_predicted / N_all_predicted)")
         print("─" * 70)
-        print(f"  Object purity      (pred real & actual real / pred real):       {results['obj_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
-        print(f"  Top purity         (pred real & perfect top / pred real):       {results['top_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
-        print(f"  W purity           (pred real & perfect W / pred real):         {results['W_purity']*100:5.2f}%   (N_pred_real={results['n_pred_real']:,})")
-        print(f"  ttbar purity       (both tops correct / pred >=2 real):         {results['ttbar_purity']*100:5.2f}%   (N_pred_2t={results['n_pred_both_tops']:,})")
+        if has_top_purity:
+            npt = results['n_pred_real_top']
+            print(f"  Object purity      (pred real & actual real / pred real):       {results['obj_purity']*100:5.2f}%   (N_pred_real_top={npt:,})")
+            print(f"  Top purity         (pred real & perfect top / pred real):       {results['top_purity']*100:5.2f}%   (N_pred_real_top={npt:,})")
+            print(f"  ttbar purity       (both tops correct / pred >=2 real):         {results['ttbar_purity']*100:5.2f}%   (N_pred_2t={results['n_pred_both_tops']:,})")
+        if has_W_purity:
+            npw = results['n_pred_real_W']
+            print(f"  W purity           (pred real & perfect W / pred real):         {results['W_purity']*100:5.2f}%   (N_pred_real_W={npw:,})")
         print("─" * 70)
 
     def _print_mult_table(label, table):
@@ -613,7 +674,7 @@ def make_plots(run_dir: Path, results: dict):
 # ---------------------------------------------------------------------------
 
 def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-                                  jet_valid, target_obj, use_probs=False,
+                                  jet_valid, use_probs=False,
                                   t_min=None, t_max=None, n_steps=100,
                                   prior_top=None, prior_W=None, joint=False):
     """
@@ -794,14 +855,16 @@ def main():
         sys.exit(f"ERROR: --run_dir does not exist or is not a directory: {run_dir}")
 
     (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-     jet_valid, target_obj, pred_obj, original_mult) = load_run_data(
+     jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
+     original_mult) = load_run_data(
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
     results = compute_efficiencies(
         pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-        jet_valid, target_obj,
-        pred_obj=pred_obj, prior_top=prior_top, prior_W=prior_W,
+        jet_valid, target_obj_top,
+        pred_obj_top=pred_obj_top, target_obj_W=target_obj_W,
+        pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
         use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
         joint=args.joint, original_mult=original_mult,
     )
@@ -815,7 +878,7 @@ def main():
         print(f"\nRunning threshold sweep ({args.sweep_steps} steps)...")
         thresholds, top_effs, W_effs, ttbar_effs = sweep_threshold_efficiencies(
             pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-            jet_valid, target_obj,
+            jet_valid,
             use_probs=args.use_probs,
             t_min=t_min, t_max=t_max,
             n_steps=args.sweep_steps,
