@@ -1019,9 +1019,8 @@ class ObjectnessTask(BaseTask):
     Targets: derived from targets["classes"] — real=1.0, null=0.0
     """
 
-    def __init__(self, config: TaskConfig, null_weight: float = 0.1):
+    def __init__(self, config: TaskConfig):
         super().__init__(config)
-        self.null_weight = null_weight
         self.pred_key = config.output_names[0]  # e.g. 'objectness_logit' or 'objectness_W_logit'
         # Detection stats accumulators — GPU buffers so .item() is deferred to
         # get_detection_stats() (called once per epoch, not per step)
@@ -1077,21 +1076,12 @@ class ObjectnessTask(BaseTask):
 
         obj_valid = targets.get('obj_valid_mask')
         if obj_valid is None:
-            # Backward compat: all queries are real
             target_obj = torch.ones_like(pred_logit)
-            weight = torch.ones_like(pred_logit)
         else:
             target_obj = obj_valid.float()  # [B, Q]
-            # Adaptive null weighting: scale null weight by n_real/Q per event
-            # so the total null contribution stays proportional to the real signal.
-            # T_i=4,Q=5 → ratio=0.8; T_i=1,Q=5 → ratio=0.2 (5× reduction)
-            n_real = obj_valid.sum(dim=1, keepdim=True).float()  # [B, 1]
-            Q = obj_valid.shape[1]
-            adaptive_null_w = self.null_weight * (n_real / Q).clamp(min=0.01)  # [B, 1]
-            weight = torch.where(obj_valid, torch.ones_like(pred_logit), adaptive_null_w.expand_as(pred_logit))
 
         loss = F.binary_cross_entropy_with_logits(
-            pred_logit, target_obj, weight=weight, reduction='mean'
+            pred_logit, target_obj, reduction='mean'
         )
 
         # Update detection stats
