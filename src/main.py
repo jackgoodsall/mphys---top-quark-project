@@ -7,7 +7,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from models.particle_transformer import (
     ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
 )
-from data.top_quark_reconstruction import MaskedFormerTopsWsDataModule
+from data.datamodule import MaskedFormerTopsWsDataModule
 from trainers.top_reconstruction_trainers import (
     ReconstructionTrainer, train_reconstruction_model,
 )

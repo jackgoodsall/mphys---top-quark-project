@@ -1,6 +1,6 @@
 root_dataset_prepper:
   root_path: "data/topquarkreconstruction/root_data"
-  save_path: "data/topquarkreconstruction/h5py_data"
+  save_path: "data/topquarkreconstruction/h5py_data/combined"
   train_file_name:  "ttbar_train"
   val_file_name: "ttbar_val"
   test_file_name: "ttbar_test"
@@ -9,7 +9,7 @@ root_dataset_prepper:
 
 preprocessing:
   stream_size: 500000
-  save_path: ""
+  save_path: "data/topquarkreconstruction/masked_targets_combined"
   save_file_prefix: "ttbar_preprocessed_"
   min_objects: 1    # keep events with >= this many reconstructable objects
                     # set to 4 to restore original fully-matched-only behaviour
@@ -23,17 +23,6 @@ max_targets: 10                       # GPU fallback threshold for gpu_bruteforc
   
 
 tasks:
-  # In chain_queries mode layer_weights are phase-split so each task head only fires
-  # during its own decoder phase.  hierarchy_order controls execution order:
-  #   top_first: top-decoder (layers 0-3) → W-decoder (layers 4-7)
-  #   w_first:   W-decoder (layers 0-3) → top-decoder (layers 4-7)
-  # Layer weights MUST match hierarchy_order — swap both together.
-  #
-  # --- w_first layer weights (use with hierarchy_order: "w_first") ---
-  # mask:         layer_weights: {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0.33, 6: 0.67, 7: 1.0}
-  # mask_W:       layer_weights: {0: 0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0, 5: 0, 6: 0, 7: 0}
-  # objectness:   layer_weights: {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0.33, 6: 0.67, 7: 1.0}
-  # objectness_W: layer_weights: {0: 0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0, 5: 0, 6: 0, 7: 0}
 
   # --- top_first layer weights (active) ---
   mask:
@@ -52,17 +41,17 @@ tasks:
 
   objectness:
     cost_weight: 1
-    loss_weight: 1
+    loss_weight: 0.05
     null_weight: 0.2
     head_norm: True
-    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
+    layer_weights: {0: 0.0, 1: 0, 2: 0, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
 
   objectness_W:
     cost_weight: 0      # matching already handled by top-phase objectness
-    loss_weight: 1
+    loss_weight: 0.05
     null_weight: 0.2
     head_norm: True
-    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0, 6: 0, 7: 1.0}
 
   # object_type: not registered in chain_queries mode
 
@@ -78,10 +67,12 @@ max_objects: 2   # chain_queries: one query per decay chain
 
 
 data_modules:
-  input_path: data/topquarkreconstruction/masked_targets_all_events
+  input_path: data/topquarkreconstruction/masked_targets_combined
   input_prefix: "ttbar_preprocessed_"
   mass_with_kinematics: True
   mask_only: True
+  lazy: False
+  load_interactions: False  # skip loading interaction matrices (~122 GB); set True when use_vanilla_attention is off
   # HDF5 key names for tops+Ws loading
   tops_mask_key: "masks_tops"
   tops_kin_key: "kinematics_tops"
