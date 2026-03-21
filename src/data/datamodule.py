@@ -154,109 +154,21 @@ def masked_former_collate_fn(batch):
     return batched_samples, batched_targets
 
 
-class ParTWDataset(Dataset):
-    def __init__(self, jet, interactions,src_mask, targets):
-        # ensure numpy arrays
-        self.jet = np.asarray(jet)
-        self.src_mask   = np.asarray(src_mask)
-        self.targets     = np.asarray(targets)
-        self.interactions = np.asarray(interactions)
- 
-    def __len__(self):
-        return int(self.jet.shape[0])
-
-    def __getitem__(self, idx):
-        sample = {
-            "jet": torch.from_numpy(self.jet[idx]).float(),
-            "src_mask":     torch.from_numpy(self.src_mask[idx]).bool(),
-            "interactions": torch.from_numpy(self.interactions[idx])
-        }
-        target = {
-            "jet_mask_true" : self.targets[idx],
-            "jet_valid_mask" : self.src_mask[idx]
-        }
-        return sample, target
-
-
-class TopandWReconstuctionDataModule(LightningDataModule):
-    def __init__(self, config):
-
-        super().__init__()
-        
-        self.config  = config["data_modules"]
-
-        self.train_config = self.config["train"]
-        self.test_config = self.config["test"]
-        self.val_config = self.config["val"]
-
-        self.input_path = self.config["input_path"]
-        self.input_prefix = self.config["input_prefix"]
-
-        self.data_prefix = Path(self.input_path, self.input_prefix)
-
-        self.train_dataset = None
-        self.test_dataset = None
-        self.val_dataset = None
-
-    def _load_split(self, name: str) -> ParTWDataset:
-        path = Path(f"{self.data_prefix}{name}.h5")
-        if not path.exists():
-            raise FileNotFoundError(f"Missing split file: {path}")
-        with h5py.File(path, "r") as f:
-            jet = f["jet"][()]   # load to memory
-            src_mask = f["src_mask"][()]
-            targ = f["targets"][()]
-            interactions = f["interactions"][()]
-
-        ds = ParTWDataset(jet, interactions ,src_mask, targ)
-        return ds
-
-    def setup(self, stage):
-        # Lightning may call with stage=None (setup everything) and/or "fit"/"validate"/"test"
-        if stage in (None, "fit", "validate"):
-            self.train_dataset = self._load_split("train")
-            self.val_dataset   = self._load_split("val")
-            print(f"[DM] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}")
-        if stage in (None, "test"):
-            self.test_dataset  = self._load_split("test")
-            print(f"[DM] test  len={len(self.test_dataset)}")
-
-    def train_dataloader(self):
-        assert self.train_dataset is not None, "train_dataset not set (did setup() run?)"
-        return DataLoader(self.train_dataset, batch_size=self.train_config["batch_size"], shuffle=self.train_config["shuffle"],
-                          num_workers=self.train_config["num_workers"], pin_memory=self.train_config["pin_memory"],
-                          drop_last = True)
-
-    def val_dataloader(self):
-        assert self.val_dataset is not None, "val_dataset not set (did setup() run?)"
-        return DataLoader(self.val_dataset, batch_size=self.val_config["batch_size"], shuffle=self.val_config["shuffle"],
-                          num_workers=self.val_config["num_workers"], pin_memory=self.val_config["pin_memory"])
-
-    def test_dataloader(self):
-        assert self.test_dataset is not None, "test_dataset not set (did setup() run?)"
-        return DataLoader(self.test_dataset, batch_size=self.test_config["batch_size"], shuffle=self.test_config["shuffle"],
-                          num_workers=self.test_config["num_workers"], pin_memory=self.test_config["pin_memory"])
-
-
-
-
 class MaskedFormerDataSet(Dataset):
+    """In-memory dataset. Used by analysis scripts and as a fallback."""
+
     def __init__(self, jet, interactions, src_mask, targets, target_kinematics,
                  target_mass=None, mass_with_kinematics=False, classes=None,
                  object_valid=None):
-        # Flag for if to include mass with the kinematics
         self.mass_with_kinematics = mass_with_kinematics
-        # ensure numpy arrays
         self.jet = np.asarray(jet)
         self.src_mask = np.asarray(src_mask)
         self.targets = np.asarray(targets)
-        self.interactions = np.asarray(interactions)
+        self.interactions = np.asarray(interactions) if interactions is not None else None
+        self._zero_interactions = None  # lazily created single zero row
         self.target_kinematics = np.asarray(target_kinematics)
         self.inv_mass = np.asarray(target_mass) if target_mass is not None else None
         self.classes = np.asarray(classes) if classes is not None else None
-        # Per-event object validity mask [N, n_obj] bool.
-        # If set, __getitem__ filters objects so T_i varies per event.
-        # If None, all objects are returned (backward-compatible behaviour).
         self.object_valid = np.asarray(object_valid, dtype=bool) if object_valid is not None else None
 
         if self.mass_with_kinematics:
@@ -270,17 +182,24 @@ class MaskedFormerDataSet(Dataset):
         return int(self.jet.shape[0])
 
     def __getitem__(self, idx):
+        if self.interactions is not None:
+            interactions = self.interactions[idx]
+        else:
+            if self._zero_interactions is None:
+                P = self.jet.shape[1]
+                self._zero_interactions = np.zeros((P, P, 4), dtype=np.float32)
+            interactions = self._zero_interactions
+
         sample = {
             "jet": torch.from_numpy(self.jet[idx]).float(),
             "src_mask": torch.from_numpy(self.src_mask[idx]).bool(),
-            "interactions": torch.from_numpy(self.interactions[idx])
+            "interactions": torch.from_numpy(interactions).float(),
         }
 
-        # Apply per-event validity filter so T_i varies when object_valid is set
         if self.object_valid is not None:
-            valid = self.object_valid[idx]  # [n_obj] bool
-            jet_mask = self.targets[idx][valid]           # [T_i, P]
-            kin = self.target_kinematics[idx][valid]      # [T_i, D]
+            valid = self.object_valid[idx]
+            jet_mask = self.targets[idx][valid]
+            kin = self.target_kinematics[idx][valid]
             cls = self.classes[idx][valid] if self.classes is not None else None
         else:
             jet_mask = self.targets[idx]
@@ -304,138 +223,120 @@ class MaskedFormerDataSet(Dataset):
         return sample, target
 
 
-class MaskedFormerDataModule(LightningDataModule):
-    def __init__(self, config):
+class LazyHDF5Dataset(Dataset):
+    """
+    Lazy-loading dataset that reads from HDF5 on the fly.
 
-        super().__init__()
-        
-        self.config  = config["data_modules"]
+    Only small metadata (length, validity, classes) is held in RAM.
+    The large arrays (jet, interactions, masks, kinematics) are read
+    per-event from disk via h5py indexing.
 
-        self.train_config = self.config["train"]
-        self.test_config = self.config["test"]
-        self.val_config = self.config["val"]
+    Each DataLoader worker opens its own file handle on first access
+    (h5py files cannot be shared across forked processes).
+    """
 
-        self.input_path = self.config["input_path"]
-        self.input_prefix = self.config["input_prefix"]
+    def __init__(self, h5_path, tops_mask_key, tops_kin_key,
+                 ws_mask_key, ws_kin_key):
+        self.h5_path = str(h5_path)
 
-        self.mass_with_kinematics = self.config["mass_with_kinematics"]
+        # Read only small arrays + metadata into RAM
+        with h5py.File(self.h5_path, "r") as f:
+            self._length = f["jet"].shape[0]
+            self._has_interactions = "interactions" in f
 
-        self.data_prefix = Path(self.input_path, self.input_prefix)
+            # HDF5 dataset keys for tops/Ws
+            self._tops_mask_key = tops_mask_key if tops_mask_key in f else None
+            self._tops_kin_key = tops_kin_key if tops_kin_key in f else None
+            self._ws_mask_key = ws_mask_key if ws_mask_key in f else None
+            self._ws_kin_key = ws_kin_key if ws_kin_key in f else None
 
-        self.train_dataset = None
-        self.test_dataset = None
-        self.val_dataset = None
+            # Load small validity arrays into RAM (~38 MB each for 19M events)
+            valid_tops = f["valid_tops"][()] if "valid_tops" in f else None
+            valid_Ws = f["valid_Ws"][()] if "valid_Ws" in f else None
 
-    def _load_split(self, name: str) -> MaskedFormerDataSet:
-        path = Path(f"{self.data_prefix}{name}.h5")
-        if not path.exists():
-            raise FileNotFoundError(f"Missing split file: {path}")
-        with h5py.File(path, "r") as f:
-            jet = f["jet"][()]   # load to memory
-            src_mask = f["src_mask"][()]
-            targ = f["targets"][()]
-            targ_kinematics = f["target_kinematics"][()]
-            interactions = f["interactions"][()]
-            target_mass = f["target_mass"][()]
+        # Pre-compute per-event classes and object_valid (small arrays).
+        # These stay in RAM; everything else is read lazily.
+        N = self._length
+        classes_parts = []
+        valid_parts = []
 
+        if self._tops_mask_key is not None:
+            T_top = 2  # always 2 tops
+            classes_parts.append(np.full((N, T_top), CLASS_TOP, dtype=np.int64))
+            vt = valid_tops if valid_tops is not None else np.ones((N, T_top), dtype=bool)
+            valid_parts.append(vt.astype(bool))
 
-        ds = MaskedFormerDataSet(jet, interactions ,src_mask, targ, targ_kinematics, target_mass, self.mass_with_kinematics)
-        return ds
+        if self._ws_mask_key is not None:
+            T_w = 2  # always 2 Ws
+            classes_parts.append(np.full((N, T_w), CLASS_W, dtype=np.int64))
+            vw = valid_Ws if valid_Ws is not None else np.ones((N, T_w), dtype=bool)
+            valid_parts.append(vw.astype(bool))
 
-    def setup(self, stage):
-        # Lightning may call with stage=None (setup everything) and/or "fit"/"validate"/"test"
-        if stage in (None, "fit", "validate"):
-            self.train_dataset = self._load_split("train")
-            self.val_dataset   = self._load_split("val")
-            print(f"[DM] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}")
-        if stage in (None, "test"):
-            self.test_dataset  = self._load_split("test")
-            print(f"[DM] test  len={len(self.test_dataset)}")
+        self.classes = np.concatenate(classes_parts, axis=1)        # [N, n_obj]
+        self.object_valid = np.concatenate(valid_parts, axis=1)     # [N, n_obj]
+        self._has_partial = not self.object_valid.all()
 
-    def train_dataloader(self):
-        assert self.train_dataset is not None, "train_dataset not set (did setup() run?)"
-        return DataLoader(self.train_dataset, batch_size=self.train_config["batch_size"], shuffle=self.train_config["shuffle"],
-                          num_workers=self.train_config["num_workers"], pin_memory=self.train_config["pin_memory"],
-                          drop_last = True)
+        # File handle opened lazily per worker process
+        self._file = None
 
-    def val_dataloader(self):
-        assert self.val_dataset is not None, "val_dataset not set (did setup() run?)"
-        return DataLoader(self.val_dataset, batch_size=self.val_config["batch_size"], shuffle=self.val_config["shuffle"],
-                          num_workers=self.val_config["num_workers"], pin_memory=self.val_config["pin_memory"])
+    def _ensure_open(self):
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
 
-    def test_dataloader(self):
-        assert self.test_dataset is not None, "test_dataset not set (did setup() run?)"
-        return DataLoader(self.test_dataset, batch_size=self.test_config["batch_size"], shuffle=self.test_config["shuffle"],
-                          num_workers=self.test_config["num_workers"], pin_memory=self.test_config["pin_memory"])
+    def __len__(self):
+        return self._length
 
+    def __del__(self):
+        if self._file is not None:
+            self._file.close()
 
-class MaskedFormer2(LightningDataModule):
-    def __init__(self, config):
+    def __getitem__(self, idx):
+        self._ensure_open()
 
-        super().__init__()
-        
-        self.config  = config["data_modules"]
+        jet = self._file["jet"][idx]
+        src_mask = self._file["src_mask"][idx]
 
-        self.train_config = self.config["train"]
-        self.test_config = self.config["test"]
-        self.val_config = self.config["val"]
+        if self._has_interactions:
+            interactions = self._file["interactions"][idx]
+        else:
+            P = jet.shape[0]
+            interactions = np.zeros((P, P, 4), dtype=np.float32)
 
-        self.input_path = self.config["input_path"]
-        self.input_prefix = self.config["input_prefix"]
+        sample = {
+            "jet": torch.from_numpy(jet).float(),
+            "src_mask": torch.from_numpy(src_mask).bool(),
+            "interactions": torch.from_numpy(interactions).float(),
+        }
 
-        self.mass_with_kinematics = self.config["mass_with_kinematics"]
+        # Read and concatenate tops + Ws masks/kinematics for this event
+        masks_parts = []
+        kins_parts = []
+        if self._tops_mask_key is not None:
+            masks_parts.append(self._file[self._tops_mask_key][idx])
+            kins_parts.append(self._file[self._tops_kin_key][idx])
+        if self._ws_mask_key is not None:
+            masks_parts.append(self._file[self._ws_mask_key][idx])
+            kins_parts.append(self._file[self._ws_kin_key][idx])
 
-        self.data_prefix = Path(self.input_path, self.input_prefix)
+        masks = np.concatenate(masks_parts, axis=0)   # [n_obj, P]
+        kins = np.concatenate(kins_parts, axis=0)      # [n_obj, D]
+        cls = self.classes[idx]                         # [n_obj]
 
-        self.train_dataset = None
-        self.test_dataset = None
-        self.val_dataset = None
+        # Apply validity filter
+        if self._has_partial:
+            valid = self.object_valid[idx]
+            masks = masks[valid]
+            kins = kins[valid]
+            cls = cls[valid]
 
-    def _load_split(self, name: str) -> MaskedFormerDataSet:
-        path = Path(f"{self.data_prefix}{name}.h5")
-        if not path.exists():
-            raise FileNotFoundError(f"Missing split file: {path}")
-        with h5py.File(path, "r") as f:
-            jet = f["jet"][()]   # load to memory
-            src_mask = f["src_mask"][()]
-            targ = f["masks_tops"][()]
-            targ_kinematics = f["kinematics_tops"][()]
-            interactions = f["interactions"][()]
-            #target_mass = f["target_mass"][()]
-            target_mass = None
+        target = {
+            "jet_mask_true": torch.from_numpy(masks).float(),
+            "jet_valid_mask": torch.from_numpy(src_mask).bool(),
+            "target_kinematics": torch.from_numpy(kins).float(),
+            "classes": torch.from_numpy(cls).long(),
+        }
 
-        ds = MaskedFormerDataSet(jet, interactions ,src_mask, targ, targ_kinematics, target_mass, self.mass_with_kinematics)
-        return ds
-
-    def setup(self, stage):
-        # Lightning may call with stage=None (setup everything) and/or "fit"/"validate"/"test"
-        if stage in (None, "fit", "validate"):
-            self.train_dataset = self._load_split("train")
-            self.val_dataset   = self._load_split("val")
-            print(f"[DM] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}")
-        if stage in (None, "test"):
-            self.test_dataset  = self._load_split("test")
-            print(f"[DM] test  len={len(self.test_dataset)}")
-
-    def train_dataloader(self):
-        assert self.train_dataset is not None, "train_dataset not set (did setup() run?)"
-        return DataLoader(self.train_dataset, batch_size=self.train_config["batch_size"], shuffle=self.train_config["shuffle"],
-                          num_workers=self.train_config["num_workers"], pin_memory=self.train_config["pin_memory"],
-                          drop_last = True)
-
-    def val_dataloader(self):
-        assert self.val_dataset is not None, "val_dataset not set (did setup() run?)"
-        return DataLoader(self.val_dataset, batch_size=self.val_config["batch_size"], shuffle=self.val_config["shuffle"],
-                          num_workers=self.val_config["num_workers"], pin_memory=self.val_config["pin_memory"])
-
-    def test_dataloader(self):
-        assert self.test_dataset is not None, "test_dataset not set (did setup() run?)"
-        return DataLoader(self.test_dataset, batch_size=self.test_config["batch_size"], shuffle=self.test_config["shuffle"],
-                          num_workers=self.test_config["num_workers"], pin_memory=self.test_config["pin_memory"])
-
-
-
-
+        return sample, target
 
 
 class MaskedFormerTopsWsDataModule(LightningDataModule):
@@ -443,6 +344,9 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
     DataModule that loads both tops and Ws from HDF5, merges them
     into unified targets with class labels, and uses a custom collate
     function that returns targets as List[Dict].
+
+    Uses lazy HDF5 loading by default to avoid OOM on large datasets.
+    Set data_modules.lazy: false in config to force in-memory loading.
     """
 
     def __init__(self, config):
@@ -464,19 +368,41 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         self.ws_mask_key = self.config.get("ws_mask_key", "masks_Ws")
         self.ws_kin_key = self.config.get("ws_kin_key", "kinematics_Ws")
 
+        self.lazy = self.config.get("lazy", False)
+        self.load_interactions = self.config.get("load_interactions", True)
+
         self.train_dataset = None
         self.test_dataset = None
         self.val_dataset = None
 
-    def _load_split(self, name: str) -> MaskedFormerDataSet:
+    def _load_split(self, name: str) -> Dataset:
         path = Path(f"{self.data_prefix}{name}.h5")
         if not path.exists():
             raise FileNotFoundError(f"Missing split file: {path}")
 
+        if self.lazy:
+            return self._load_split_lazy(path)
+        return self._load_split_eager(path)
+
+    def _load_split_lazy(self, path: Path) -> LazyHDF5Dataset:
+        ds = LazyHDF5Dataset(
+            h5_path=path,
+            tops_mask_key=self.tops_mask_key,
+            tops_kin_key=self.tops_kin_key,
+            ws_mask_key=self.ws_mask_key,
+            ws_kin_key=self.ws_kin_key,
+        )
+        return ds
+
+    def _load_split_eager(self, path: Path) -> MaskedFormerDataSet:
         with h5py.File(path, "r") as f:
             jet = f["jet"][()]
             src_mask = f["src_mask"][()]
-            interactions = f["interactions"][()]
+
+            if self.load_interactions and "interactions" in f:
+                interactions = f["interactions"][()]
+            else:
+                interactions = None
 
             tops_masks, tops_kins = _load_object_type(
                 f, self.tops_mask_key, self.tops_kin_key
@@ -485,8 +411,6 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
                 f, self.ws_mask_key, self.ws_kin_key
             )
 
-            # Load validity arrays if present (produced by dataset_prepper_3.py
-            # with min_objects < 4). Falls back to all-True (old behaviour) if absent.
             valid_tops = f["valid_tops"][()] if "valid_tops" in f else None
             valid_Ws = f["valid_Ws"][()] if "valid_Ws" in f else None
 
@@ -494,8 +418,6 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             tops_masks, tops_kins, ws_masks, ws_kins, valid_tops, valid_Ws
         )
 
-        # Only pass object_valid when it's not all-True (i.e. when some objects
-        # are actually invalid) to avoid unnecessary filtering overhead.
         has_partial = (object_valid is not None and not object_valid.all())
 
         ds = MaskedFormerDataSet(
@@ -515,7 +437,8 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         if stage in (None, "fit", "validate"):
             self.train_dataset = self._load_split("train")
             self.val_dataset = self._load_split("val")
-            print(f"[DM TopsWs] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}")
+            print(f"[DM TopsWs] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}"
+                  f"  {'lazy' if self.lazy else 'in-memory'}")
         if stage in (None, "test"):
             self.test_dataset = self._load_split("test")
             print(f"[DM TopsWs] test  len={len(self.test_dataset)}")
@@ -553,5 +476,3 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             pin_memory=self.test_config["pin_memory"],
             collate_fn=masked_former_collate_fn,
         )
-
-

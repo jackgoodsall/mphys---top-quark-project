@@ -83,15 +83,15 @@ except Exception as e:
         return {}
 
 try:
-    from utils import (
+    from kinematics import (
         apply_mask,
         calculate_energy_value,
         convert_polar_to_cartesian,
         create_interaction_matrix,
     )
-    print("[OK] utils functions imported", flush=True)
+    print("[OK] kinematics functions imported", flush=True)
 except Exception as e:
-    print(f"[FAIL] utils import: {e}", flush=True)
+    print(f"[FAIL] kinematics import: {e}", flush=True)
     print("[WARN] Proceeding with dummy utils", flush=True)
     
     def apply_mask(arrays, mask):
@@ -493,8 +493,6 @@ class TopReconstructionDatasetFromH5:
 
     def _fit_file(self, raw_path: Path):
         """Fit transformers on a single file."""
-        # Interaction min/max is stable after a small sample — only fit once.
-        interaction_fitted = False
         with h5py.File(raw_path, "r") as f:
             file_len = f["jet"].shape[0]
             print(f"[FIT] File length: {file_len}", flush=True)
@@ -533,16 +531,16 @@ class TopReconstructionDatasetFromH5:
                 # Fit target transformers
                 self._fit_target_transformers(targets_dict)
 
-                # Fit interaction transformer once on a small sample.
-                # min/max converges quickly — 5 K events is sufficient.
-                if self.interaction_processor.needs_interaction() and not interaction_fitted:
+                # Fit interaction transformer on every chunk in sub-batches
+                # to avoid OOM (full chunk would be 500k×20×20×4 ≈ 3 GB).
+                if self.interaction_processor.needs_interaction():
                     try:
-                        sample = jet_chunk[:5_000]
-                        interaction_sample = create_interaction_matrix(sample)
-                        self._fit_interaction_transformers(interaction_sample)
-                        interaction_fitted = True
-                        print("[FIT] Interaction transformer fitted on 5K-event sample",
-                              flush=True)
+                        FIT_BATCH = 50_000
+                        for b_start in range(0, jet_chunk.shape[0], FIT_BATCH):
+                            b_end = min(b_start + FIT_BATCH, jet_chunk.shape[0])
+                            int_batch = create_interaction_matrix(jet_chunk[b_start:b_end])
+                            self._fit_interaction_transformers(int_batch)
+                            del int_batch
                     except Exception as e:
                         print(f"[WARN] Interaction fit failed: {e}", flush=True)
 
