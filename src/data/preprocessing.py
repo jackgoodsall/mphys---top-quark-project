@@ -913,7 +913,7 @@ if __name__ == "__main__":
     print("="*60 + "\n", flush=True)
     
     try:
-        config = load_any_config("config/top_reconstruction_config.yaml")
+        config = load_any_config("config/preprocessing_config.yaml")
         
         if not config:
             print("[WARN] Config is empty, using defaults", flush=True)
