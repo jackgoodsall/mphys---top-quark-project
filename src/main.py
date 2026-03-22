@@ -56,20 +56,14 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
     # Get task-specific configurations
     task_configs = config.get("tasks", {})
     
-    # Get legacy loss parameters for backward compatibility
-    legacy_loss_params = config.get("loss_parameters", {})
-    
     # ========================================
     # Mask Reconstruction Task
     # ========================================
     mask_config = task_configs.get("mask", {})
-    
-    # Loss weights: try new format first, fall back to legacy
+
     mask_loss_weights = {
-        'dice': mask_config.get('dice_weight', 
-                               legacy_loss_params.get('dice_weight', 1.0)),
-        'bce': mask_config.get('bce_weight',
-                              legacy_loss_params.get('bce_weight', 0.5))
+        'dice': mask_config.get('dice_weight', 1.0),
+        'bce': mask_config.get('bce_weight', 0.5),
     }
     
     # Layer weights
@@ -130,34 +124,9 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         task_registry.register_task(mask_W_task)
 
     # ========================================
-    # W Objectness Task (chain_queries: W-phase objectness signal)
-    # ========================================
-    if chain_queries:
-        obj_W_config = task_configs.get("objectness_W", {})
-
-        obj_W_layer_weights = _build_layer_weights(
-            layer_config=obj_W_config.get('layer_weights'),
-            strategy=obj_W_config.get('layer_weight_strategy'),
-            strategy_params=obj_W_config.get('layer_weight_params', {}),
-            n_layers=n_decoder_layers,
-        )
-
-        objectness_W_task = ObjectnessTask(
-            TaskConfig(
-                name='objectness_W',
-                output_names=['objectness_W_logit'],
-                output_dims={'objectness_W_logit': 1},
-                cost_weights={'objectness': obj_W_config.get('cost_weight', 0.0)},
-                loss_weights={'objectness': obj_W_config.get('loss_weight', 1.0)},
-                max_objects=max_objects,
-                layer_weights=obj_W_layer_weights,
-                head_norm=obj_W_config.get('head_norm', True),
-            ),
-        )
-        task_registry.register_task(objectness_W_task)
-
-    # ========================================
     # Objectness Task (is this query a real object?)
+    # Single head — in chain_queries mode a valid top requires a valid W,
+    # so one binary objectness per query is sufficient.
     # ========================================
     obj_config = task_configs.get("objectness", {})
 
@@ -359,9 +328,6 @@ if __name__ == "__main__":
         interaction_embedder=interactions_embedder,
         task_registry=task_registry,
         **config["model_parameters"]["transformer"],
-        use_hungarian_matching=config.get("use_hungarian_matching", True),
-        matching_solver=config.get("matching_solver", "gpu_bruteforce"),
-        max_targets=config.get("max_targets", 5),
     )
     
     # DataModule
