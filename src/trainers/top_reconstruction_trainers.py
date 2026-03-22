@@ -1,10 +1,7 @@
 import os
 import math
 import lightning
-from lightning import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
-from torchmetrics import Accuracy
-from torchmetrics.classification import BinaryAccuracy
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -23,17 +20,10 @@ class WarmupEarlyStopping(EarlyStopping):
         if trainer.current_epoch < self.warmup_epochs:
             return
         super().on_validation_epoch_end(trainer, pl_module)
-from dataclasses import field
-from torchmetrics.functional import roc, precision_recall_curve, auroc
 import h5py
 import torch_optimizer
-from utils.utils import generate_reconstruction_report
-import joblib
 from src.models.components.masked_former_tasks import * 
 
-
-def _to_1d(x: torch.Tensor) -> torch.Tensor:
-    return x.reshape(-1)
 
 def _check_for_nans( name, x):
     """Recursively check tensors or dicts for non-finite values."""

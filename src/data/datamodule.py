@@ -158,25 +158,15 @@ class MaskedFormerDataSet(Dataset):
     """In-memory dataset. Used by analysis scripts and as a fallback."""
 
     def __init__(self, jet, interactions, src_mask, targets, target_kinematics,
-                 target_mass=None, mass_with_kinematics=False, classes=None,
-                 object_valid=None):
-        self.mass_with_kinematics = mass_with_kinematics
+                 classes=None, object_valid=None):
         self.jet = np.asarray(jet)
         self.src_mask = np.asarray(src_mask)
         self.targets = np.asarray(targets)
         self.interactions = np.asarray(interactions) if interactions is not None else None
         self._zero_interactions = None  # lazily created single zero row
         self.target_kinematics = np.asarray(target_kinematics)
-        self.inv_mass = np.asarray(target_mass) if target_mass is not None else None
         self.classes = np.asarray(classes) if classes is not None else None
         self.object_valid = np.asarray(object_valid, dtype=bool) if object_valid is not None else None
-
-        if self.mass_with_kinematics:
-            if target_mass is not None:
-                self.inv_mass = self.inv_mass.reshape(-1, 1, 1)
-                self.target_kinematics = np.concatenate(
-                    (self.target_kinematics, self.inv_mass), axis=2
-                )
 
     def __len__(self):
         return int(self.jet.shape[0])
@@ -213,10 +203,6 @@ class MaskedFormerDataSet(Dataset):
             ).bool(),
             "target_kinematics": torch.from_numpy(np.asarray(kin)).float(),
         }
-        if not self.mass_with_kinematics and self.inv_mass is not None:
-            target["inv_mass"] = torch.from_numpy(
-                np.asarray(self.inv_mass[idx])
-            ).float()
         if cls is not None:
             target["classes"] = torch.from_numpy(np.asarray(cls)).long()
 
@@ -426,8 +412,6 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             src_mask=src_mask,
             targets=masks,
             target_kinematics=kins,
-            target_mass=None,
-            mass_with_kinematics=False,
             classes=classes,
             object_valid=object_valid if has_partial else None,
         )

@@ -179,7 +179,6 @@ class MaskedReconstructionPart(nn.Module):
                  use_particle_gating: bool = False,
                  n_gating_layers: int = 2,
                  n_gate_queries: int = 1,
-                 *args,
                  **kwargs
                  ):
         super().__init__()

@@ -36,7 +36,7 @@ sys.path.insert(0, str(_PROJ_DIR))
 from models.particle_transformer import (
     ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
 )
-from data.top_quark_reconstruction import (
+from data.datamodule import (
     MaskedFormerDataSet, masked_former_collate_fn, merge_object_types,
 )
 from trainers.top_reconstruction_trainers import ReconstructionTrainer
@@ -149,8 +149,6 @@ def build_signal_jets_dataset(h5_path: Path, config: dict):
         src_mask=new_src_mask,
         targets=masks,
         target_kinematics=kins,
-        target_mass=None,
-        mass_with_kinematics=False,
         classes=classes,
         object_valid=object_valid if has_partial else None,
     )
@@ -281,9 +279,6 @@ def main():
         interaction_embedder=interactions_embedder,
         task_registry=task_registry,
         **config["model_parameters"]["transformer"],
-        use_hungarian_matching=config.get("use_hungarian_matching", True),
-        matching_solver=config.get("matching_solver", "gpu_bruteforce"),
-        max_targets=config.get("max_targets", 5),
     )
 
     # ------------------------------------------------------------------
