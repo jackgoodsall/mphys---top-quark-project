@@ -1,57 +1,28 @@
-root_dataset_prepper:
-  root_path: "data/topquarkreconstruction/root_data"
-  save_path: "data/topquarkreconstruction/h5py_data/combined"
-  train_file_name:  "ttbar_train"
-  val_file_name: "ttbar_val"
-  test_file_name: "ttbar_test"
-  save_file_prefix: "ttbar_h5py_raw_"
+max_objects: 2   # chain_queries: one query per decay chain
 
-
-preprocessing:
-  stream_size: 500000
-  save_path: "data/topquarkreconstruction/masked_targets_combined"
-  save_file_prefix: "ttbar_preprocessed_"
-  min_objects: 1    # keep events with >= this many reconstructable objects
-                    # set to 4 to restore original fully-matched-only behaviour
-
-interactions: 
-  True
-reconstruct_W: True
-use_hungarian_matching: True
-matching_solver: "gpu_bruteforce"   # "gpu_bruteforce" | "scipy"
-max_targets: 10                       # GPU fallback threshold for gpu_bruteforce
-  
 
 tasks:
 
-  # --- top_first layer weights (active) ---
+  # --- w_first layer weights (active) ---
   mask:
-    cost_weight: 1.0
-    dice_weight: 1.0
-    bce_weight: 0.5
-    null_mask_penalty: 0.2
-    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
-
-  mask_W:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
     null_mask_penalty: 0.2
     layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
-  objectness:
-    cost_weight: 1
-    loss_weight: 0.05
-    null_weight: 0.2
-    head_norm: True
-    layer_weights: {0: 0.0, 1: 0, 2: 0, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
+  mask_W:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
 
-  objectness_W:
-    cost_weight: 0      # matching already handled by top-phase objectness
-    loss_weight: 0.05
-    null_weight: 0.2
+  objectness:
+    cost_weight: 0
+    loss_weight: 0
     head_norm: True
-    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0, 6: 0, 7: 1.0}
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
   # object_type: not registered in chain_queries mode
 
@@ -61,16 +32,9 @@ pretraining:
   transition_ramp_epochs: 5
 
 
-
-
-max_objects: 2   # chain_queries: one query per decay chain
-
-
 data_modules:
   input_path: data/topquarkreconstruction/masked_targets_combined
   input_prefix: "ttbar_preprocessed_"
-  mass_with_kinematics: True
-  mask_only: True
   lazy: False
   load_interactions: False  # skip loading interaction matrices (~122 GB); set True when use_vanilla_attention is off
   # HDF5 key names for tops+Ws loading
@@ -101,7 +65,6 @@ model_parameters:
     embedding_size: 64
     p_dropout: 0.1
 
-
   interaction_embedder:
     input_features: 4
     hidden_layers: [64, 64, 64]
@@ -113,13 +76,15 @@ model_parameters:
     n_encoder_layers: 8
     n_decoder_layers: 8
     n_heads: 8
-    out_dimensions: 6
     p_dropout: 0.1
     dim_ff: 256
-    number_class_tokens: 2   # one query per top-decay chain (W->top from same token)
+    num_query_tokens: 2      # learnable query tokens (= n_chains in chain_queries mode)
     hierarchical_decoding: True
     chain_queries: True       # W-phase then top-phase from the SAME query token
-    hierarchy_order: "top_first"  # "top_first" | "w_first" — controls which decoder phase runs first
+    hierarchy_order: "w_first"  # "top_first" | "w_first" — controls which decoder phase runs first
+    use_hungarian_matching: True
+    matching_solver: "gpu_bruteforce"   # "gpu_bruteforce" | "scipy"
+    max_targets: 10                     # GPU fallback threshold for gpu_bruteforce
     use_mia_encoder: False
     n_mia_layers: 0
     mia_interaction_dim: 64
@@ -130,41 +95,34 @@ model_parameters:
 
 model_training:
   seed: null
-  learning_rate: 5e-4
-  weight_decay: 0.0001
+  learning_rate: 2e-4
+  weight_decay: 0.001
   use_lookahead: True
-  gradient_clip_val: 5  # Increased from 2 to prevent gradient explosions causing NaNs
-  precision: "32-true"   # Lightning precision options:
-                            #   "32-true"    — full FP32, safest, slowest
-                            #   "16-mixed"   — FP16 mixed (fast but can overflow; needs loss scaling)
-                            #   "bf16-mixed" — BF16 mixed (A100 native, no overflow risk) [recommended]
-                            #   "bf16-true"  — pure BF16 everywhere (risky for training)
-                            #   "64-true"    — double precision (debugging only)
-  matmul_precision: "high"  # torch.set_float32_matmul_precision — affects residual FP32 matmuls:
-                            #   "highest" — full FP32, no approximation (default)
-                            #   "high"    — TF32: ~8x faster on A100, minimal precision loss [recommended]
-                            #   "medium"  — BF16 matmuls internally (redundant if using bf16-mixed)
+  gradient_clip_val: 2
+  precision: "bf16-mixed"   # "32-true" | "16-mixed" | "bf16-mixed" [recommended] | "bf16-true" | "64-true"
+  matmul_precision: "high"  # "highest" (FP32) | "high" (TF32, recommended) | "medium" (BF16)
   min_epochs: 15
   max_epochs: 100
 
   scheduler:
-    type: "warmup_cosine"  # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
-    # WarmupCosine params (type=warmup_cosine):
-    warmup_epochs: 3       # linear ramp 0 → lr over this many epochs
-    T_max: 100               # total epochs for cosine decay
-    eta_min: 1e-6           # floor LR at end of cosine decay
-    update_interval: "step" # "step" (every batch) or "epoch" (once per epoch)
-    lr_rewarmup_epochs: 5      # re-warmup from reduced LR at phase transition; 0 = disabled
-    lr_rewarmup_fraction: 1.5   # start re-warmup at this fraction of base LR
-    # ReduceLROnPlateau params (type=plateau):
-    factor: 0.5             # halve LR on plateau
-    patience: 3             # epochs without improvement before reducing
+    type: "warmup_cosine"     # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
+    update_interval: "step"   # "step" (every batch) or "epoch" (once per epoch)
+
+    # --- warmup_cosine ---
+    warmup_epochs: 5          # linear ramp 0 → lr
+    T_max: 100                # total epochs for cosine decay
+    eta_min: 1e-6             # floor LR at end of cosine decay
+    lr_rewarmup_epochs: 5     # re-warmup at phase transition; 0 = disabled
+    lr_rewarmup_fraction: 1.5 # start re-warmup at this fraction of base LR
+
+    # --- plateau ---
+    factor: 0.5
+    patience: 3
     plateau_monitor: "val_loss"
-    # StepLR params (type=step):
+
+    # --- step ---
     step_size: 3000
     gamma: 0.9
-    # CosineAnnealingLR params (type=cosine):
-    # T_max and eta_min shared with warmup_cosine above
 
 training_callbacks:
   checkpoint:
