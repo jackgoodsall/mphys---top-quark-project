@@ -166,7 +166,7 @@ class MaskedReconstructionPart(nn.Module):
                  n_heads,
                  dim_ff,
                  p_dropout,
-                 number_class_tokens,
+                 num_query_tokens,
                  task_registry: TaskRegistry,
                  activation_function="gelu",
                  use_hungarian_matching=True,
@@ -187,7 +187,7 @@ class MaskedReconstructionPart(nn.Module):
         # Model parameters
         self.particle_embedder = particle_embedder
         self.interaction_embedder = interaction_embedder
-        self.number_class_tokens = number_class_tokens
+        self.num_query_tokens = num_query_tokens
         self.use_hungarian_matching = use_hungarian_matching
         self.task_registry = task_registry
         self.use_mia_encoder = use_mia_encoder
@@ -231,29 +231,29 @@ class MaskedReconstructionPart(nn.Module):
         # randn (zero-centered) rather than rand (positive-biased) so queries
         # start distinguishable and the matcher can form meaningful assignments
         self.target_tokens = nn.Parameter(
-            torch.randn((self.number_class_tokens, embedding_size)) * 0.02
+            torch.randn((self.num_query_tokens, embedding_size)) * 0.02
         )
 
         self.hierarchical_decoding = kwargs.get('hierarchical_decoding', False)
         # chain_queries: single query per top-decay chain (W-phase → top-phase same token).
-        # When True, number_class_tokens = n_chains (e.g. 2).  No top/W query split.
+        # When True, num_query_tokens = n_chains (e.g. 2).  No top/W query split.
         self.chain_queries = kwargs.get('chain_queries', False)
         self.hierarchy_order = kwargs.get('hierarchy_order', 'w_first')
 
         if self.chain_queries:
             # All queries are chain queries — no type distinction needed.
-            self.n_top_queries = number_class_tokens
-            self.n_w_queries = number_class_tokens
+            self.n_top_queries = num_query_tokens
+            self.n_w_queries = num_query_tokens
         else:
             # Type-conditioned queries: first n_top_queries are top-designated,
             # remainder are W-designated.
-            n_top_queries = kwargs.get('n_top_queries', number_class_tokens // 2)
+            n_top_queries = kwargs.get('n_top_queries', num_query_tokens // 2)
             self.type_embeddings = nn.Embedding(2, embedding_size)  # 0=top, 1=W
             self.register_buffer('query_type_ids',
                 torch.cat([torch.zeros(n_top_queries, dtype=torch.long),
-                           torch.ones(number_class_tokens - n_top_queries, dtype=torch.long)]))
+                           torch.ones(num_query_tokens - n_top_queries, dtype=torch.long)]))
             self.n_top_queries = n_top_queries
-            self.n_w_queries = number_class_tokens - n_top_queries
+            self.n_w_queries = num_query_tokens - n_top_queries
 
         # Decoder
         if self.hierarchical_decoding:
@@ -297,7 +297,7 @@ class MaskedReconstructionPart(nn.Module):
         if self.use_hungarian_matching:
             self.matcher = create_matcher(
                 matching_solver=matching_solver,
-                num_queries=number_class_tokens,
+                num_queries=num_query_tokens,
                 max_targets=max_targets,
             )
     
@@ -459,7 +459,7 @@ class MaskedReconstructionPart(nn.Module):
                     phase1_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
 
             # Extended memory: particles + phase-1 states
-            chain_valid = src_mask.new_ones(B, self.number_class_tokens)
+            chain_valid = src_mask.new_ones(B, self.num_query_tokens)
             extended_src_mask = torch.cat([src_mask, chain_valid], dim=1)
             extended_memory = torch.cat([memory, phase1_tgt], dim=1)  # [B, N+Q, D]
 
