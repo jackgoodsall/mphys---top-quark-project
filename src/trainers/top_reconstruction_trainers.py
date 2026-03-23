@@ -226,9 +226,10 @@ class ReconstructionTrainer(lightning.LightningModule):
                 k for k, v in task_loss_accum.items()
                 if not (torch.isfinite(v).all() if torch.is_tensor(v) else (v == v))
             ]
-            print(f"\nNon-finite total_loss={total_loss.item():.4f} — stopping training.")
-            if bad_tasks:
-                print(f"   Tasks with NaN: {bad_tasks}")
+            if self.global_rank == 0:
+                print(f"\nNon-finite total_loss={total_loss.item():.4f} — stopping training.")
+                if bad_tasks:
+                    print(f"   Tasks with NaN: {bad_tasks}")
             self.trainer.should_stop = True
 
         return total_loss, task_loss_accum
@@ -497,7 +498,8 @@ class ReconstructionTrainer(lightning.LightningModule):
         """Log model parameter counts at the start of training"""
         total = sum(p.numel() for p in self.model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"\nModel parameters: {total:,} total, {trainable:,} trainable\n")
+        if self.global_rank == 0:
+            print(f"\nModel parameters: {total:,} total, {trainable:,} trainable\n")
         if self.logger:
             self.logger.experiment.add_scalar('model/total_params', float(total), global_step=0)
             self.logger.experiment.add_scalar('model/trainable_params', float(trainable), global_step=0)
@@ -533,7 +535,7 @@ class ReconstructionTrainer(lightning.LightningModule):
                 self.task_registry.set_active_tasks(self.mask_pretrain_tasks)
                 if mask_task is not None:
                     mask_task.null_penalty_scale = 0.0
-                if epoch == 0:
+                if epoch == 0 and self.global_rank == 0:
                     print(f"\n[Pretraining] Phase 1: mask-only "
                           f"(epochs 0–{self.mask_pretrain_epochs - 1}), "
                           f"active tasks: {self.mask_pretrain_tasks}")
@@ -555,11 +557,11 @@ class ReconstructionTrainer(lightning.LightningModule):
                 if mask_task is not None:
                     mask_task.null_penalty_scale = alpha
 
-                if epoch == self.mask_pretrain_epochs:
+                if epoch == self.mask_pretrain_epochs and self.global_rank == 0:
                     print(f"\n[Pretraining] Phase 2: full multi-task "
                           f"(epoch {epoch}+), all tasks active"
                           f"{f', ramp over {ramp} epochs' if ramp > 0 else ''}")
-                if ramp > 0 and epochs_since < ramp:
+                if ramp > 0 and epochs_since < ramp and self.global_rank == 0:
                     print(f"[Ramp] epoch {epoch}: alpha={alpha:.3f} "
                           f"for new tasks + null penalty")
 
@@ -576,7 +578,9 @@ class ReconstructionTrainer(lightning.LightningModule):
                  prog_bar=False, sync_dist=False)
 
     def on_train_end(self):
-        """Plot loss curves and learning rate schedule"""
+        """Plot loss curves and learning rate schedule (rank 0 only)"""
+        if self.global_rank != 0:
+            return
         if self.trainer.logger is None:
             return
         out_dir = Path(self.trainer.logger.log_dir)
@@ -664,8 +668,12 @@ def train_reconstruction_model(
         version = int(slurm_id) if slurm_id else None
         logger = TensorBoardLogger(log_dir, version=version)
 
+    train_cfg = config["model_training"]
     lightning_trainer = lightning.Trainer(
-        num_nodes=1,
+        num_nodes=train_cfg.get("num_nodes", 1),
+        devices=train_cfg.get("devices", "auto"),
+        strategy=train_cfg.get("strategy", "auto"),
+        accelerator=train_cfg.get("accelerator", "auto"),
         precision=precision,
         min_epochs=config["model_training"]["min_epochs"],
         max_epochs=config["model_training"]["max_epochs"],

@@ -302,7 +302,11 @@ def create_layer_weights(strategy: str, n_layers: int, **kwargs) -> Optional[Dic
 
 
 if __name__ == "__main__":
-    config = load_any_config("config/top_reconstruction_config.yaml")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config/top_reconstruction_config.yaml")
+    args, _ = parser.parse_known_args()
+    config = load_any_config(args.config)
 
     # FP32 matmul precision (TF32 on Ampere+ GPUs)
     matmul_precision = config.get("model_training", {}).get("matmul_precision", "highest")
@@ -388,6 +392,8 @@ if __name__ == "__main__":
         # Minimal trainer — no early stopping, no checkpointing
         lr_trainer = pl.Trainer(
             num_nodes=1,
+            devices=1,
+            accelerator=config.get("model_training", {}).get("accelerator", "auto"),
             precision=config.get("model_training", {}).get("precision", "32-true"),
             max_epochs=1,
             default_root_dir=log_dir,

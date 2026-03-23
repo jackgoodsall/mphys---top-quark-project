@@ -325,6 +325,135 @@ class LazyHDF5Dataset(Dataset):
         return sample, target
 
 
+class MemmapDataset(Dataset):
+    """
+    Memory-mapped dataset backed by .npy files converted once from HDF5.
+
+    Per-sample access (arr[idx]) reads only the bytes for that row via the OS
+    page cache — zero upfront RAM cost, near in-memory speed after warm-up.
+
+    To create the .npy files from an existing .h5 file, call
+    MemmapDataset.prepare(h5_path, npy_dir) once before training.
+    """
+
+    @staticmethod
+    def npy_dir(h5_path: Path) -> Path:
+        """Canonical directory for the .npy files derived from h5_path."""
+        return h5_path.parent / (h5_path.stem + "_memmap")
+
+    @staticmethod
+    def prepare(h5_path: Path, tops_mask_key, tops_kin_key,
+                ws_mask_key, ws_kin_key, load_interactions: bool = True):
+        """
+        Convert all arrays in h5_path to .npy files in a sibling directory.
+        Skips keys whose .npy file already exists.
+        """
+        npy_dir = MemmapDataset.npy_dir(h5_path)
+        npy_dir.mkdir(exist_ok=True)
+        keys_to_save = ["jet", "src_mask"]
+        if load_interactions:
+            keys_to_save.append("interactions")
+        for k in [tops_mask_key, tops_kin_key, ws_mask_key, ws_kin_key,
+                  "valid_tops", "valid_Ws"]:
+            if k:
+                keys_to_save.append(k)
+
+        with h5py.File(h5_path, "r") as f:
+            for key in keys_to_save:
+                if key not in f:
+                    continue
+                out = npy_dir / f"{key}.npy"
+                if out.exists():
+                    continue
+                print(f"[memmap] converting {key} → {out} ...", flush=True)
+                np.save(str(out), f[key][()])
+        return npy_dir
+
+    def __init__(self, npy_dir: Path, tops_mask_key, tops_kin_key,
+                 ws_mask_key, ws_kin_key, load_interactions: bool = True):
+        self.npy_dir = npy_dir
+        self.load_interactions = load_interactions
+
+        def _mmap(key):
+            p = npy_dir / f"{key}.npy"
+            return np.load(str(p), mmap_mode="r") if p.exists() else None
+
+        self._jet = _mmap("jet")
+        self._src_mask = _mmap("src_mask")
+        self._interactions = _mmap("interactions") if load_interactions else None
+
+        self._tops_masks = _mmap(tops_mask_key) if tops_mask_key else None
+        self._tops_kins = _mmap(tops_kin_key) if tops_kin_key else None
+        self._ws_masks = _mmap(ws_mask_key) if ws_mask_key else None
+        self._ws_kins = _mmap(ws_kin_key) if ws_kin_key else None
+
+        valid_tops = _mmap("valid_tops")
+        valid_Ws = _mmap("valid_Ws")
+
+        N = len(self._jet)
+        classes_parts, valid_parts = [], []
+        if self._tops_masks is not None:
+            T_top = self._tops_masks.shape[1]
+            classes_parts.append(np.full((N, T_top), CLASS_TOP, dtype=np.int64))
+            vt = valid_tops if valid_tops is not None else np.ones((N, T_top), dtype=bool)
+            valid_parts.append(vt.astype(bool))
+        if self._ws_masks is not None:
+            T_w = self._ws_masks.shape[1]
+            classes_parts.append(np.full((N, T_w), CLASS_W, dtype=np.int64))
+            vw = valid_Ws if valid_Ws is not None else np.ones((N, T_w), dtype=bool)
+            valid_parts.append(vw.astype(bool))
+
+        self.classes = np.concatenate(classes_parts, axis=1)
+        self.object_valid = np.concatenate(valid_parts, axis=1)
+        self._has_partial = not self.object_valid.all()
+        self._zero_interactions = None
+
+    def __len__(self):
+        return len(self._jet)
+
+    def __getitem__(self, idx):
+        jet = np.array(self._jet[idx])
+        src_mask = np.array(self._src_mask[idx])
+
+        if self._interactions is not None:
+            interactions = np.array(self._interactions[idx])
+        else:
+            if self._zero_interactions is None:
+                P = jet.shape[0]
+                self._zero_interactions = np.zeros((P, P, 4), dtype=np.float32)
+            interactions = self._zero_interactions
+
+        sample = {
+            "jet": torch.from_numpy(jet).float(),
+            "src_mask": torch.from_numpy(src_mask).bool(),
+            "interactions": torch.from_numpy(interactions).float(),
+        }
+
+        masks_parts, kins_parts = [], []
+        if self._tops_masks is not None:
+            masks_parts.append(np.array(self._tops_masks[idx]))
+            kins_parts.append(np.array(self._tops_kins[idx]))
+        if self._ws_masks is not None:
+            masks_parts.append(np.array(self._ws_masks[idx]))
+            kins_parts.append(np.array(self._ws_kins[idx]))
+
+        masks = np.concatenate(masks_parts, axis=0)
+        kins = np.concatenate(kins_parts, axis=0)
+        cls = self.classes[idx]
+
+        if self._has_partial:
+            valid = self.object_valid[idx]
+            masks, kins, cls = masks[valid], kins[valid], cls[valid]
+
+        target = {
+            "jet_mask_true": torch.from_numpy(masks).float(),
+            "jet_valid_mask": torch.from_numpy(src_mask).bool(),
+            "target_kinematics": torch.from_numpy(kins).float(),
+            "classes": torch.from_numpy(cls).long(),
+        }
+        return sample, target
+
+
 class MaskedFormerTopsWsDataModule(LightningDataModule):
     """
     DataModule that loads both tops and Ws from HDF5, merges them
@@ -354,7 +483,7 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         self.ws_mask_key = self.config.get("ws_mask_key", "masks_Ws")
         self.ws_kin_key = self.config.get("ws_kin_key", "kinematics_Ws")
 
-        self.lazy = self.config.get("lazy", False)
+        self.lazy = self.config.get("lazy", False)   # False | True | "memmap"
         self.load_interactions = self.config.get("load_interactions", True)
 
         self.train_dataset = None
@@ -366,6 +495,8 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         if not path.exists():
             raise FileNotFoundError(f"Missing split file: {path}")
 
+        if self.lazy == "memmap":
+            return self._load_split_memmap(path)
         if self.lazy:
             return self._load_split_lazy(path)
         return self._load_split_eager(path)
@@ -379,6 +510,24 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             ws_kin_key=self.ws_kin_key,
         )
         return ds
+
+    def _load_split_memmap(self, path: Path) -> MemmapDataset:
+        npy_dir = MemmapDataset.prepare(
+            path,
+            tops_mask_key=self.tops_mask_key,
+            tops_kin_key=self.tops_kin_key,
+            ws_mask_key=self.ws_mask_key,
+            ws_kin_key=self.ws_kin_key,
+            load_interactions=self.load_interactions,
+        )
+        return MemmapDataset(
+            npy_dir=npy_dir,
+            tops_mask_key=self.tops_mask_key,
+            tops_kin_key=self.tops_kin_key,
+            ws_mask_key=self.ws_mask_key,
+            ws_kin_key=self.ws_kin_key,
+            load_interactions=self.load_interactions,
+        )
 
     def _load_split_eager(self, path: Path) -> MaskedFormerDataSet:
         with h5py.File(path, "r") as f:
@@ -421,8 +570,8 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         if stage in (None, "fit", "validate"):
             self.train_dataset = self._load_split("train")
             self.val_dataset = self._load_split("val")
-            print(f"[DM TopsWs] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}"
-                  f"  {'lazy' if self.lazy else 'in-memory'}")
+            mode = {False: "in-memory", True: "lazy", "memmap": "memmap"}.get(self.lazy, str(self.lazy))
+            print(f"[DM TopsWs] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}  {mode}")
         if stage in (None, "test"):
             self.test_dataset = self._load_split("test")
             print(f"[DM TopsWs] test  len={len(self.test_dataset)}")
