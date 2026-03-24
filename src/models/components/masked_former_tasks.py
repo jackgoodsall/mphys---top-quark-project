@@ -234,12 +234,14 @@ class MaskReconstructionTask(BaseTask):
         null_mask_penalty: float = 0.1,
         pred_key: str = 'mask_predictions',
         target_key: str = 'jet_mask_true',
+        bce_pos_weight: bool = False,
     ):
         super().__init__(config)
         self.pred_key = pred_key
         self.target_key = target_key
         self.eps = 1e-6  # Increased from 1e-8 for better numerical stability in Dice loss
         self.null_mask_penalty = null_mask_penalty
+        self.bce_pos_weight = bce_pos_weight
         # 0.0 = suppressed (during mask-only pretraining), 1.0 = full penalty.
         # Ramped from 0→1 during phase transition to avoid "predict nothing" snap-on.
         self.null_penalty_scale = 1.0
@@ -319,10 +321,24 @@ class MaskReconstructionTask(BaseTask):
                 dice = (2 * intersection) / (pred_sum + target_sum + self.eps)
                 dice_loss = (1 - dice).mean()
 
-                # BCE loss
-                bce = F.binary_cross_entropy_with_logits(
-                    real_pred_logits, real_tgt_float, reduction='none'
-                )
+                # BCE loss — optional per-mask positive weighting to
+                # counteract signal dilution in high-multiplicity events.
+                # pos_weight = n_neg / n_pos per mask so that signal and
+                # background particles contribute equally to the gradient.
+                if self.bce_pos_weight:
+                    n_pos = real_tgt_float.sum(dim=-1, keepdim=True).clamp(min=1)  # [N_real, 1]
+                    if valid_mask is not None:
+                        n_total = real_vm.sum(dim=-1, keepdim=True).clamp(min=1)
+                    else:
+                        n_total = torch.tensor(N, device=real_tgt_float.device, dtype=real_tgt_float.dtype)
+                    pw = ((n_total - n_pos) / n_pos).expand_as(real_tgt_float)     # [N_real, N]
+                    bce = F.binary_cross_entropy_with_logits(
+                        real_pred_logits, real_tgt_float, pos_weight=pw, reduction='none'
+                    )
+                else:
+                    bce = F.binary_cross_entropy_with_logits(
+                        real_pred_logits, real_tgt_float, reduction='none'
+                    )
                 if valid_mask is not None:
                     bce = bce * real_vm
                     num_valid = real_vm.sum(dim=-1).clamp(min=1)
@@ -388,9 +404,17 @@ class MaskReconstructionTask(BaseTask):
             dice_loss = 1 - dice
 
             # BCE loss
-            bce_per_particle = F.binary_cross_entropy_with_logits(
-                pred_masks_flat, target_float_flat, reduction='none'
-            )
+            if self.bce_pos_weight:
+                n_pos = target_float_flat.sum(dim=-1, keepdim=True).clamp(min=1)
+                n_total_flat = torch.tensor(N, device=target_float_flat.device, dtype=target_float_flat.dtype)
+                pw = ((n_total_flat - n_pos) / n_pos).expand_as(target_float_flat)
+                bce_per_particle = F.binary_cross_entropy_with_logits(
+                    pred_masks_flat, target_float_flat, pos_weight=pw, reduction='none'
+                )
+            else:
+                bce_per_particle = F.binary_cross_entropy_with_logits(
+                    pred_masks_flat, target_float_flat, reduction='none'
+                )
 
             if valid_mask is not None:
                 valid_mask_flat = valid_mask.unsqueeze(1).expand(-1, num_targets, -1).reshape(-1, N)
