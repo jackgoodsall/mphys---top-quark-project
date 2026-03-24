@@ -535,7 +535,7 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             src_mask = f["src_mask"][()]
 
             if self.load_interactions and "interactions" in f:
-                interactions = f["interactions"][()]
+                interactions = f["interactions"][()].astype(np.float16)
             else:
                 interactions = None
 

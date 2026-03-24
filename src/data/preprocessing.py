@@ -224,18 +224,20 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
     for both tops and W bosons using fully vectorized operations.
     """
 
-    def __init__(self, 
-                 tag_top1: np.ndarray = None, 
+    def __init__(self,
+                 tag_top1: np.ndarray = None,
                  tag_top2: np.ndarray = None,
-                 tag_W1: np.ndarray = None, 
+                 tag_W1: np.ndarray = None,
                  tag_W2: np.ndarray = None,
-                 num_jets: int = 20):
+                 num_jets: int = 20,
+                 require_top_for_w: bool = False):
         # Set default truth-matching tags
         self.tag_top1 = tag_top1 if tag_top1 is not None else np.array([1, 2, 3])
         self.tag_top2 = tag_top2 if tag_top2 is not None else np.array([4, 5, 6])
         self.tag_W1 = tag_W1 if tag_W1 is not None else np.array([2, 3])
         self.tag_W2 = tag_W2 if tag_W2 is not None else np.array([5, 6])
         self.num_jets = num_jets
+        self.require_top_for_w = require_top_for_w
         
         # Define reconstruction tasks: (tags, particle_type, index)
         self.reco_tasks = [
@@ -370,6 +372,10 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
             reco_Ws,
             np.zeros((B, 2, 1), dtype=np.float32)
         ], axis=-1)  # (B, 2, 5)
+
+        # Optionally require parent top to be valid for W to count
+        if self.require_top_for_w:
+            valid_Ws &= valid_tops
 
         return {
             "masks_tops": masks_tops,
