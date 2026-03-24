@@ -35,15 +35,15 @@ pretraining:
 data_modules:
   input_path: data/topquarkreconstruction/masked_targets_combined
   input_prefix: "ttbar_preprocessed_"
-  lazy: False
-  load_interactions: False  # skip loading interaction matrices (~122 GB); set True when use_vanilla_attention is off
+  lazy: false
+  load_interactions: True   # load interaction matrices (~89 GB); fits in gpuA 515 GB RAM
   # HDF5 key names for tops+Ws loading
   tops_mask_key: "masks_tops"
   tops_kin_key: "kinematics_tops"
   ws_mask_key: "masks_Ws"
   ws_kin_key: "kinematics_Ws"
   train:
-    batch_size: 2024
+    batch_size: 1024          # per-GPU; effective = 1024 x 2 GPUs = 2048
     shuffle: True
     num_workers: 4
     pin_memory: True
@@ -88,7 +88,7 @@ model_parameters:
     use_mia_encoder: False
     n_mia_layers: 0
     mia_interaction_dim: 64
-    use_vanilla_attention: true  # true = skip interaction embedder, use native flash attention encoder (faster R&D)
+    use_vanilla_attention: false  # false = use interaction embedder + ParticleAttentionBlock encoder
     use_particle_gating: false  # disabled for clean R&D baseline
     n_gating_layers: 2
     n_gate_queries: 1
@@ -103,6 +103,11 @@ model_training:
   matmul_precision: "high"  # "highest" (FP32) | "high" (TF32, recommended) | "medium" (BF16)
   min_epochs: 15
   max_epochs: 100
+  # DDP configuration
+  num_nodes: 1              # number of SLURM nodes
+  devices: 2                # GPUs per node
+  strategy: "ddp"           # "auto" | "ddp" | "ddp_find_unused_parameters_true"
+  accelerator: "gpu"        # "auto" | "gpu" | "cpu"
 
   scheduler:
     type: "warmup_cosine"     # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
