@@ -174,7 +174,8 @@ def binarise_predictions(scores, jet_valid, prior_k, use_probs, threshold=None):
 # Core efficiency computation
 # ---------------------------------------------------------------------------
 
-def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, is_perfect_top, is_perfect_W,
+def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, W_eff_gate,
+                       is_perfect_top, is_perfect_W,
                        all_tops_perfect, all_Ws_perfect, pred_real):
     """Compute per-multiplicity efficiency/purity rows for a given multiplicity array."""
     mult_values = sorted(np.unique(multiplicity_arr).tolist())
@@ -187,24 +188,25 @@ def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, is_perfect_top, 
 
         ir  = is_real[sel]
         teg = top_eff_gate[sel]
+        weg = W_eff_gate[sel]
         ipt = is_perfect_top[sel]
         ipw = is_perfect_W[sel]
 
-        has_W     = ir.any(axis=1)
         both_tops = ir.sum(axis=1) == 2
 
         n_top_correct = int((teg & ipt).sum())
         n_top_total   = int(teg.sum())
-        hw = int(has_W.sum())
+        n_W_correct   = int((weg & ipw).sum())
+        n_W_total     = int(weg.sum())
         bt = int(both_tops.sum())
 
         row = {
             "n_events":  int(n_sel),
             "top_eff":   float(n_top_correct / max(n_top_total, 1)),
-            "W_eff":     float((all_Ws_perfect[sel] & has_W).sum() / max(hw, 1)),
+            "W_eff":     float(n_W_correct / max(n_W_total, 1)),
             "ttbar_eff": float((all_tops_perfect[sel] & both_tops).sum() / max(bt, 1)),
             "n_top":     n_top_total,
-            "n_W":       hw,
+            "n_W":       n_W_total,
             "n_ttbar":   bt,
         }
 
@@ -228,7 +230,8 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
                          jet_valid, target_obj_top, pred_obj_top=None,
                          target_obj_W=None, pred_obj_W=None,
                          prior_top=None, prior_W=None, use_probs=False,
-                         threshold=None, strict=False, joint=False, original_mult=None):
+                         threshold=None, strict=False, joint=False, original_mult=None,
+                         require_top_for_w=False):
     """
     Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
 
@@ -242,6 +245,12 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
 
     # Chain is real if W target has particles
     is_real = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
+    # Stricter W gate: only count W as real if parent top also has particles
+    if require_top_for_w:
+        top_has_particles = target_masks_top.astype(bool).any(axis=-1)  # [N, Q]
+        is_real_W = is_real & top_has_particles
+    else:
+        is_real_W = is_real
     n_real  = is_real.sum(axis=1)                          # [N]
 
     valid = jet_valid[:, np.newaxis, :].astype(bool)       # [N, 1, P]
@@ -304,10 +313,19 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     n_top_correct = (top_eff_gate & detected_top).sum()
     n_top_total   = top_eff_gate.sum()
 
-    # W efficiency: event-level — all Ws correct among events with ≥1 real chain
+    # W efficiency: per-slot, using is_real_W (respects require_top_for_w)
+    if prior_W is not None:
+        W_counts    = target_W_b.sum(axis=-1)              # [N, Q]
+        W_eff_gate  = is_real_W & (W_counts == prior_W)
+    else:
+        W_eff_gate  = is_real_W
+
+    n_W_correct = (W_eff_gate & detected_W).sum()
+    n_W_total   = W_eff_gate.sum()
+
     # ttbar efficiency: event-level — both tops correct among events with exactly 2 real chains
     top_eff   = n_top_correct / max(n_top_total, 1)
-    W_eff     = (all_Ws_perfect & has_W).sum()     / max(has_W.sum(),     1)
+    W_eff     = n_W_correct   / max(n_W_total,   1)
     ttbar_eff = (all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)
     all_eff   = perfect_all.sum()                    / len(perfect_all)
 
@@ -354,7 +372,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     # Per-multiplicity breakdown (by signal jet count)
     multiplicity = jet_valid.sum(axis=1).astype(int)
     breakdown = _compute_breakdown(
-        multiplicity, is_real, top_eff_gate, detected_top, detected_W,
+        multiplicity, is_real, top_eff_gate, W_eff_gate, detected_top, detected_W,
         all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
     )
 
@@ -362,7 +380,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     breakdown_orig = {}
     if original_mult is not None:
         breakdown_orig = _compute_breakdown(
-            original_mult, is_real, top_eff_gate, detected_top, detected_W,
+            original_mult, is_real, top_eff_gate, W_eff_gate, detected_top, detected_W,
             all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
         )
 
@@ -382,7 +400,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         "n_pred_real_W":    n_pred_real_W,
         "n_pred_both_tops": n_pred_both_tops,
         "n_has_top":   int(n_top_total),   # chains with non-empty top target
-        "n_has_W":     int(has_W.sum()),
+        "n_has_W":     int(n_W_total),
         "n_both_tops": int(both_tops.sum()),
         "breakdown":      breakdown,
         "breakdown_orig": breakdown_orig,
@@ -428,7 +446,7 @@ def print_results(run_dir: Path, results: dict):
     print("─" * 70)
     top_label = "top+W masks correct" if results.get("joint") else "top mask correct"
     print(f"  Top efficiency     (per chain, {top_label}):  {results['top_eff']*100:6.2f}%   (N={results['n_has_top']:,} chains)")
-    print(f"  W efficiency       (>=1 chain, all W masks correct):   {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,})")
+    print(f"  W efficiency       (per chain, W mask correct):        {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,} chains)")
     print(f"  ttbar efficiency   (exactly 2 chains, both correct):   {results['ttbar_eff']*100:6.2f}%   (N={results['n_both_tops']:,})")
     print("─" * 70)
     print(f"  All-object efficiency:                                  {results['all_eff']*100:6.2f}%   (N={N:,})")
@@ -669,6 +687,106 @@ def make_plots(run_dir: Path, results: dict):
         print(f"  Saved: {out}")
 
 
+def make_table_image(run_dir: Path, results: dict):
+    """Render a single-run efficiency table as a PNG image."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import to_rgb
+    except ImportError:
+        print("WARNING: matplotlib not available — skipping table image.")
+        return
+
+    br = results["breakdown"]
+    all_mults = sorted(br.keys())
+    ge8_keys = [m for m in all_mults if m >= 8]
+
+    bins = {
+        "6 jets":   _agg_bin(br, [6]),
+        "7 jets":   _agg_bin(br, [7]),
+        ">=8 jets": _agg_bin(br, ge8_keys),
+        "All": {
+            "top_eff":   results["top_eff"],
+            "W_eff":     results["W_eff"],
+            "ttbar_eff": results["ttbar_eff"],
+            "n_events":  results["N"],
+        },
+    }
+
+    metrics = [
+        ("Top eff",   "top_eff"),
+        ("W eff",     "W_eff"),
+        ("ttbar eff", "ttbar_eff"),
+    ]
+    bin_keys = ["6 jets", "7 jets", ">=8 jets", "All"]
+    col_headers = ["Metric"] + bin_keys
+
+    cell_text = []
+    for metric_label, metric_key in metrics:
+        cell_text.append(
+            [metric_label] + [f"{bins[bk][metric_key]*100:.2f}%" for bk in bin_keys]
+        )
+
+    n_rows = len(cell_text)
+    n_cols = len(col_headers)
+
+    fig, ax = plt.subplots(figsize=(9, 1.4 + n_rows * 0.55))
+    ax.axis("off")
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_headers,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.0, 2.0)
+
+    # Header style
+    for j in range(n_cols):
+        cell = table[0, j]
+        cell.set_facecolor("#1a252f")
+        cell.set_text_props(color="white", fontweight="bold", fontsize=12)
+        cell.set_edgecolor("white")
+        cell.set_linewidth(2.5)
+
+    # Row colours
+    row_colors = [
+        ("#d6eaf8", "#2c3e50"),
+        ("#fadbd8", "#78281f"),
+        ("#d5f5e3", "#1e8449"),
+    ]
+    for i in range(n_rows):
+        bg, fg = row_colors[i % len(row_colors)]
+        for j in range(n_cols):
+            cell = table[i + 1, j]
+            cell.set_facecolor(bg)
+            cell.set_edgecolor("white")
+            cell.set_linewidth(2.5)
+            if j >= 1:
+                cell.set_text_props(fontweight="bold", fontsize=11, color=fg)
+            else:
+                cell.set_text_props(fontweight="bold", fontsize=11, color="#2c3e50")
+
+    # Build title
+    prior_parts = []
+    if results["prior_top"] is not None:
+        prior_parts.append(f"top={results['prior_top']}")
+    if results["prior_W"] is not None:
+        prior_parts.append(f"W={results['prior_W']}")
+    binarisation = ", ".join(prior_parts) if prior_parts else f"threshold={results['threshold']}"
+    title = f"Reconstruction Efficiency\n(binarisation: {binarisation})"
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=20)
+
+    fig.tight_layout()
+    out = run_dir / "eval_table.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
 # ---------------------------------------------------------------------------
 # Threshold sweep
 # ---------------------------------------------------------------------------
@@ -676,7 +794,8 @@ def make_plots(run_dir: Path, results: dict):
 def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
                                   jet_valid, use_probs=False,
                                   t_min=None, t_max=None, n_steps=100,
-                                  prior_top=None, prior_W=None, joint=False):
+                                  prior_top=None, prior_W=None, joint=False,
+                                  require_top_for_w=False):
     """
     Evaluate efficiency metrics across a range of thresholds.
 
@@ -691,6 +810,10 @@ def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_
 
     # Pre-compute masks that don't depend on threshold
     is_real      = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
+    if require_top_for_w:
+        is_real_W = is_real & target_masks_top.astype(bool).any(axis=-1)
+    else:
+        is_real_W = is_real
     n_real       = is_real.sum(axis=1)
     has_W        = is_real.any(axis=1)
     both_tops    = n_real == 2
@@ -701,7 +824,12 @@ def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_
         top_eff_gate = is_real & (target_top_b.sum(axis=-1) == prior_top)
     else:
         top_eff_gate = is_real
+    if prior_W is not None:
+        W_eff_gate = is_real_W & (target_W_b.sum(axis=-1) == prior_W)
+    else:
+        W_eff_gate = is_real_W
     n_top_total  = int(top_eff_gate.sum())
+    n_W_total    = int(W_eff_gate.sum())
 
     top_effs, W_effs, ttbar_effs = [], [], []
 
@@ -720,12 +848,12 @@ def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_
             slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real)
 
         all_tops_perfect = ((~is_real) | slot_perfect_top).all(axis=1)
-        all_Ws_perfect   = ((~is_real) | slot_perfect_W).all(axis=1)
 
         n_top_correct = (top_eff_gate & slot_perfect_top).sum()
+        n_W_correct   = (W_eff_gate & slot_perfect_W).sum()
 
         top_effs.append(float(n_top_correct / max(n_top_total, 1)))
-        W_effs.append(float((all_Ws_perfect & has_W).sum() / max(has_W.sum(), 1)))
+        W_effs.append(float(n_W_correct / max(n_W_total, 1)))
         ttbar_effs.append(float((all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)))
 
     return np.array(thresholds), np.array(top_effs), np.array(W_effs), np.array(ttbar_effs)
@@ -788,6 +916,10 @@ def main():
         help="Save PNG efficiency plots to --run_dir"
     )
     parser.add_argument(
+        "--table", action="store_true",
+        help="Save PNG efficiency table to --run_dir"
+    )
+    parser.add_argument(
         "--use_probs", action="store_true",
         help="Use saved sigmoid probabilities instead of raw logits (default threshold 0.5)"
     )
@@ -821,6 +953,10 @@ def main():
     parser.add_argument(
         "--joint", action="store_true",
         help="Count a top as correctly reconstructed only if its associated W is also correct"
+    )
+    parser.add_argument(
+        "--require_top_for_w", action="store_true",
+        help="Only count a chain as real if the top target also has particles (no orphan Ws)"
     )
     parser.add_argument(
         "--prior", nargs="+", metavar="TYPE=K", default=[],
@@ -867,11 +1003,15 @@ def main():
         pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
         use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
         joint=args.joint, original_mult=original_mult,
+        require_top_for_w=args.require_top_for_w,
     )
     print_results(run_dir, results)
 
     if args.plot:
         make_plots(run_dir, results)
+
+    if args.table:
+        make_table_image(run_dir, results)
 
     if args.threshold_sweep:
         t_min, t_max = args.sweep_range if args.sweep_range else (None, None)
@@ -884,6 +1024,7 @@ def main():
             n_steps=args.sweep_steps,
             prior_top=prior_top, prior_W=prior_W,
             joint=args.joint,
+            require_top_for_w=args.require_top_for_w,
         )
         plot_threshold_sweep(run_dir, thresholds, top_effs, W_effs, ttbar_effs,
                              use_probs=args.use_probs)

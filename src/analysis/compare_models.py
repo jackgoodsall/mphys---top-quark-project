@@ -67,7 +67,8 @@ def _parse_runs(run_args):
 
 
 def _load_and_evaluate_chain(run_dir, data_file, use_probs, threshold,
-                              prior_top, prior_W, strict, joint):
+                              prior_top, prior_W, strict, joint,
+                              require_top_for_w=False):
     """Load and evaluate a chain_queries run."""
     (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
      jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
@@ -80,6 +81,7 @@ def _load_and_evaluate_chain(run_dir, data_file, use_probs, threshold,
         pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
         use_probs=use_probs, threshold=threshold,
         strict=strict, joint=joint, original_mult=original_mult,
+        require_top_for_w=require_top_for_w,
     )
 
 
@@ -245,6 +247,115 @@ def make_comparison_plot(all_results, output_path: Path):
     print(f"  Saved: {output_path}")
 
 
+def make_table_image(rows, output_path: Path, binarisation: str = ""):
+    """Render the comparison table as a blocky, high-contrast image."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import to_rgba
+    except ImportError:
+        print("WARNING: matplotlib not available — skipping table image.")
+        return
+
+    bin_labels = [6, 7, "8+", "All"]
+    col_headers = ["Model", "Metric", "6 jets", "7 jets", ">=8 jets", "All"]
+    n_cols = len(col_headers)
+
+    # Build cell text and track model grouping
+    cell_text = []
+    model_indices = []
+    model_names_seen = []
+    for r in rows:
+        model_name = r["model"]
+        if model_name not in model_names_seen:
+            model_names_seen.append(model_name)
+        model_indices.append(model_names_seen.index(model_name))
+        cell_text.append([
+            model_name,
+            r["metric"],
+        ] + [f"{r[bk]*100:.2f}%" for bk in bin_labels])
+
+    n_rows = len(cell_text)
+    fig_width = 11
+    fig_height = 1.6 + n_rows * 0.55
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_headers,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.0, 2.0)
+
+    # Strong model-group colours
+    model_colors = [
+        ("#d6eaf8", "#2c3e50"),  # light blue bg, dark text
+        ("#fadbd8", "#78281f"),  # light red bg, dark red text
+        ("#d5f5e3", "#1e8449"),  # light green bg, dark green text
+        ("#fdebd0", "#784212"),  # light orange bg, dark orange text
+    ]
+
+    # Style header - thick, dark
+    for j in range(n_cols):
+        cell = table[0, j]
+        cell.set_facecolor("#1a252f")
+        cell.set_text_props(color="white", fontweight="bold", fontsize=12)
+        cell.set_edgecolor("white")
+        cell.set_linewidth(2.5)
+
+    # Style data rows - bold borders, strong alternating colours per model
+    for i in range(n_rows):
+        midx = model_indices[i]
+        bg, fg = model_colors[midx % len(model_colors)]
+        for j in range(n_cols):
+            cell = table[i + 1, j]
+            cell.set_facecolor(bg)
+            cell.set_edgecolor("white")
+            cell.set_linewidth(2.5)
+            if j >= 2:  # value columns
+                cell.set_text_props(fontweight="bold", fontsize=11, color=fg)
+            else:
+                cell.set_text_props(fontweight="bold", fontsize=11, color="#2c3e50")
+
+    # Find best value per metric+bin and highlight it
+    from collections import defaultdict
+    metric_bins = defaultdict(list)
+    for idx, r in enumerate(rows):
+        for bk in bin_labels:
+            metric_bins[(r["metric"], bk)].append((r[bk], idx))
+
+    for (metric, bk), vals in metric_bins.items():
+        best_val = max(v for v, _ in vals)
+        col_j = bin_labels.index(bk) + 2
+        for v, row_idx in vals:
+            if v == best_val and len(set(v for v, _ in vals)) > 1:
+                cell = table[row_idx + 1, col_j]
+                midx = model_indices[row_idx]
+                _, fg = model_colors[midx % len(model_colors)]
+                cell.set_text_props(fontweight="bold", fontsize=12, color=fg,
+                                    fontstyle="normal")
+                # Slightly darker bg to highlight winner
+                from matplotlib.colors import to_rgb
+                r_c, g_c, b_c = to_rgb(model_colors[midx % len(model_colors)][0])
+                cell.set_facecolor((r_c * 0.85, g_c * 0.85, b_c * 0.85))
+
+    title = "Model Comparison: Reconstruction Efficiency"
+    if binarisation:
+        title += f"\n(binarisation: {binarisation})"
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=20)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare reconstruction efficiency across models (chain and non-chain)."
@@ -278,12 +389,20 @@ def main():
         help="(Chain only) Top correct only if associated W is also correct"
     )
     parser.add_argument(
+        "--require_top_for_w", action="store_true",
+        help="Only count a chain as real if the top target also has particles (no orphan Ws)"
+    )
+    parser.add_argument(
         "--plot", action="store_true",
         help="Save comparison bar chart"
     )
     parser.add_argument(
+        "--table", action="store_true",
+        help="Save comparison table as an image"
+    )
+    parser.add_argument(
         "--output", type=Path, default=None,
-        help="Output path for plot (default: comparison_efficiency.png in first run dir)"
+        help="Output path for plot/table (default: comparison_*.png in first run dir)"
     )
     args = parser.parse_args()
 
@@ -319,6 +438,7 @@ def main():
             results = _load_and_evaluate_chain(
                 run_dir, args.data_file, args.use_probs, args.threshold,
                 prior_top, prior_W, args.strict, args.joint,
+                require_top_for_w=args.require_top_for_w,
             )
         else:
             results = _load_and_evaluate_std(
@@ -350,6 +470,10 @@ def main():
     if args.plot:
         output_path = args.output or runs[0][1] / "comparison_efficiency.png"
         make_comparison_plot(all_results, output_path)
+
+    if args.table:
+        table_path = args.output or runs[0][1] / "comparison_table.png"
+        make_table_image(rows, table_path, binarisation)
 
 
 if __name__ == "__main__":
