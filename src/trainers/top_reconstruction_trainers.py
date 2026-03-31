@@ -220,16 +220,19 @@ class ReconstructionTrainer(lightning.LightningModule):
                 prev = task_loss_accum.get(task_name, 0.0)
                 task_loss_accum[task_name] = prev + task_val
 
-        # Stop training on NaN/Inf
+        # Stop training on NaN/Inf — replace with zero to keep DDP ranks in
+        # sync (setting should_stop on one rank desynchronises collectives).
         if torch.is_tensor(total_loss) and not torch.isfinite(total_loss):
             bad_tasks = [
                 k for k, v in task_loss_accum.items()
                 if not (torch.isfinite(v).all() if torch.is_tensor(v) else (v == v))
             ]
-            if self.global_rank == 0:
-                print(f"\nNon-finite total_loss={total_loss.item():.4f} — stopping training.")
-                if bad_tasks:
-                    print(f"   Tasks with NaN: {bad_tasks}")
+            print(f"\n[Rank {self.global_rank}] Non-finite total_loss "
+                  f"— replacing with 0 and signalling stop.")
+            if bad_tasks:
+                print(f"   Tasks with NaN: {bad_tasks}")
+            # Replace loss with zero so backward + allreduce still runs on all ranks
+            total_loss = torch.zeros_like(total_loss)
             self.trainer.should_stop = True
 
         return total_loss, task_loss_accum
@@ -440,19 +443,20 @@ class ReconstructionTrainer(lightning.LightningModule):
         return None
     
     def on_test_start(self):
-        """Initialize HDF5 files for test predictions and keep handles open"""
+        """Initialize HDF5 files for test predictions (rank 0 only)"""
         super().on_test_start()
-        out_dir = Path(self.trainer.logger.log_dir)
-
-        test_loaders = self.trainer.test_dataloaders
-        number_events = len(test_loaders.dataset)
-
         self._test_h5_files: Dict[str, h5py.File] = {}
-        for task_name, task in self.task_registry.tasks.items():
-            h5_filename = f"test_outputs_{task_name}.h5"
-            fh = h5py.File(out_dir / h5_filename, "w")
-            task.create_test_datasets(fh, number_events)
-            self._test_h5_files[task_name] = fh
+
+        if self.global_rank == 0:
+            out_dir = Path(self.trainer.logger.log_dir)
+            test_loaders = self.trainer.test_dataloaders
+            number_events = len(test_loaders.dataset)
+
+            for task_name, task in self.task_registry.tasks.items():
+                h5_filename = f"test_outputs_{task_name}.h5"
+                fh = h5py.File(out_dir / h5_filename, "w")
+                task.create_test_datasets(fh, number_events)
+                self._test_h5_files[task_name] = fh
 
         self.test_start_idx = 0
 
@@ -467,7 +471,10 @@ class ReconstructionTrainer(lightning.LightningModule):
         outputs: Dict[int, Dict[str, torch.Tensor]],
         targets,
     ):
-        """Save test predictions to HDF5"""
+        """Save test predictions to HDF5 (rank 0 only)"""
+        if self.global_rank != 0:
+            return
+
         final_layer = max(outputs.keys())
         layer_dict = outputs[final_layer]
 
@@ -479,7 +486,6 @@ class ReconstructionTrainer(lightning.LightningModule):
         else:
             save_targets = targets
             predictions = layer_dict
-
 
         batch_size = predictions[list(predictions.keys())[0]].shape[0]
 
