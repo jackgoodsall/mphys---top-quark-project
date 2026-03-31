@@ -456,20 +456,21 @@ class MaskReconstructionTask(BaseTask):
     def create_test_datasets(self, file: h5py.File, number_events: int):
         """Create HDF5 datasets for mask predictions"""
         N_particles = 20  # Adjust to your actual particle count if needed
-        
+        M = self.config.max_objects
+
         file.create_dataset(
             "target_masks",
-            shape=(number_events, self.config.max_objects, N_particles),
+            shape=(number_events, M, N_particles),
             dtype='float32'
         )
         file.create_dataset(
             "predicted_masks_logits",
-            shape=(number_events, self.config.max_objects, N_particles),
+            shape=(number_events, M, N_particles),
             dtype='float32'
         )
         file.create_dataset(
             "predicted_masks_prob",
-            shape=(number_events, self.config.max_objects, N_particles),
+            shape=(number_events, M, N_particles),
             dtype='float32'
         )
         file.create_dataset(
@@ -477,7 +478,13 @@ class MaskReconstructionTask(BaseTask):
             shape=(number_events, N_particles),
             dtype='float32'
         )
-    
+        # Per-type slot validity (chain mode): which slots have a real top / real W
+        file.create_dataset(
+            "slot_valid",
+            shape=(number_events, M),
+            dtype='bool'
+        )
+
     def save_test_predictions(
         self,
         file: h5py.File,
@@ -491,11 +498,11 @@ class MaskReconstructionTask(BaseTask):
         pred_masks_prob = predictions[self.pred_key].sigmoid().float().cpu().numpy()
         target_masks = targets[self.target_key].float().cpu().numpy()
         jet_valid_mask = targets.get('jet_valid_mask')
-        
+
         # Handle 2D targets
         if target_masks.ndim == 2:
             target_masks = target_masks[:, None, :]
-        
+
         # Truncate to max_objects (predictions may have Q > max_objects after padding)
         M = self.config.max_objects
         pred_masks_logits = pred_masks_logits[:, :M, :]
@@ -509,6 +516,17 @@ class MaskReconstructionTask(BaseTask):
         file["predicted_masks_prob"][start_idx:end_idx] = pred_masks_prob
         if jet_valid_mask is not None:
             file["jet_valid_mask"][start_idx:end_idx] = jet_valid_mask.float().cpu().numpy()
+
+        # Per-type slot validity: top mask task → top_valid, W mask task → w_valid
+        validity_key = 'top_valid' if self.target_key == 'jet_mask_true' else 'w_valid'
+        slot_valid = targets.get(validity_key)
+        if slot_valid is not None:
+            file["slot_valid"][start_idx:end_idx] = slot_valid[:, :M].bool().cpu().numpy()
+        else:
+            # Fallback: use chain-level obj_valid_mask
+            obj_valid = targets.get('obj_valid_mask')
+            if obj_valid is not None:
+                file["slot_valid"][start_idx:end_idx] = obj_valid[:, :M].bool().cpu().numpy()
 
 
 class KinematicRegressionTask(BaseTask):

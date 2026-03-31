@@ -222,7 +222,7 @@ class MaskedReconstructionPart(nn.Module):
             # Original ParT-style encoder
             self.encoder_stack = nn.ModuleList(
                 [ParticleAttentionBlock(embedding_size, dim_ff,
-                                        n_heads, p_dropout, pair_wise_dim=8)
+                                        n_heads, p_dropout, pair_wise_dim=n_heads)
                  for _ in range(n_encoder_layers)]
             )
 
@@ -632,10 +632,16 @@ class MaskedReconstructionPart(nn.Module):
                 cls_list.append(cls)
             batched['classes'] = torch.stack(cls_list)
 
-        # Build target_valid_mask [B, T_max]
+        # Build target_valid_mask [B, T_max] from per-object validity if available
         target_valid_mask = torch.zeros(B, T_max, dtype=torch.bool, device=device)
-        for i, T_i in enumerate(T_per_event):
-            target_valid_mask[i, :T_i] = True
+        has_ov = 'object_valid' in targets_list[0]
+        if has_ov:
+            for i, t in enumerate(targets_list):
+                ov = t['object_valid']
+                target_valid_mask[i, :len(ov)] = ov
+        else:
+            for i, T_i in enumerate(T_per_event):
+                target_valid_mask[i, :T_i] = True
 
         return batched, target_valid_mask
 
@@ -694,9 +700,13 @@ class MaskedReconstructionPart(nn.Module):
             targets_batched['jet_mask_true'] = jmt[:, :T_chains, :]    # top masks
             targets_batched['jet_mask_true_W'] = jmt[:, T_chains:, :]  # W masks
 
-            # Chain j is valid only when both top_j and W_j are present.
+            # Per-type validity (before the AND) — saved for per-type efficiency eval.
             top_valid = target_valid_mask[:, :T_chains]
             w_valid_tgt = target_valid_mask[:, T_chains:]
+            targets_batched['top_valid'] = top_valid          # [B, T_chains]
+            targets_batched['w_valid'] = w_valid_tgt          # [B, T_chains]
+
+            # Chain j is valid only when both top_j and W_j are present.
             target_valid_mask = top_valid & w_valid_tgt  # [B, T_chains]
 
             # Remove the merged 'classes' field — no per-query type in chain mode.
@@ -795,14 +805,13 @@ class MaskedReconstructionPart(nn.Module):
         T_max = target_valid_mask.shape[1]
         pad_q = Q - T_max  # may be 0 if Q == T_max
 
-        # Per-event T from target_valid_mask
-        per_event_T = target_valid_mask.sum(dim=1)  # [B]
-
         # obj_valid_mask: [B, Q] — True for matched real objects
-        obj_valid_mask = (
-            torch.arange(Q, device=pred_idxs.device).unsqueeze(0)
-            < per_event_T.unsqueeze(1)
-        )
+        # Use target_valid_mask directly (padded to Q) rather than position-based,
+        # since valid targets may not be contiguous after removing pre-filtering.
+        if pad_q > 0:
+            obj_valid_mask = F.pad(target_valid_mask, (0, pad_q), value=False)
+        else:
+            obj_valid_mask = target_valid_mask
 
         padded_targets = {
             'jet_valid_mask': targets_batched['jet_valid_mask'],  # [B, P]
@@ -818,11 +827,21 @@ class MaskedReconstructionPart(nn.Module):
         else:
             padded_targets['jet_mask_true'] = jmt
 
-        # Chain mode: also pad W masks
+        # Chain mode: also pad W masks and per-type validity
         if 'jet_mask_true_W' in targets_batched:
             jmt_W = targets_batched['jet_mask_true_W']
             padded_targets['jet_mask_true_W'] = (
                 F.pad(jmt_W, (0, 0, 0, pad_q), value=0.0) if pad_q > 0 else jmt_W
+            )
+        if 'top_valid' in targets_batched:
+            tv = targets_batched['top_valid']
+            padded_targets['top_valid'] = (
+                F.pad(tv, (0, pad_q), value=False) if pad_q > 0 else tv
+            )
+        if 'w_valid' in targets_batched:
+            wv = targets_batched['w_valid']
+            padded_targets['w_valid'] = (
+                F.pad(wv, (0, pad_q), value=False) if pad_q > 0 else wv
             )
 
         # Pad target_kinematics if present
