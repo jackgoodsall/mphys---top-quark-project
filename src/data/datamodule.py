@@ -120,10 +120,17 @@ def masked_former_collate_fn(batch):
         if T_i > 0:
             jmt[i, :T_i] = t['jet_mask_true']
 
-    # Build target_valid_mask [B, T_max]
+    # Build target_valid_mask [B, T_max] from per-object validity if available,
+    # otherwise all returned objects are valid (pre-filtered path).
+    has_object_valid = 'object_valid' in targets[0]
     tvm = torch.zeros(B, T_max, dtype=torch.bool)
-    for i, T_i in enumerate(T_per_event):
-        tvm[i, :T_i] = True
+    if has_object_valid:
+        for i, t in enumerate(targets):
+            ov = t['object_valid']  # [n_obj]
+            tvm[i, :len(ov)] = ov
+    else:
+        for i, T_i in enumerate(T_per_event):
+            tvm[i, :T_i] = True
 
     batched_targets = {
         'jet_mask_true': jmt,
@@ -186,15 +193,9 @@ class MaskedFormerDataSet(Dataset):
             "interactions": torch.from_numpy(interactions).float(),
         }
 
-        if self.object_valid is not None:
-            valid = self.object_valid[idx]
-            jet_mask = self.targets[idx][valid]
-            kin = self.target_kinematics[idx][valid]
-            cls = self.classes[idx][valid] if self.classes is not None else None
-        else:
-            jet_mask = self.targets[idx]
-            kin = self.target_kinematics[idx]
-            cls = self.classes[idx] if self.classes is not None else None
+        jet_mask = self.targets[idx]
+        kin = self.target_kinematics[idx]
+        cls = self.classes[idx] if self.classes is not None else None
 
         target = {
             "jet_mask_true": torch.from_numpy(np.asarray(jet_mask)).float(),
@@ -205,6 +206,10 @@ class MaskedFormerDataSet(Dataset):
         }
         if cls is not None:
             target["classes"] = torch.from_numpy(np.asarray(cls)).long()
+        if self.object_valid is not None:
+            target["object_valid"] = torch.from_numpy(
+                np.asarray(self.object_valid[idx])
+            ).bool()
 
         return sample, target
 
@@ -308,19 +313,16 @@ class LazyHDF5Dataset(Dataset):
         kins = np.concatenate(kins_parts, axis=0)      # [n_obj, D]
         cls = self.classes[idx]                         # [n_obj]
 
-        # Apply validity filter
-        if self._has_partial:
-            valid = self.object_valid[idx]
-            masks = masks[valid]
-            kins = kins[valid]
-            cls = cls[valid]
-
         target = {
             "jet_mask_true": torch.from_numpy(masks).float(),
             "jet_valid_mask": torch.from_numpy(src_mask).bool(),
             "target_kinematics": torch.from_numpy(kins).float(),
             "classes": torch.from_numpy(cls).long(),
         }
+        if self._has_partial:
+            target["object_valid"] = torch.from_numpy(
+                self.object_valid[idx]
+            ).bool()
 
         return sample, target
 
@@ -441,16 +443,16 @@ class MemmapDataset(Dataset):
         kins = np.concatenate(kins_parts, axis=0)
         cls = self.classes[idx]
 
-        if self._has_partial:
-            valid = self.object_valid[idx]
-            masks, kins, cls = masks[valid], kins[valid], cls[valid]
-
         target = {
             "jet_mask_true": torch.from_numpy(masks).float(),
             "jet_valid_mask": torch.from_numpy(src_mask).bool(),
             "target_kinematics": torch.from_numpy(kins).float(),
             "classes": torch.from_numpy(cls).long(),
         }
+        if self._has_partial:
+            target["object_valid"] = torch.from_numpy(
+                self.object_valid[idx]
+            ).bool()
         return sample, target
 
 
