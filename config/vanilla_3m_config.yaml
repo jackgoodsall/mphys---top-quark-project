@@ -8,21 +8,23 @@ tasks:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
+    bce_pos_weight: True
     null_mask_penalty: 0.2
-    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
   mask_W:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
+    bce_pos_weight: True
     null_mask_penalty: 0.2
-    layer_weights: {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    layer_weights: {0: 0.0, 1: 0.33, 2: 0.67, 3: 1.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0}
 
   objectness:
     cost_weight: 0
     loss_weight: 0
     head_norm: True
-    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.33, 6: 0.67, 7: 1.0}
 
   # object_type: not registered in chain_queries mode
 
@@ -35,15 +37,15 @@ pretraining:
 data_modules:
   input_path: data/topquarkreconstruction/masked_targets_combined
   input_prefix: "ttbar_preprocessed_"
-  lazy: true
-  load_interactions: true
+  lazy: False
+  load_interactions: False   # vanilla attention — no interaction matrices needed
   # HDF5 key names for tops+Ws loading
   tops_mask_key: "masks_tops"
   tops_kin_key: "kinematics_tops"
   ws_mask_key: "masks_Ws"
   ws_kin_key: "kinematics_Ws"
   train:
-    batch_size: 1024          # per-GPU; effective = 1024 x 2 GPUs = 2048
+    batch_size: 1024
     shuffle: True
     num_workers: 4
     pin_memory: True
@@ -61,22 +63,22 @@ data_modules:
 model_parameters:
   particle_embedder:
     n_input: 7
-    hidden_sizes: [64]
+    hidden_sizes: [128, 256]
     embedding_size: 128
-    p_dropout: 0.0
+    p_dropout: 0.1
 
   interaction_embedder:
     input_features: 4
-    hidden_layers: [32]
-    output_size: 4   # must equal n_heads (pair_wise_dim=n_heads in encoder); was 8 legacy hardcode
-    p_dropout: 0.0
+    hidden_layers: [64, 64, 64]
+    output_size: 8   # unused when use_vanilla_attention: true
+    p_dropout: 0.1
 
   transformer:
     embedding_size: 128
-    n_encoder_layers: 6
-    n_decoder_layers: 6
-    n_heads: 4
-    p_dropout: 0.0
+    n_encoder_layers: 8
+    n_decoder_layers: 8
+    n_heads: 8
+    p_dropout: 0.1
     dim_ff: 512
     num_query_tokens: 2      # learnable query tokens (= n_chains in chain_queries mode)
     hierarchical_decoding: True
@@ -88,37 +90,37 @@ model_parameters:
     use_mia_encoder: False
     n_mia_layers: 0
     mia_interaction_dim: 64
-    use_vanilla_attention: false  # true = nn.TransformerEncoderLayer; false = ParticleAttentionBlock
-    use_particle_gating: false  # disabled for clean R&D baseline
+    use_vanilla_attention: true   # vanilla self-attention encoder, no interaction embedder
+    use_particle_gating: false
     n_gating_layers: 2
     n_gate_queries: 1
 
 model_training:
   seed: null
   learning_rate: 2e-4
-  weight_decay: 0.05
-  use_lookahead: False
+  weight_decay: 0.001
+  use_lookahead: True
   gradient_clip_val: 2
-  precision: "bf16-mixed"   # "32-true" | "16-mixed" | "bf16-mixed" [recommended] | "bf16-true" | "64-true"
-  matmul_precision: "high"  # "highest" (FP32) | "high" (TF32, recommended) | "medium" (BF16)
+  precision: "bf16-mixed"
+  matmul_precision: "high"
   min_epochs: 15
   max_epochs: 100
   # DDP configuration
-  num_nodes: 1              # number of SLURM nodes
-  devices: 2                # GPUs per node
-  strategy: "ddp"           # "auto" | "ddp" | "ddp_find_unused_parameters_true"
-  accelerator: "gpu"        # "auto" | "gpu" | "cpu"
+  num_nodes: 1
+  devices: 1
+  strategy: "auto"
+  accelerator: "gpu"
 
   scheduler:
-    type: "warmup_cosine"     # "warmup_cosine" | "step" | "cosine" | "plateau" | "none"
-    update_interval: "step"   # "step" (every batch) or "epoch" (once per epoch)
+    type: "warmup_cosine"
+    update_interval: "step"
 
     # --- warmup_cosine ---
-    warmup_epochs: 5          # linear ramp 0 → lr
-    T_max: 100                # total epochs for cosine decay
-    eta_min: 5e-6             # floor LR at end of cosine decay
-    lr_rewarmup_epochs: 0     # re-warmup at phase transition; 0 = disabled
-    lr_rewarmup_fraction: 1.5 # start re-warmup at this fraction of base LR
+    warmup_epochs: 5
+    T_max: 100
+    eta_min: 1e-6
+    lr_rewarmup_epochs: 5
+    lr_rewarmup_fraction: 1.5
 
     # --- plateau ---
     factor: 0.5
@@ -140,13 +142,13 @@ training_callbacks:
 
   early_stopping:
     monitor: "val_loss"
-    patience: 20  # long enough to survive the pretraining→multi-task phase transition
+    patience: 20
     min_delta: 0.0001
     mode: "min"
 
 inference:
-  mode: "train"              # "train" | "test" | "resume" | "lr_find"
-  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_12489040/checkpoints/epoch=epoch=99-val_loss=val_loss=1.2272.ckpt"
+  mode: "train"
+  checkpoint_path: ""
 
 model_artefacts:
   log_dir: "masked_reconstruction"
