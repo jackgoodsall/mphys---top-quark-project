@@ -31,6 +31,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,25 @@ def _load_objectness(path: Path, use_probs: bool, task_name: str = "objectness")
         pred_key = f"predicted_{task_name}_prob" if use_probs else f"predicted_{task_name}_logit"
         pred = f[pred_key][:] if pred_key in f else None
     return target, pred
+
+
+def _infer_data_file_from_hparams(run_dir: Path):
+    """Best-effort inference of test HDF5 path from run hparams.yaml."""
+    hparams = run_dir / "hparams.yaml"
+    if not hparams.exists():
+        return None
+    try:
+        with hparams.open("r", encoding="utf-8") as f:
+            hp = yaml.safe_load(f)
+    except Exception:
+        return None
+    dmcfg = ((hp or {}).get("config", {}).get("data_modules", {}) or {})
+    in_path = dmcfg.get("input_path")
+    in_prefix = dmcfg.get("input_prefix")
+    if not in_path or not in_prefix:
+        return None
+    p = Path(in_path) / f"{in_prefix}test.h5"
+    return p if p.exists() else None
 
 
 def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
@@ -80,12 +100,14 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
         pred_scores_top = f[scores_key][:]                # [N, Q, P]
         target_masks_top = f["target_masks"][:]            # [N, Q, P]
         jet_valid = f["jet_valid_mask"][:] if "jet_valid_mask" in f else None
+        slot_valid_top = f["slot_valid"][:] if "slot_valid" in f else None
 
     with h5py.File(mask_W_path, "r") as f:
         if scores_key not in f:
             sys.exit(f"ERROR: key '{scores_key}' not found in {mask_W_path}")
         pred_scores_W = f[scores_key][:]                  # [N, Q, P]
         target_masks_W = f["target_masks"][:]              # [N, Q, P]
+        slot_valid_W = f["slot_valid"][:] if "slot_valid" in f else None
 
     # Load separate top / W objectness
     target_obj_top, pred_obj_top = None, None
@@ -102,26 +124,49 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
     if target_obj_W is None:
         target_obj_W, pred_obj_W = target_obj_top, pred_obj_top
 
-    # Fall back to external data file for src_mask
-    if jet_valid is None:
-        if data_file is None:
+    # Prefer explicit --data_file, else infer from hparams when possible.
+    if data_file is None:
+        data_file = _infer_data_file_from_hparams(run_dir)
+
+    valid_tops_truth = None
+    valid_Ws_truth = None
+
+    # Fall back to external data file for src_mask, and optionally load truth validity masks.
+    if jet_valid is None or data_file is not None:
+        if jet_valid is None and data_file is None:
             sys.exit(
                 "ERROR: 'jet_valid_mask' not found in test_outputs_mask.h5 and "
-                "--data_file was not provided.\n"
+                "--data_file was not provided (and could not infer from hparams.yaml).\n"
                 "Re-run with --data_file pointing to the corresponding HDF5 data file."
             )
-        if not data_file.exists():
+        if data_file is not None and not data_file.exists():
             sys.exit(f"ERROR: data file not found: {data_file}")
-        with h5py.File(data_file, "r") as f:
-            if "src_mask" not in f:
-                sys.exit(f"ERROR: 'src_mask' key not found in {data_file}")
-            jet_valid = f["src_mask"][:]
+        if data_file is not None:
+            with h5py.File(data_file, "r") as f:
+                if jet_valid is None:
+                    if "src_mask" not in f:
+                        sys.exit(f"ERROR: 'src_mask' key not found in {data_file}")
+                    jet_valid = f["src_mask"][:]
+                if "valid_tops" in f:
+                    valid_tops_truth = f["valid_tops"][:].astype(bool)
+                if "valid_Ws" in f:
+                    valid_Ws_truth = f["valid_Ws"][:].astype(bool)
         N_run = pred_scores_top.shape[0]
         N_data = jet_valid.shape[0]
         if N_data != N_run:
             sys.exit(
                 f"ERROR: event count mismatch — run has {N_run} events but "
                 f"data file has {N_data}. Make sure you are using the correct test split."
+            )
+        if valid_tops_truth is not None and valid_tops_truth.shape[0] != N_run:
+            sys.exit(
+                f"ERROR: 'valid_tops' event count mismatch — run has {N_run} events but "
+                f"data file has {valid_tops_truth.shape[0]}."
+            )
+        if valid_Ws_truth is not None and valid_Ws_truth.shape[0] != N_run:
+            sys.exit(
+                f"ERROR: 'valid_Ws' event count mismatch — run has {N_run} events but "
+                f"data file has {valid_Ws_truth.shape[0]}."
             )
 
     # Load original (pre-signal-jet-filtering) multiplicities if available
@@ -133,7 +178,8 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
 
     return (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
             jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
-            original_mult)
+            original_mult, valid_tops_truth, valid_Ws_truth,
+            slot_valid_top, slot_valid_W)
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +220,7 @@ def binarise_predictions(scores, jet_valid, prior_k, use_probs, threshold=None):
 # Core efficiency computation
 # ---------------------------------------------------------------------------
 
-def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, W_eff_gate,
-                       is_perfect_top, is_perfect_W,
+def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, W_eff_gate, is_perfect_top, is_perfect_W,
                        all_tops_perfect, all_Ws_perfect, pred_real):
     """Compute per-multiplicity efficiency/purity rows for a given multiplicity array."""
     mult_values = sorted(np.unique(multiplicity_arr).tolist())
@@ -188,7 +233,6 @@ def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, W_eff_gate,
 
         ir  = is_real[sel]
         teg = top_eff_gate[sel]
-        weg = W_eff_gate[sel]
         ipt = is_perfect_top[sel]
         ipw = is_perfect_W[sel]
 
@@ -196,8 +240,8 @@ def _compute_breakdown(multiplicity_arr, is_real, top_eff_gate, W_eff_gate,
 
         n_top_correct = int((teg & ipt).sum())
         n_top_total   = int(teg.sum())
-        n_W_correct   = int((weg & ipw).sum())
-        n_W_total     = int(weg.sum())
+        n_W_correct   = int((W_eff_gate[sel] & ipw).sum())
+        n_W_total     = int(W_eff_gate[sel].sum())
         bt = int(both_tops.sum())
 
         row = {
@@ -231,27 +275,56 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
                          target_obj_W=None, pred_obj_W=None,
                          prior_top=None, prior_W=None, use_probs=False,
                          threshold=None, strict=False, joint=False, original_mult=None,
+                         valid_tops_truth=None, valid_Ws_truth=None,
+                         slot_valid_top=None, slot_valid_W=None,
+                         legacy_output_targets=False,
+                         require_complete_truth=False,
                          require_top_for_w=False):
     """
     Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
 
     Chain queries: each query predicts both a top mask and a W mask.
-    A chain is "real" when the W-mask target has ≥1 assigned particle.
 
-    Separate objectness heads for tops and Ws are used for strict gating
-    and purity: pred_obj_top gates top metrics, pred_obj_W gates W metrics.
+    Per-type efficiency gates:
+      - slot_valid_top / slot_valid_W from the output files (post-matching order,
+        derived from the per-type valid_tops / valid_Ws before the chain AND).
+      - Fallback: chain-level obj_valid_mask (both top & W valid).
     """
     N, Q, P = pred_scores_top.shape
 
-    # Chain is real if W target has particles
-    is_real = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
-    # Stricter W gate: only count W as real if parent top also has particles
-    if require_top_for_w:
-        top_has_particles = target_masks_top.astype(bool).any(axis=-1)  # [N, Q]
-        is_real_W = is_real & top_has_particles
+    # Per-type slot validity from output files (preferred)
+    if slot_valid_top is not None:
+        is_real_top = slot_valid_top.astype(bool)
     else:
+        # Fallback: chain-level objectness (both top & W valid)
+        is_real_top = target_obj_top.astype(bool) if target_obj_top is not None else \
+                      target_masks_top.astype(bool).any(axis=-1)
+
+    if slot_valid_W is not None:
+        is_real_W = slot_valid_W.astype(bool)
+    else:
+        is_real_W = target_obj_W.astype(bool) if target_obj_W is not None else \
+                    target_masks_W.astype(bool).any(axis=-1)
+
+    # Fallback for legacy/backward compat
+    if legacy_output_targets:
+        is_real = target_masks_W.astype(bool).any(axis=-1)
+        is_real_top = is_real
         is_real_W = is_real
-    n_real  = is_real.sum(axis=1)                          # [N]
+
+    # Optional physics-complete truth gate: require full expected multiplicity
+    # for a real object (top=3 particles, W=2 particles).
+    if require_complete_truth and not legacy_output_targets:
+        top_counts = target_masks_top.astype(bool).sum(axis=-1)
+        W_counts = target_masks_W.astype(bool).sum(axis=-1)
+        is_real_top = is_real_top & (top_counts == 3)
+        is_real_W = is_real_W & (W_counts == 2)
+
+    # Optional physics-consistent gate: a W is only real if its parent top is also real.
+    if require_top_for_w:
+        is_real_W = is_real_W & is_real_top
+
+    n_real_top = is_real_top.sum(axis=1)                   # [N]
 
     valid = jet_valid[:, np.newaxis, :].astype(bool)       # [N, 1, P]
 
@@ -275,7 +348,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     # In joint mode, top is only correct if its associated W is also correct.
     # W condition is vacuously satisfied for chains with no real W target.
     if joint:
-        slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real)
+        slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real_W)
 
     # In strict mode, require the corresponding objectness head to predict real
     obj_thresh = 0.5 if use_probs else 0.0
@@ -293,39 +366,27 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         detected_W = slot_perfect_W
 
     # Event-level aggregates — use is_real (W-based) as the chain gate throughout
-    all_tops_perfect = ((~is_real) | detected_top).all(axis=1)   # [N]
-    all_Ws_perfect   = ((~is_real) | detected_W).all(axis=1)     # [N]
-    perfect_all      = ((~is_real) | (detected_top & detected_W)).all(axis=1)
+    all_tops_perfect = ((~is_real_top) | detected_top).all(axis=1)   # [N]
+    all_Ws_perfect   = ((~is_real_W) | detected_W).all(axis=1)       # [N]
+    perfect_all      = ((~is_real_top) | (detected_top & detected_W)).all(axis=1)
 
-    has_W     = is_real.any(axis=1)
-    both_tops = n_real == 2
+    both_tops = n_real_top == 2
 
-    # Top efficiency gate: is_real (W-based) by default, matching original behaviour.
-    # When prior_top is given, further restrict to chains where the top target has
-    # exactly prior_top particles — chains with fewer particles always fail the prior
-    # (b-jet outside acceptance etc.) and should not count against efficiency.
-    if prior_top is not None:
-        top_counts    = target_top_b.sum(axis=-1)          # [N, Q]
-        top_eff_gate  = is_real & (top_counts == prior_top)
-    else:
-        top_eff_gate  = is_real
+    # Per-chain efficiencies use all real chains in the denominator.
+    # Priors affect prediction binarisation only (numerator), not denominator.
+    top_eff_gate = is_real_top
+    W_eff_gate   = is_real_W
 
     n_top_correct = (top_eff_gate & detected_top).sum()
     n_top_total   = top_eff_gate.sum()
 
-    # W efficiency: per-slot, using is_real_W (respects require_top_for_w)
-    if prior_W is not None:
-        W_counts    = target_W_b.sum(axis=-1)              # [N, Q]
-        W_eff_gate  = is_real_W & (W_counts == prior_W)
-    else:
-        W_eff_gate  = is_real_W
-
     n_W_correct = (W_eff_gate & detected_W).sum()
     n_W_total   = W_eff_gate.sum()
 
+    # W efficiency: per-chain (real W chains)
     # ttbar efficiency: event-level — both tops correct among events with exactly 2 real chains
     top_eff   = n_top_correct / max(n_top_total, 1)
-    W_eff     = n_W_correct   / max(n_W_total,   1)
+    W_eff     = n_W_correct / max(n_W_total, 1)
     ttbar_eff = (all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)
     all_eff   = perfect_all.sum()                    / len(perfect_all)
 
@@ -345,16 +406,16 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         n_pred_real_top = int(pred_real_top.sum())
 
         # Of predicted-real-top chains, fraction that are actually real
-        obj_purity = float((pred_real_top & is_real).sum() / max(n_pred_real_top, 1))
+        obj_purity = float((pred_real_top & is_real_top).sum() / max(n_pred_real_top, 1))
 
         # Top purity: of predicted-real-top chains, fraction with perfect top mask
-        top_purity = float((pred_real_top & is_real & slot_perfect_top).sum()
+        top_purity = float((pred_real_top & is_real_top & slot_perfect_top).sum()
                            / max(n_pred_real_top, 1))
 
         # ttbar purity: events with ≥2 chains predicted real (top), both tops correct
         pred_both_tops   = pred_real_top.sum(axis=1) >= 2
         n_pred_both_tops = int(pred_both_tops.sum())
-        both_tops_correct = (pred_real_top & is_real & slot_perfect_top).sum(axis=1) == 2
+        both_tops_correct = (pred_real_top & is_real_top & slot_perfect_top).sum(axis=1) == 2
         ttbar_purity = float((pred_both_tops & both_tops_correct).sum()
                              / max(n_pred_both_tops, 1))
 
@@ -363,7 +424,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         n_pred_real_W = int(pred_real_W.sum())
 
         # W purity: of predicted-real-W chains, fraction with perfect W mask
-        W_purity = float((pred_real_W & is_real & slot_perfect_W).sum()
+        W_purity = float((pred_real_W & is_real_W & slot_perfect_W).sum()
                          / max(n_pred_real_W, 1))
 
     # For breakdown purity, use top objectness as the gating prediction
@@ -372,7 +433,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     # Per-multiplicity breakdown (by signal jet count)
     multiplicity = jet_valid.sum(axis=1).astype(int)
     breakdown = _compute_breakdown(
-        multiplicity, is_real, top_eff_gate, W_eff_gate, detected_top, detected_W,
+        multiplicity, is_real_top, top_eff_gate, W_eff_gate, detected_top, detected_W,
         all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
     )
 
@@ -380,7 +441,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     breakdown_orig = {}
     if original_mult is not None:
         breakdown_orig = _compute_breakdown(
-            original_mult, is_real, top_eff_gate, W_eff_gate, detected_top, detected_W,
+            original_mult, is_real_top, top_eff_gate, W_eff_gate, detected_top, detected_W,
             all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
         )
 
@@ -446,8 +507,9 @@ def print_results(run_dir: Path, results: dict):
     print("─" * 70)
     top_label = "top+W masks correct" if results.get("joint") else "top mask correct"
     print(f"  Top efficiency     (per chain, {top_label}):  {results['top_eff']*100:6.2f}%   (N={results['n_has_top']:,} chains)")
-    print(f"  W efficiency       (per chain, W mask correct):        {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,} chains)")
+    print(f"  W efficiency       (per chain, W mask correct):         {results['W_eff']*100:6.2f}%   (N={results['n_has_W']:,} chains)")
     print(f"  ttbar efficiency   (exactly 2 chains, both correct):   {results['ttbar_eff']*100:6.2f}%   (N={results['n_both_tops']:,})")
+    print(f"  N_real used        (top / W / ttbar):                  {results['n_has_top']:,} / {results['n_has_W']:,} / {results['n_both_tops']:,}")
     print("─" * 70)
     print(f"  All-object efficiency:                                  {results['all_eff']*100:6.2f}%   (N={N:,})")
 
@@ -470,7 +532,10 @@ def print_results(run_dir: Path, results: dict):
         if not table:
             return
         print(f"\n{label}")
-        header = f"  {'Jets':>5}   {'Top eff':>8}   {'W eff':>8}   {'ttbar eff':>9}   {'Events':>8}"
+        header = (
+            f"  {'Jets':>5}   {'Top eff':>8}   {'W eff':>8}   {'ttbar eff':>9}   "
+            f"{'N_top':>8}   {'N_W':>8}   {'N_ttbar':>8}   {'Events':>8}"
+        )
         print(header)
         print("  " + "-" * (len(header) - 2))
         for m, row in sorted(table.items()):
@@ -478,6 +543,9 @@ def print_results(run_dir: Path, results: dict):
                 f"  {m:>5}   {row['top_eff']*100:>7.2f}%   "
                 f"{row['W_eff']*100:>7.2f}%   "
                 f"{row['ttbar_eff']*100:>8.2f}%   "
+                f"{row['n_top']:>8,}   "
+                f"{row['n_W']:>8,}   "
+                f"{row['n_ttbar']:>8,}   "
                 f"{row['n_events']:>8,}"
             )
 
@@ -687,106 +755,6 @@ def make_plots(run_dir: Path, results: dict):
         print(f"  Saved: {out}")
 
 
-def make_table_image(run_dir: Path, results: dict):
-    """Render a single-run efficiency table as a PNG image."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import to_rgb
-    except ImportError:
-        print("WARNING: matplotlib not available — skipping table image.")
-        return
-
-    br = results["breakdown"]
-    all_mults = sorted(br.keys())
-    ge8_keys = [m for m in all_mults if m >= 8]
-
-    bins = {
-        "6 jets":   _agg_bin(br, [6]),
-        "7 jets":   _agg_bin(br, [7]),
-        ">=8 jets": _agg_bin(br, ge8_keys),
-        "All": {
-            "top_eff":   results["top_eff"],
-            "W_eff":     results["W_eff"],
-            "ttbar_eff": results["ttbar_eff"],
-            "n_events":  results["N"],
-        },
-    }
-
-    metrics = [
-        ("Top eff",   "top_eff"),
-        ("W eff",     "W_eff"),
-        ("ttbar eff", "ttbar_eff"),
-    ]
-    bin_keys = ["6 jets", "7 jets", ">=8 jets", "All"]
-    col_headers = ["Metric"] + bin_keys
-
-    cell_text = []
-    for metric_label, metric_key in metrics:
-        cell_text.append(
-            [metric_label] + [f"{bins[bk][metric_key]*100:.2f}%" for bk in bin_keys]
-        )
-
-    n_rows = len(cell_text)
-    n_cols = len(col_headers)
-
-    fig, ax = plt.subplots(figsize=(9, 1.4 + n_rows * 0.55))
-    ax.axis("off")
-
-    table = ax.table(
-        cellText=cell_text,
-        colLabels=col_headers,
-        loc="center",
-        cellLoc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1.0, 2.0)
-
-    # Header style
-    for j in range(n_cols):
-        cell = table[0, j]
-        cell.set_facecolor("#1a252f")
-        cell.set_text_props(color="white", fontweight="bold", fontsize=12)
-        cell.set_edgecolor("white")
-        cell.set_linewidth(2.5)
-
-    # Row colours
-    row_colors = [
-        ("#d6eaf8", "#2c3e50"),
-        ("#fadbd8", "#78281f"),
-        ("#d5f5e3", "#1e8449"),
-    ]
-    for i in range(n_rows):
-        bg, fg = row_colors[i % len(row_colors)]
-        for j in range(n_cols):
-            cell = table[i + 1, j]
-            cell.set_facecolor(bg)
-            cell.set_edgecolor("white")
-            cell.set_linewidth(2.5)
-            if j >= 1:
-                cell.set_text_props(fontweight="bold", fontsize=11, color=fg)
-            else:
-                cell.set_text_props(fontweight="bold", fontsize=11, color="#2c3e50")
-
-    # Build title
-    prior_parts = []
-    if results["prior_top"] is not None:
-        prior_parts.append(f"top={results['prior_top']}")
-    if results["prior_W"] is not None:
-        prior_parts.append(f"W={results['prior_W']}")
-    binarisation = ", ".join(prior_parts) if prior_parts else f"threshold={results['threshold']}"
-    title = f"Reconstruction Efficiency\n(binarisation: {binarisation})"
-    ax.set_title(title, fontsize=14, fontweight="bold", pad=20)
-
-    fig.tight_layout()
-    out = run_dir / "eval_table.png"
-    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"  Saved: {out}")
-
-
 # ---------------------------------------------------------------------------
 # Threshold sweep
 # ---------------------------------------------------------------------------
@@ -795,6 +763,10 @@ def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_
                                   jet_valid, use_probs=False,
                                   t_min=None, t_max=None, n_steps=100,
                                   prior_top=None, prior_W=None, joint=False,
+                                  valid_tops_truth=None, valid_Ws_truth=None,
+                                  slot_valid_top=None, slot_valid_W=None,
+                                  legacy_output_targets=False,
+                                  require_complete_truth=False,
                                   require_top_for_w=False):
     """
     Evaluate efficiency metrics across a range of thresholds.
@@ -809,25 +781,32 @@ def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_
     thresholds = np.linspace(t_min, t_max, n_steps)
 
     # Pre-compute masks that don't depend on threshold
-    is_real      = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
-    if require_top_for_w:
-        is_real_W = is_real & target_masks_top.astype(bool).any(axis=-1)
-    else:
+    is_real = target_masks_W.astype(bool).any(axis=-1)    # [N, Q]
+    if legacy_output_targets:
+        is_real_top = is_real
         is_real_W = is_real
-    n_real       = is_real.sum(axis=1)
-    has_W        = is_real.any(axis=1)
-    both_tops    = n_real == 2
+    elif slot_valid_top is not None:
+        is_real_top = slot_valid_top.astype(bool)
+        is_real_W = slot_valid_W.astype(bool) if slot_valid_W is not None else is_real
+    else:
+        is_real_top = valid_tops_truth if valid_tops_truth is not None else is_real
+        is_real_W = valid_Ws_truth if valid_Ws_truth is not None else is_real
+
+    if require_complete_truth and not legacy_output_targets and slot_valid_top is None:
+        top_counts = target_masks_top.astype(bool).sum(axis=-1)
+        W_counts = target_masks_W.astype(bool).sum(axis=-1)
+        is_real_top = is_real_top & (top_counts == 3)
+        is_real_W = is_real_W & (W_counts == 2)
+
+    if require_top_for_w:
+        is_real_W = is_real_W & is_real_top
+    n_real_top   = is_real_top.sum(axis=1)
+    both_tops    = n_real_top == 2
     valid        = jet_valid[:, np.newaxis, :].astype(bool)
     target_top_b = target_masks_top.astype(bool)
     target_W_b   = target_masks_W.astype(bool)
-    if prior_top is not None:
-        top_eff_gate = is_real & (target_top_b.sum(axis=-1) == prior_top)
-    else:
-        top_eff_gate = is_real
-    if prior_W is not None:
-        W_eff_gate = is_real_W & (target_W_b.sum(axis=-1) == prior_W)
-    else:
-        W_eff_gate = is_real_W
+    top_eff_gate = is_real_top
+    W_eff_gate   = is_real_W
     n_top_total  = int(top_eff_gate.sum())
     n_W_total    = int(W_eff_gate.sum())
 
@@ -845,10 +824,9 @@ def sweep_threshold_efficiencies(pred_scores_top, target_masks_top, pred_scores_
         slot_perfect_W   = ((pred_bin_W   != target_W_b)   & valid).sum(axis=2) == 0
 
         if joint:
-            slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real)
+            slot_perfect_top = slot_perfect_top & (slot_perfect_W | ~is_real_W)
 
-        all_tops_perfect = ((~is_real) | slot_perfect_top).all(axis=1)
-
+        all_tops_perfect = ((~is_real_top) | slot_perfect_top).all(axis=1)
         n_top_correct = (top_eff_gate & slot_perfect_top).sum()
         n_W_correct   = (W_eff_gate & slot_perfect_W).sum()
 
@@ -916,10 +894,6 @@ def main():
         help="Save PNG efficiency plots to --run_dir"
     )
     parser.add_argument(
-        "--table", action="store_true",
-        help="Save PNG efficiency table to --run_dir"
-    )
-    parser.add_argument(
         "--use_probs", action="store_true",
         help="Use saved sigmoid probabilities instead of raw logits (default threshold 0.5)"
     )
@@ -955,16 +929,36 @@ def main():
         help="Count a top as correctly reconstructed only if its associated W is also correct"
     )
     parser.add_argument(
-        "--require_top_for_w", action="store_true",
-        help="Only count a chain as real if the top target also has particles (no orphan Ws)"
-    )
-    parser.add_argument(
         "--prior", nargs="+", metavar="TYPE=K", default=[],
         help=(
             "Per-type top-k binarisation prior, e.g. --prior top=3 W=2. "
             "For each mask type, select the K highest-scoring valid particles "
             "instead of thresholding."
         ),
+    )
+    parser.add_argument(
+        "--fixed_slot_eval", action="store_true",
+        help=(
+            "Compatibility flag. This evaluator already uses fixed slot index matching, "
+            "so enabling this does not change behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--legacy_output_targets", action="store_true",
+        help=(
+            "Evaluate using legacy output targets/objectness gates for both top and W denominators."
+        ),
+    )
+    parser.add_argument(
+        "--require_complete_truth", action="store_true",
+        help=(
+            "In truth-based mode, only count real tops/Ws with complete truth multiplicity "
+            "(top=3 particles, W=2 particles)."
+        ),
+    )
+    parser.add_argument(
+        "--require_top_for_w", action="store_true",
+        help="Only count a W as real when its corresponding top is also real",
     )
     args = parser.parse_args()
 
@@ -992,7 +986,8 @@ def main():
 
     (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
      jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
-     original_mult) = load_run_data(
+     original_mult, valid_tops_truth, valid_Ws_truth,
+     slot_valid_top, slot_valid_W) = load_run_data(
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
@@ -1003,15 +998,18 @@ def main():
         pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
         use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
         joint=args.joint, original_mult=original_mult,
+        valid_tops_truth=valid_tops_truth,
+        valid_Ws_truth=valid_Ws_truth,
+        slot_valid_top=slot_valid_top,
+        slot_valid_W=slot_valid_W,
+        legacy_output_targets=args.legacy_output_targets,
+        require_complete_truth=args.require_complete_truth,
         require_top_for_w=args.require_top_for_w,
     )
     print_results(run_dir, results)
 
     if args.plot:
         make_plots(run_dir, results)
-
-    if args.table:
-        make_table_image(run_dir, results)
 
     if args.threshold_sweep:
         t_min, t_max = args.sweep_range if args.sweep_range else (None, None)
@@ -1024,6 +1022,12 @@ def main():
             n_steps=args.sweep_steps,
             prior_top=prior_top, prior_W=prior_W,
             joint=args.joint,
+            valid_tops_truth=valid_tops_truth,
+            valid_Ws_truth=valid_Ws_truth,
+            slot_valid_top=slot_valid_top,
+            slot_valid_W=slot_valid_W,
+            legacy_output_targets=args.legacy_output_targets,
+            require_complete_truth=args.require_complete_truth,
             require_top_for_w=args.require_top_for_w,
         )
         plot_threshold_sweep(run_dir, thresholds, top_effs, W_effs, ttbar_effs,
