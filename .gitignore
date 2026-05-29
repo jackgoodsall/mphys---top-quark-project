@@ -1,5 +1,5 @@
 /.transformer_env
-/src/data_utls
+/src/data_utils
 /data/
 /lightning_logs/
 /checkpoints/

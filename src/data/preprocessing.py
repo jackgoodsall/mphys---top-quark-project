@@ -56,7 +56,7 @@ print("\n[ATTEMPTING] Custom imports from src/utils...", flush=True)
 
 try:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-    from src.data_utls.scalers import LogMinMaxScaler, StandardScaler, PhiTransformer
+    from src.data_utils.scalers import LogMinMaxScaler, StandardScaler, PhiTransformer
     print("[OK] Scalers imported", flush=True)
 except Exception as e:
     print(f"[FAIL] Scalers import: {e}", flush=True)

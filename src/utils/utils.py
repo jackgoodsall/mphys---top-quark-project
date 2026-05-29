@@ -7,11 +7,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import numpy as np
 import vector
-import sys
 import joblib
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from src.data_utls.scalers import *
+from src.data_utils.scalers import *
 
 ## Define some config models so that we have a first layer file 
 ## on passing bricked configs
