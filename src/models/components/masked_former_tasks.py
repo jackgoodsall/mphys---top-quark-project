@@ -118,6 +118,10 @@ class TaskRegistry(nn.Module):
         # Plain Python attribute so it is NOT saved in checkpoints — reconstructed
         # from config on every run, making checkpoint resume correct automatically.
         self._active_tasks: Optional[set] = None
+        # Tasks that contribute to matching cost only (not loss). Used for
+        # e.g. keeping mask cost active during objectness-only phase.
+        # Not persisted — reconstructed each epoch by the trainer.
+        self._cost_only_tasks: set = set()
         # Per-task loss scales for smooth phase transitions (0.0 → 1.0 ramp).
         # Not persisted — reconstructed each epoch by the trainer.
         self._loss_scales: Dict[str, float] = {}
@@ -145,8 +149,28 @@ class TaskRegistry(nn.Module):
                 raise ValueError(f"Unknown tasks requested: {unknown}")
             self._active_tasks = set(task_names)
 
+    def set_cost_only_tasks(self, task_names: Optional[list]):
+        """
+        Mark tasks as contributing to matching cost but not to loss.
+        Used to keep mask driving Hungarian matching during phases where
+        mask loss should be suppressed (e.g. objectness-only phase).
+
+        Args:
+            task_names: List of task names, or None/[] to clear.
+        """
+        if not task_names:
+            self._cost_only_tasks = set()
+        else:
+            unknown = set(task_names) - set(self.tasks.keys())
+            if unknown:
+                raise ValueError(f"Unknown tasks requested: {unknown}")
+            self._cost_only_tasks = set(task_names)
+
     def _is_active(self, task_name: str) -> bool:
         return self._active_tasks is None or task_name in self._active_tasks
+
+    def _is_cost_only(self, task_name: str) -> bool:
+        return task_name in self._cost_only_tasks
 
     def set_loss_scale(self, task_name: str, scale: float):
         """Set a multiplicative loss scale for a task (used for smooth phase transitions)."""
@@ -170,7 +194,7 @@ class TaskRegistry(nn.Module):
         total_cost = None
 
         for task_name, task in self.tasks.items():
-            if not self._is_active(task_name):
+            if not self._is_active(task_name) and not self._is_cost_only(task_name):
                 continue
             task_cost = task.compute_cost(predictions, targets)
 
@@ -221,6 +245,18 @@ class TaskRegistry(nn.Module):
 
             per_task_losses[task_name] = task_loss.detach() if torch.is_tensor(task_loss) else torch.tensor(float(task_loss))
             total_loss += task_loss
+
+        # Cost-only tasks are excluded from the loss loop above, so their
+        # compute_loss is never called and their stats buffers stay at zero.
+        # On the final decoder layer, run compute_loss in no-grad to accumulate
+        # stats (dice scores, detection stats) without affecting gradients.
+        if is_final_layer and self._cost_only_tasks:
+            for task_name, task in self.tasks.items():
+                if self._is_cost_only(task_name):
+                    task._stats_enabled = True
+                    with torch.no_grad():
+                        task.compute_loss(predictions, targets, valid_mask)
+                    task._stats_enabled = True
 
         return total_loss, per_task_losses
 
@@ -1061,9 +1097,10 @@ class ObjectnessTask(BaseTask):
     Targets: derived from targets["classes"] — real=1.0, null=0.0
     """
 
-    def __init__(self, config: TaskConfig):
+    def __init__(self, config: TaskConfig, target_key: str = 'obj_valid_mask'):
         super().__init__(config)
-        self.pred_key = config.output_names[0]  # e.g. 'objectness_logit' or 'objectness_W_logit'
+        self.pred_key = config.output_names[0]  # e.g. 'objectness_logit', 'objectness_top_logit'
+        self.target_key = target_key             # which validity mask to use as target
         # Detection stats accumulators — GPU buffers so .item() is deferred to
         # get_detection_stats() (called once per epoch, not per step)
         self.register_buffer('_tp_buf', torch.zeros(1, dtype=torch.long), persistent=False)
@@ -1116,7 +1153,7 @@ class ObjectnessTask(BaseTask):
 
         pred_logit = predictions[self.pred_key].squeeze(-1)  # [B, Q]
 
-        obj_valid = targets.get('obj_valid_mask')
+        obj_valid = targets.get(self.target_key)
         if obj_valid is None:
             target_obj = torch.ones_like(pred_logit)
         else:
@@ -1188,7 +1225,7 @@ class ObjectnessTask(BaseTask):
         pred_logit = predictions[self.pred_key].squeeze(-1)  # [B, Q]
         pred_prob = pred_logit.sigmoid()
 
-        obj_valid = targets.get('obj_valid_mask')
+        obj_valid = targets.get(self.target_key)
         if obj_valid is not None:
             target_obj = obj_valid.float()
         else:
@@ -1360,6 +1397,182 @@ class ObjectTypeTask(BaseTask):
         file["target_classes"][start_idx:end_idx] = classes[:, :M].float().cpu().numpy()
 
 
+class IoUPredictionTask(BaseTask):
+    """
+    Predicts the IoU between each query's mask and the matched ground-truth mask.
+    Acts as a learned quality/confidence signal replacing binary objectness.
+
+    Two outputs (chain_queries mode):
+        'iou_score_top' [B, Q, 1]  — quality of the top mask
+        'iou_score_W'   [B, Q, 1]  — quality of the W mask
+
+    For real slots: trained to regress to the actual sigmoid-mask vs GT IoU.
+    For null slots: target = 0.0 (no mask → no quality).
+
+    At inference: rank/threshold chains by min(iou_score_top, iou_score_W) or their
+    mean to get a continuous objectness proxy that reflects actual mask quality.
+    """
+
+    def __init__(self, config: TaskConfig,
+                 top_mask_pred_key: str = 'mask_predictions',
+                 w_mask_pred_key: str = 'mask_W'):
+        super().__init__(config)
+        self.top_mask_pred_key = top_mask_pred_key
+        self.w_mask_pred_key = w_mask_pred_key
+        self.eps = 1e-6
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        first = next(iter(predictions.values()))
+        B, Q = first.shape[:2]
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=first.device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        obj_valid = targets.get('obj_valid_mask')   # [B, Q] bool or None
+
+        first = next(iter(predictions.values()))
+        total_loss = first.new_tensor(0.0)
+        n_terms = 0
+
+        for score_key, mask_pred_key, target_key in [
+            ('iou_score_top', self.top_mask_pred_key, 'jet_mask_true'),
+            ('iou_score_W',   self.w_mask_pred_key,   'jet_mask_true_W'),
+        ]:
+            if score_key not in predictions or mask_pred_key not in predictions:
+                continue
+            target_masks = targets.get(target_key)
+            if target_masks is None:
+                continue
+
+            pred_score = predictions[score_key].squeeze(-1)          # [B, Q]
+            pred_probs = predictions[mask_pred_key].sigmoid()        # [B, Q, N]
+            target_f   = target_masks.float()                        # [B, Q, N]
+
+            if valid_mask is not None:
+                vm = valid_mask.unsqueeze(1)                         # [B, 1, N]
+                pred_probs = pred_probs * vm
+                target_f   = target_f   * vm
+
+            # True IoU per (batch, query) — detached; not part of the mask gradient
+            intersection = (pred_probs * target_f).sum(-1)           # [B, Q]
+            union = (pred_probs + target_f - pred_probs * target_f).sum(-1)
+            true_iou = (intersection / (union + self.eps)).detach()  # [B, Q]
+
+            # Null slots → target IoU = 0 (no real mask, so no quality)
+            if obj_valid is not None:
+                iou_target = torch.where(obj_valid, true_iou, torch.zeros_like(true_iou))
+            else:
+                iou_target = true_iou
+
+            total_loss = total_loss + F.mse_loss(pred_score, iou_target)
+            n_terms += 1
+
+        if n_terms > 0:
+            total_loss = total_loss / n_terms
+
+        return self.config.get_loss_weight('iou') * total_loss
+
+    def create_test_datasets(self, file: h5py.File, number_events: int):
+        M = self.config.max_objects
+        for key in ('iou_score_top', 'iou_score_W'):
+            if key in self.config.output_names:
+                file.create_dataset(f"predicted_{key}", shape=(number_events, M), dtype='float32')
+
+    def save_test_predictions(
+        self,
+        file: h5py.File,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        start_idx: int,
+        batch_size: int
+    ):
+        M = self.config.max_objects
+        end_idx = start_idx + batch_size
+        for key in ('iou_score_top', 'iou_score_W'):
+            if key in predictions and f"predicted_{key}" in file:
+                scores = predictions[key].squeeze(-1)[:, :M].float().cpu().numpy()
+                file[f"predicted_{key}"][start_idx:end_idx] = scores
+
+
+class MaskOverlapTask(BaseTask):
+    """
+    Penalises overlap between different queries' predicted masks.
+    Encourages each query to claim a distinct set of particles.
+
+    Loss = mean pairwise Dice overlap across all (i, j) query pairs, i < j.
+    Applied independently to top masks and W masks when both keys are present.
+    """
+
+    def __init__(self, config: TaskConfig,
+                 pred_keys: Optional[list] = None):
+        super().__init__(config)
+        # Default: penalise both top and W mask overlap
+        self.pred_keys = pred_keys or ['mask_predictions', 'mask_W']
+        self.eps = 1e-6
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        first = next(iter(predictions.values()))
+        B, Q = first.shape[:2]
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=first.device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        first = next(iter(predictions.values()))
+        total_loss = first.new_tensor(0.0)
+        n_terms = 0
+
+        for pred_key in self.pred_keys:
+            if pred_key not in predictions:
+                continue
+
+            probs = predictions[pred_key].sigmoid()       # [B, Q, N]
+            if valid_mask is not None:
+                probs = probs * valid_mask.unsqueeze(1)   # zero-out padding positions
+
+            B, Q, N = probs.shape
+            if Q < 2:
+                continue
+
+            overlap = probs.new_tensor(0.0)
+            n_pairs = 0
+            for i in range(Q):
+                for j in range(i + 1, Q):
+                    p_i = probs[:, i, :]                  # [B, N]
+                    p_j = probs[:, j, :]
+                    intersection = (p_i * p_j).sum(-1)    # [B]
+                    denom = p_i.sum(-1) + p_j.sum(-1) + self.eps
+                    dice_overlap = (2 * intersection / denom).mean()
+                    overlap = overlap + dice_overlap
+                    n_pairs += 1
+
+            if n_pairs > 0:
+                total_loss = total_loss + overlap / n_pairs
+                n_terms += 1
+
+        if n_terms > 0:
+            total_loss = total_loss / n_terms
+
+        return self.config.get_loss_weight('overlap') * total_loss
+
+
 class BackgroundSuppressionTask(BaseTask):
     """
     Penalises high mask logits for background particles (not in any real GT mask)
@@ -1464,13 +1677,14 @@ class ParticleGatingTask(BaseTask):
             real = jet_mask_true
         particle_target = real.any(dim=1).float()  # [B, N]  1=signal, 0=background
 
+        # gate_relevance is raw logits — use BCEWithLogits (autocast-safe)
         if valid_mask is not None:
             vm = valid_mask.float()
             n = vm.sum().clamp(min=1)
-            loss = (F.binary_cross_entropy(relevance.clamp(1e-6, 1 - 1e-6),
-                                           particle_target, reduction='none') * vm).sum() / n
+            loss = (F.binary_cross_entropy_with_logits(
+                relevance, particle_target, reduction='none') * vm).sum() / n
         else:
-            loss = F.binary_cross_entropy(relevance.clamp(1e-6, 1 - 1e-6),
-                                          particle_target, reduction='mean')
+            loss = F.binary_cross_entropy_with_logits(
+                relevance, particle_target, reduction='mean')
 
         return self.config.get_loss_weight('gate') * loss

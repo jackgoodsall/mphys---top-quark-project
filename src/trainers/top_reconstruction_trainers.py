@@ -99,12 +99,27 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.lr_history = []
         self.test_metrics = {}
 
-        # Mask-only pretraining config
+        # Multi-phase pretraining config
         pretrain_cfg = config.get("pretraining", {})
-        self.mask_pretrain_epochs = pretrain_cfg.get("mask_pretrain_epochs", 0)
-        self.mask_pretrain_tasks = pretrain_cfg.get("tasks", ["mask"])
-        self._pretrain_phase_active = self.mask_pretrain_epochs > 0
         self.transition_ramp_epochs = pretrain_cfg.get("transition_ramp_epochs", 0)
+
+        if "phases" in pretrain_cfg:
+            # New multi-phase format: list of {epochs, tasks, cost_only_tasks?}
+            self._pretrain_phases = pretrain_cfg["phases"]
+            cumulative = 0
+            self._phase_boundaries = []
+            for p in self._pretrain_phases:
+                cumulative += p["epochs"]
+                self._phase_boundaries.append(cumulative)
+            self.mask_pretrain_epochs = self._phase_boundaries[-1]
+        else:
+            # Legacy single-phase
+            self._pretrain_phases = None
+            self._phase_boundaries = None
+            self.mask_pretrain_epochs = pretrain_cfg.get("mask_pretrain_epochs", 0)
+            self.mask_pretrain_tasks = pretrain_cfg.get("tasks", ["mask"])
+
+        self._pretrain_phase_active = self.mask_pretrain_epochs > 0
 
         self.save_hyperparameters(ignore=["model", "task_registry"])
 
@@ -231,8 +246,8 @@ class ReconstructionTrainer(lightning.LightningModule):
                   f"— replacing with 0 and signalling stop.")
             if bad_tasks:
                 print(f"   Tasks with NaN: {bad_tasks}")
-            # Replace loss with zero so backward + allreduce still runs on all ranks
-            total_loss = torch.zeros_like(total_loss)
+            # Multiply by 0 (not zeros_like) to preserve grad_fn so backward() succeeds
+            total_loss = total_loss * 0.0
             self.trainer.should_stop = True
 
         return total_loss, task_loss_accum
@@ -445,6 +460,19 @@ class ReconstructionTrainer(lightning.LightningModule):
     def on_test_start(self):
         """Initialize HDF5 files for test predictions (rank 0 only)"""
         super().on_test_start()
+
+        # Always evaluate with all tasks fully active regardless of which
+        # pretraining phase training ended in.  Without this, the matching
+        # cost used during the forward pass can differ from Phase 1 (e.g.
+        # objectness cost added when its cost_weight > 0), misaligning saved
+        # HDF5 targets with mask predictions and collapsing efficiency.
+        self.task_registry.set_active_tasks(None)
+        self.task_registry.set_cost_only_tasks(None)
+        # Restore null penalty so the mask loss is computed correctly during test
+        for task in self.task_registry.tasks.values():
+            if hasattr(task, 'null_penalty_scale'):
+                task.null_penalty_scale = 1.0
+
         self._test_h5_files: Dict[str, h5py.File] = {}
 
         if self.global_rank == 0:
@@ -501,11 +529,18 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.test_start_idx += batch_size
     
     def on_fit_start(self):
-        """Log model parameter counts at the start of training"""
+        """Log model parameter counts and optionally compile the model."""
         total = sum(p.numel() for p in self.model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         if self.global_rank == 0:
             print(f"\nModel parameters: {total:,} total, {trainable:,} trainable\n")
+
+        compile_cfg = self.config.get("model_training", {}).get("compile", False)
+        if compile_cfg:
+            mode = compile_cfg if isinstance(compile_cfg, str) else "default"
+            if self.global_rank == 0:
+                print(f"[Compile] torch.compile(mode='{mode}') — first batch will be slow (tracing).")
+            self.model = torch.compile(self.model, mode=mode)
         if self.logger:
             self.logger.experiment.add_scalar('model/total_params', float(total), global_step=0)
             self.logger.experiment.add_scalar('model/trainable_params', float(trainable), global_step=0)
@@ -529,59 +564,127 @@ class ReconstructionTrainer(lightning.LightningModule):
             if param_groups:
                 self.lr_history.append(param_groups[0]['lr'])
 
-        # Mask-only pretraining phase transitions
+        # Multi-phase pretraining transitions
         if self._pretrain_phase_active:
             epoch = self.trainer.current_epoch
-            mask_task = self.task_registry.tasks['mask'] if 'mask' in self.task_registry.tasks else None
-            pretrain_set = set(self.mask_pretrain_tasks)
             ramp = self.transition_ramp_epochs
 
-            if epoch < self.mask_pretrain_epochs:
-                # Phase 1: mask only — no objectness/type cost or loss, no null penalty
-                self.task_registry.set_active_tasks(self.mask_pretrain_tasks)
-                if mask_task is not None:
-                    mask_task.null_penalty_scale = 0.0
-                if epoch == 0 and self.global_rank == 0:
-                    print(f"\n[Pretraining] Phase 1: mask-only "
-                          f"(epochs 0–{self.mask_pretrain_epochs - 1}), "
-                          f"active tasks: {self.mask_pretrain_tasks}")
-            else:
-                # Phase 2+: all tasks enabled, with optional ramp
-                self.task_registry.set_active_tasks(None)
-                epochs_since = epoch - self.mask_pretrain_epochs
-                if ramp > 0 and epochs_since < ramp:
-                    alpha = min(1.0, (epochs_since + 1) / ramp)
+            if self._pretrain_phases is not None:
+                # --- New multi-phase path ---
+                current_phase_idx = None
+                for i, boundary in enumerate(self._phase_boundaries):
+                    if epoch < boundary:
+                        current_phase_idx = i
+                        break
+
+                if current_phase_idx is not None:
+                    # Still in a pretrain phase
+                    phase = self._pretrain_phases[current_phase_idx]
+                    phase_tasks = phase["tasks"]
+                    cost_only = phase.get("cost_only_tasks", [])
+                    trainable_heads = phase.get("trainable_heads", None)
+                    phase_start = self._phase_boundaries[current_phase_idx - 1] if current_phase_idx > 0 else 0
+
+                    self.task_registry.set_active_tasks(phase_tasks)
+                    self.task_registry.set_cost_only_tasks(cost_only)
+                    # Suppress null penalty for ALL mask tasks during pretraining
+                    for task in self.task_registry.tasks.values():
+                        if hasattr(task, 'null_penalty_scale'):
+                            task.null_penalty_scale = 0.0
+
+                    # Freeze backbone if this phase only trains specific heads
+                    if epoch == phase_start:
+                        if trainable_heads is not None:
+                            for param in self.model.parameters():
+                                param.requires_grad = False
+                            for head_name, head_module in self.model.prediction_heads.items():
+                                if head_name in trainable_heads:
+                                    for param in head_module.parameters():
+                                        param.requires_grad = True
+                            if self.global_rank == 0:
+                                frozen    = sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
+                                trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                                print(f"\n[Pretraining] Phase {current_phase_idx + 1}: backbone frozen. "
+                                      f"Trainable heads: {trainable_heads} "
+                                      f"({trainable:,} params, {frozen:,} frozen)")
+                        else:
+                            # No head restriction — unfreeze everything
+                            for param in self.model.parameters():
+                                param.requires_grad = True
+
+                        if self.global_rank == 0:
+                            print(f"\n[Pretraining] Phase {current_phase_idx + 1}/{len(self._pretrain_phases)}: "
+                                  f"epochs {phase_start}–{self._phase_boundaries[current_phase_idx] - 1}, "
+                                  f"active tasks: {phase_tasks}"
+                                  + (f", cost-only: {cost_only}" if cost_only else "")
+                                  + (f", trainable heads: {trainable_heads}" if trainable_heads else ""))
                 else:
-                    alpha = 1.0
+                    # Final phase: all tasks active, unfreeze everything
+                    self.task_registry.set_active_tasks(None)
+                    self.task_registry.set_cost_only_tasks(None)
+                    if epoch == self.mask_pretrain_epochs:
+                        for param in self.model.parameters():
+                            param.requires_grad = True
+                    epochs_since = epoch - self.mask_pretrain_epochs
+                    alpha = min(1.0, (epochs_since + 1) / ramp) if ramp > 0 and epochs_since < ramp else 1.0
 
-                # Ramp loss scales for non-pretrain tasks
-                for task_name in self.task_registry.tasks:
-                    if task_name not in pretrain_set:
-                        self.task_registry.set_loss_scale(task_name, alpha)
+                    # Ramp all tasks that weren't in the last pretrain phase
+                    last_phase_tasks = set(self._pretrain_phases[-1]["tasks"])
+                    for task_name in self.task_registry.tasks:
+                        if task_name not in last_phase_tasks:
+                            self.task_registry.set_loss_scale(task_name, alpha)
 
-                # Ramp null penalty scale on the mask task
-                if mask_task is not None:
-                    mask_task.null_penalty_scale = alpha
+                    # Ramp null penalty for ALL mask tasks together
+                    for task in self.task_registry.tasks.values():
+                        if hasattr(task, 'null_penalty_scale'):
+                            task.null_penalty_scale = alpha
 
-                if epoch == self.mask_pretrain_epochs and self.global_rank == 0:
-                    print(f"\n[Pretraining] Phase 2: full multi-task "
-                          f"(epoch {epoch}+), all tasks active"
-                          f"{f', ramp over {ramp} epochs' if ramp > 0 else ''}")
-                if ramp > 0 and epochs_since < ramp and self.global_rank == 0:
-                    print(f"[Ramp] epoch {epoch}: alpha={alpha:.3f} "
-                          f"for new tasks + null penalty")
+                    if epoch == self.mask_pretrain_epochs and self.global_rank == 0:
+                        print(f"\n[Pretraining] Final phase: full multi-task "
+                              f"(epoch {epoch}+), all tasks active"
+                              + (f", ramp over {ramp} epochs" if ramp > 0 else ""))
+                    if ramp > 0 and epochs_since < ramp and self.global_rank == 0:
+                        print(f"[Ramp] epoch {epoch}: alpha={alpha:.3f} for new tasks + null penalty")
 
-    def on_before_optimizer_step(self, optimizer):
-        """Log gradient norm before optimizer step (after clipping)"""
-        grads = [p.grad for p in self.parameters() if p.grad is not None]
-        if grads:
-            total_norm = torch.norm(
-                torch.stack([g.detach().norm(2) for g in grads])
-            ).item()
-        else:
-            total_norm = 0.0
-        self.log('grad_norm', total_norm, on_step=True, on_epoch=False,
-                 prog_bar=False, sync_dist=False)
+            else:
+                # --- Legacy single-phase path ---
+                pretrain_set = set(self.mask_pretrain_tasks)
+
+                if epoch < self.mask_pretrain_epochs:
+                    self.task_registry.set_active_tasks(self.mask_pretrain_tasks)
+                    self.task_registry.set_cost_only_tasks(None)
+                    for task in self.task_registry.tasks.values():
+                        if hasattr(task, 'null_penalty_scale'):
+                            task.null_penalty_scale = 0.0
+                    if epoch == 0 and self.global_rank == 0:
+                        print(f"\n[Pretraining] Phase 1: mask-only "
+                              f"(epochs 0–{self.mask_pretrain_epochs - 1}), "
+                              f"active tasks: {self.mask_pretrain_tasks}")
+                else:
+                    self.task_registry.set_active_tasks(None)
+                    self.task_registry.set_cost_only_tasks(None)
+                    epochs_since = epoch - self.mask_pretrain_epochs
+                    alpha = min(1.0, (epochs_since + 1) / ramp) if ramp > 0 and epochs_since < ramp else 1.0
+
+                    for task_name in self.task_registry.tasks:
+                        if task_name not in pretrain_set:
+                            self.task_registry.set_loss_scale(task_name, alpha)
+
+                    for task in self.task_registry.tasks.values():
+                        if hasattr(task, 'null_penalty_scale'):
+                            task.null_penalty_scale = alpha
+
+                    if epoch == self.mask_pretrain_epochs and self.global_rank == 0:
+                        print(f"\n[Pretraining] Phase 2: full multi-task "
+                              f"(epoch {epoch}+), all tasks active"
+                              + (f", ramp over {ramp} epochs" if ramp > 0 else ""))
+                    if ramp > 0 and epochs_since < ramp and self.global_rank == 0:
+                        print(f"[Ramp] epoch {epoch}: alpha={alpha:.3f} for new tasks + null penalty")
+
+    # Gradient norm is already computed by Lightning for gradient clipping.
+    # Re-computing it manually every step was redundant — removed.
+    # Enable Lightning's built-in norm logging via Trainer(log_every_n_steps=...)
+    # if needed for debugging.
 
     def on_train_end(self):
         """Plot loss curves and learning rate schedule (rank 0 only)"""
@@ -642,9 +745,14 @@ def train_reconstruction_model(
     # --- Config-driven callbacks ---
     cb_cfg = config.get("training_callbacks", {})
 
-    # Early stopping — skip checks during pretraining phase
+    # Early stopping — skip checks during pretraining phase.
+    # Support both legacy mask_pretrain_epochs and new multi-phase format.
     es_cfg = cb_cfg.get("early_stopping", {})
-    pretrain_warmup = config.get("pretraining", {}).get("mask_pretrain_epochs", 0)
+    pretrain_cfg = config.get("pretraining", {})
+    if "phases" in pretrain_cfg:
+        pretrain_warmup = sum(p["epochs"] for p in pretrain_cfg["phases"])
+    else:
+        pretrain_warmup = pretrain_cfg.get("mask_pretrain_epochs", 0)
     callbacks.append(WarmupEarlyStopping(
         warmup_epochs=pretrain_warmup,
         monitor=es_cfg.get("monitor", "val_loss"),
@@ -683,6 +791,7 @@ def train_reconstruction_model(
         precision=precision,
         min_epochs=config["model_training"]["min_epochs"],
         max_epochs=config["model_training"]["max_epochs"],
+        check_val_every_n_epoch=train_cfg.get("check_val_every_n_epoch", 1),
         logger=logger,
         callbacks=callbacks,
         gradient_clip_val=grad_clip,

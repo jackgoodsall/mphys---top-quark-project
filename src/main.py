@@ -15,9 +15,35 @@ from models.components.masked_former_tasks import (
     TaskRegistry, TaskConfig,
     MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
     BackgroundSuppressionTask, ParticleGatingTask,
+    IoUPredictionTask, MaskOverlapTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
+
+
+def _apply_finetune_freeze(model, ft_cfg: dict):
+    """
+    Freeze all model parameters then unfreeze only the prediction heads listed
+    in ft_cfg['trainable_heads'].  Everything else (encoder, decoder, embedders,
+    query tokens) stays frozen so Hungarian matching uses the already-trained
+    mask costs while only the specified heads receive gradient updates.
+    """
+    trainable_heads = set(ft_cfg.get("trainable_heads", []))
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for head_name, head_module in model.prediction_heads.items():
+        if head_name in trainable_heads:
+            for param in head_module.parameters():
+                param.requires_grad = True
+
+    frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Finetune] Frozen: {frozen:,} params | Trainable: {trainable:,} params")
+    print(f"[Finetune] Trainable prediction heads: {sorted(trainable_heads)}")
+    if not trainable_heads:
+        print("[Finetune] WARNING: no trainable_heads specified — all params frozen!")
 
 
 def find_latest_checkpoint(log_dir: str):
@@ -126,32 +152,59 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         task_registry.register_task(mask_W_task)
 
     # ========================================
-    # Objectness Task (is this query a real object?)
-    # Single head — in chain_queries mode a valid top requires a valid W,
-    # so one binary objectness per query is sufficient.
+    # Objectness Task(s)
+    # chain_queries mode: separate top and W objectness heads, since a W can
+    # be valid without a reconstructable top and vice versa.
+    # Non-chain mode: single shared head against obj_valid_mask.
     # ========================================
-    obj_config = task_configs.get("objectness", {})
+    if chain_queries:
+        # Shared fallback config — individual keys override
+        _obj_default = task_configs.get("objectness", {})
 
-    obj_layer_weights = _build_layer_weights(
-        layer_config=obj_config.get('layer_weights'),
-        strategy=obj_config.get('layer_weight_strategy'),
-        strategy_params=obj_config.get('layer_weight_params', {}),
-        n_layers=n_decoder_layers
-    )
-
-    objectness_task = ObjectnessTask(
-        TaskConfig(
-            name='objectness',
-            output_names=['objectness_logit'],
-            output_dims={'objectness_logit': 1},
-            cost_weights={'objectness': obj_config.get('cost_weight', 1.0)},
-            loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
-            max_objects=max_objects,
-            layer_weights=obj_layer_weights,
-            head_norm=obj_config.get('head_norm', False),
-        ),
-    )
-    task_registry.register_task(objectness_task)
+        for obj_name, head_key, tgt_key in [
+            ('objectness_top', 'objectness_top_logit', 'top_valid'),
+            ('objectness_W',   'objectness_W_logit',   'w_valid'),
+        ]:
+            obj_config = task_configs.get(obj_name, _obj_default)
+            obj_layer_weights = _build_layer_weights(
+                layer_config=obj_config.get('layer_weights'),
+                strategy=obj_config.get('layer_weight_strategy'),
+                strategy_params=obj_config.get('layer_weight_params', {}),
+                n_layers=n_decoder_layers,
+            )
+            task_registry.register_task(ObjectnessTask(
+                TaskConfig(
+                    name=obj_name,
+                    output_names=[head_key],
+                    output_dims={head_key: 1},
+                    cost_weights={'objectness': obj_config.get('cost_weight', 0)},
+                    loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
+                    max_objects=max_objects,
+                    layer_weights=obj_layer_weights,
+                    head_norm=obj_config.get('head_norm', False),
+                ),
+                target_key=tgt_key,
+            ))
+    else:
+        obj_config = task_configs.get("objectness", {})
+        obj_layer_weights = _build_layer_weights(
+            layer_config=obj_config.get('layer_weights'),
+            strategy=obj_config.get('layer_weight_strategy'),
+            strategy_params=obj_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers,
+        )
+        task_registry.register_task(ObjectnessTask(
+            TaskConfig(
+                name='objectness',
+                output_names=['objectness_logit'],
+                output_dims={'objectness_logit': 1},
+                cost_weights={'objectness': obj_config.get('cost_weight', 1.0)},
+                loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=obj_layer_weights,
+                head_norm=obj_config.get('head_norm', False),
+            ),
+        ))
 
     # ========================================
     # Object Type Task (top vs W classification)
@@ -227,6 +280,58 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             )
         )
         task_registry.register_task(gate_task)
+
+    # ========================================
+    # IoU Prediction Task
+    # ========================================
+    iou_config = task_configs.get("iou_prediction", {})
+    if iou_config:
+        iou_output_names = ['iou_score_top', 'iou_score_W'] if chain_queries else ['iou_score_top']
+        iou_layer_weights = _build_layer_weights(
+            layer_config=iou_config.get('layer_weights'),
+            strategy=iou_config.get('layer_weight_strategy', 'uniform'),
+            strategy_params=iou_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers,
+        )
+        iou_task = IoUPredictionTask(
+            TaskConfig(
+                name='iou_prediction',
+                output_names=iou_output_names,
+                output_dims={k: 1 for k in iou_output_names},
+                cost_weights={},
+                loss_weights={'iou': iou_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=iou_layer_weights,
+                head_norm=iou_config.get('head_norm', True),
+            ),
+        )
+        task_registry.register_task(iou_task)
+
+    # ========================================
+    # Mask Overlap Task
+    # ========================================
+    overlap_config = task_configs.get("mask_overlap", {})
+    if overlap_config:
+        pred_keys = ['mask_predictions', 'mask_W'] if chain_queries else ['mask_predictions']
+        overlap_layer_weights = _build_layer_weights(
+            layer_config=overlap_config.get('layer_weights'),
+            strategy=overlap_config.get('layer_weight_strategy', 'uniform'),
+            strategy_params=overlap_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers,
+        )
+        overlap_task = MaskOverlapTask(
+            TaskConfig(
+                name='mask_overlap',
+                output_names=['mask_predictions'],  # reuses existing head; no new head
+                output_dims={},
+                cost_weights={},
+                loss_weights={'overlap': overlap_config.get('loss_weight', 0.5)},
+                max_objects=max_objects,
+                layer_weights=overlap_layer_weights,
+            ),
+            pred_keys=pred_keys,
+        )
+        task_registry.register_task(overlap_task)
 
     return task_registry
 
@@ -363,6 +468,7 @@ if __name__ == "__main__":
             model=transformer_model,
             task_registry=task_registry,
             config=config,
+            strict=False,
         )
         slurm_id = os.environ.get("SLURM_JOB_ID")
         version = int(slurm_id) if slurm_id else None
@@ -385,6 +491,33 @@ if __name__ == "__main__":
             data_module=topantitopquark,
             config=config,
             ckpt_path=ckpt_path,
+        )
+        trainer.test(model, datamodule=topantitopquark)
+
+    elif mode == "finetune":
+        assert ckpt_path is not None, (
+            "inference.checkpoint_path must be set for finetune mode"
+        )
+        ft_cfg = config.get("finetune", {})
+
+        # Load weights only — fresh optimizer and epoch counter
+        lightning_model = ReconstructionTrainer.load_from_checkpoint(
+            ckpt_path,
+            model=transformer_model,
+            task_registry=task_registry,
+            config=config,
+            strict=False,
+        )
+
+        # Freeze all params except the specified prediction heads
+        if ft_cfg.get("freeze_backbone", False):
+            _apply_finetune_freeze(lightning_model.model, ft_cfg)
+
+        trainer, model = train_reconstruction_model(
+            model=lightning_model.model,
+            task_registry=task_registry,
+            data_module=topantitopquark,
+            config=config,
         )
         trainer.test(model, datamodule=topantitopquark)
 

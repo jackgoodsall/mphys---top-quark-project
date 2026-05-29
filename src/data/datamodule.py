@@ -513,15 +513,26 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         )
         return ds
 
+    def prepare_data(self):
+        """Convert H5 → .npy for all splits. Lightning calls this on rank 0 only,
+        before setup(), so DDP ranks never race to write the same files."""
+        if self.lazy != "memmap":
+            return
+        for name in ("train", "val", "test"):
+            path = Path(f"{self.data_prefix}{name}.h5")
+            if path.exists():
+                MemmapDataset.prepare(
+                    path,
+                    tops_mask_key=self.tops_mask_key,
+                    tops_kin_key=self.tops_kin_key,
+                    ws_mask_key=self.ws_mask_key,
+                    ws_kin_key=self.ws_kin_key,
+                    load_interactions=self.load_interactions,
+                )
+
     def _load_split_memmap(self, path: Path) -> MemmapDataset:
-        npy_dir = MemmapDataset.prepare(
-            path,
-            tops_mask_key=self.tops_mask_key,
-            tops_kin_key=self.tops_kin_key,
-            ws_mask_key=self.ws_mask_key,
-            ws_kin_key=self.ws_kin_key,
-            load_interactions=self.load_interactions,
-        )
+        # prepare_data() has already created the .npy files on rank 0
+        npy_dir = MemmapDataset.npy_dir(path)
         return MemmapDataset(
             npy_dir=npy_dir,
             tops_mask_key=self.tops_mask_key,
@@ -580,34 +591,43 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
 
     def train_dataloader(self):
         assert self.train_dataset is not None
+        nw = self.train_config["num_workers"]
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_config["batch_size"],
             shuffle=self.train_config["shuffle"],
-            num_workers=self.train_config["num_workers"],
+            num_workers=nw,
             pin_memory=self.train_config["pin_memory"],
+            persistent_workers=self.train_config.get("persistent_workers", False) and nw > 0,
+            prefetch_factor=self.train_config.get("prefetch_factor", 2) if nw > 0 else None,
             drop_last=True,
             collate_fn=masked_former_collate_fn,
         )
 
     def val_dataloader(self):
         assert self.val_dataset is not None
+        nw = self.val_config["num_workers"]
         return DataLoader(
             self.val_dataset,
             batch_size=self.val_config["batch_size"],
             shuffle=self.val_config["shuffle"],
-            num_workers=self.val_config["num_workers"],
+            num_workers=nw,
             pin_memory=self.val_config["pin_memory"],
+            persistent_workers=self.val_config.get("persistent_workers", False) and nw > 0,
+            prefetch_factor=self.val_config.get("prefetch_factor", 2) if nw > 0 else None,
             collate_fn=masked_former_collate_fn,
         )
 
     def test_dataloader(self):
         assert self.test_dataset is not None
+        nw = self.test_config["num_workers"]
         return DataLoader(
             self.test_dataset,
             batch_size=self.test_config["batch_size"],
             shuffle=self.test_config["shuffle"],
-            num_workers=self.test_config["num_workers"],
+            num_workers=nw,
             pin_memory=self.test_config["pin_memory"],
+            persistent_workers=self.test_config.get("persistent_workers", False) and nw > 0,
+            prefetch_factor=self.test_config.get("prefetch_factor", 2) if nw > 0 else None,
             collate_fn=masked_former_collate_fn,
         )

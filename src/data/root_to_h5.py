@@ -24,9 +24,9 @@ import awkward as ak
 from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
-ROOT_PATH = Path("data/topquarkreconstruction/root_data/ttbarLO_inclusive_mostof20M.root")
+ROOT_PATH = Path("data/topquarkreconstruction/root_data/ttbarLO_inclusive_unique_tags.root")
 SAVE_DIR = Path("data/topquarkreconstruction/h5py_data")
-SAVE_PREFIX = "ttbar_h5py_raw_"
+SAVE_PREFIX = "ttbar_h5py_raw_unique_"
 MAX_PARTICLES = 20
 CHUNK_SIZE = 500_000  # events per read chunk
 

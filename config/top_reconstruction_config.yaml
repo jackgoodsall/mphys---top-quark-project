@@ -8,34 +8,59 @@ tasks:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
+    bce_pos_weight: True
     null_mask_penalty: 0.2
-    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.1, 4: 0.5, 5: 1.0}
 
   mask_W:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
+    bce_pos_weight: True
     null_mask_penalty: 0.2
-    layer_weights: {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    layer_weights: {0: 0.1, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
 
-  objectness:
-    cost_weight: 0
-    loss_weight: 0
+  objectness_top:
+    cost_weight: 0       # mask drives matching
+    loss_weight: 1.0
     head_norm: True
     layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+
+  objectness_W:
+    cost_weight: 0
+    loss_weight: 1.0
+    head_norm: True
+    layer_weights: {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+
+  particle_gating:
+    loss_weight: 0.5
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 1.0}  # final layer only (gate_relevance only emitted at final layer)
+
+  iou_prediction:
+    loss_weight: 1.0
+    head_norm: True
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 1.0}  # final layer: both mask types available
+
+  mask_overlap:
+    loss_weight: 0.5
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 1.0}  # final layer: both mask types available
 
   # object_type: not registered in chain_queries mode
 
 pretraining:
-  mask_pretrain_epochs: 0   # disabled for R&D — train all tasks from the start
-  tasks: ["mask_W"]
-  transition_ramp_epochs: 5
+  phases:
+    - epochs: 15
+      tasks: ["mask", "mask_W", "particle_gating", "iou_prediction", "mask_overlap"]  # Phase 1: masks + quality signal
+    - epochs: 10
+      tasks: ["objectness_top", "objectness_W", "particle_gating", "iou_prediction"]  # Phase 2: objectness + IoU quality
+      cost_only_tasks: ["mask", "mask_W"]                                              # mask cost kept for Hungarian matching
+  transition_ramp_epochs: 0                                            # no ramp — all tasks at full weight immediately
 
 
 data_modules:
-  input_path: data/topquarkreconstruction/masked_targets_combined
+  input_path: data/topquarkreconstruction/masked_targets_all_events
   input_prefix: "ttbar_preprocessed_"
-  lazy: true
+  lazy: True
   load_interactions: true
   # HDF5 key names for tops+Ws loading
   tops_mask_key: "masks_tops"
@@ -47,16 +72,22 @@ data_modules:
     shuffle: True
     num_workers: 4
     pin_memory: True
+    persistent_workers: True
+    prefetch_factor: 4
   test:
     batch_size: 2048
     shuffle: False
     num_workers: 4
     pin_memory: False
+    persistent_workers: True
+    prefetch_factor: 4
   val:
     batch_size: 2048
     shuffle: False
     num_workers: 4
     pin_memory: False
+    persistent_workers: True
+    prefetch_factor: 4
 
 model_parameters:
   particle_embedder:
@@ -89,7 +120,7 @@ model_parameters:
     n_mia_layers: 0
     mia_interaction_dim: 64
     use_vanilla_attention: false  # true = nn.TransformerEncoderLayer; false = ParticleAttentionBlock
-    use_particle_gating: false  # disabled for clean R&D baseline
+    use_particle_gating: true
     n_gating_layers: 2
     n_gate_queries: 1
 
@@ -101,12 +132,14 @@ model_training:
   gradient_clip_val: 2
   precision: "bf16-mixed"   # "32-true" | "16-mixed" | "bf16-mixed" [recommended] | "bf16-true" | "64-true"
   matmul_precision: "high"  # "highest" (FP32) | "high" (TF32, recommended) | "medium" (BF16)
-  min_epochs: 15
-  max_epochs: 100
+  compile: false  # false | "default" | "reduce-overhead" | "max-autotune"
+  min_epochs: 1
+  max_epochs: 35
+  check_val_every_n_epoch: 2
   # DDP configuration
   num_nodes: 1              # number of SLURM nodes
-  devices: 2                # GPUs per node
-  strategy: "ddp"           # "auto" | "ddp" | "ddp_find_unused_parameters_true"
+  devices: 1                # GPUs per node
+  strategy: "auto"           # DDP across 2 GPUs
   accelerator: "gpu"        # "auto" | "gpu" | "cpu"
 
   scheduler:
@@ -114,8 +147,8 @@ model_training:
     update_interval: "step"   # "step" (every batch) or "epoch" (once per epoch)
 
     # --- warmup_cosine ---
-    warmup_epochs: 5          # linear ramp 0 → lr
-    T_max: 100                # total epochs for cosine decay
+    warmup_epochs: 2          # linear ramp 0 → lr
+    T_max: 35                 # total epochs for cosine decay
     eta_min: 5e-6             # floor LR at end of cosine decay
     lr_rewarmup_epochs: 0     # re-warmup at phase transition; 0 = disabled
     lr_rewarmup_fraction: 1.5 # start re-warmup at this fraction of base LR
@@ -145,8 +178,14 @@ training_callbacks:
     mode: "min"
 
 inference:
-  mode: "train"              # "train" | "test" | "resume" | "lr_find"
-  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_12489040/checkpoints/epoch=epoch=99-val_loss=val_loss=1.2272.ckpt"
+    mode: "test"
+    checkpoint_path: "masked_reconstruction/lightning_logs/version_15715991/checkpoints/epoch=epoch=3-val_loss=val_loss=1.5581.ckpt"
+    
+                                                                                 
+# Fine-tune settings (used only when inference.mode = "finetune")
+finetune:
+  freeze_backbone: true       # freeze encoder/decoder/embedders/query tokens
+  trainable_heads: ["objectness_top_logit", "objectness_W_logit"]  # output head keys
 
 model_artefacts:
   log_dir: "masked_reconstruction"

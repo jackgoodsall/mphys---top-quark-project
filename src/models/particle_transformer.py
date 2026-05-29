@@ -54,20 +54,10 @@ class ParticleEmbedder(nn.Module):
     def forward(self, X, src_mask = None):
         # Clip input to prevent extreme values from causing NaNs in Linear layers
         X = torch.clamp(X, min=-100.0, max=100.0)
-        
-        # Check for NaNs in INPUT to embedder
-        if torch.isnan(X).any():
-            nan_count = torch.isnan(X).sum().item()
-            raise RuntimeError(f"NaN in ParticleEmbedder INPUT (after clipping)! {nan_count} NaNs out of {X.numel()}")
-        
-        for i, layer in enumerate(self.layers):
+
+        for layer in self.layers:
             X = layer(X)
-            # Debug: check for NaN after each layer
-            if torch.isnan(X).any():
-                nan_count = torch.isnan(X).sum().item()
-                layer_name = layer.__class__.__name__
-                raise RuntimeError(f"NaN after ParticleEmbedder layer {i} ({layer_name})! {nan_count} NaNs out of {X.numel()}")
-        
+
         if src_mask is not None:
             # mask -> [B, N, 1] → broadcasts over features
             mask = src_mask.unsqueeze(-1).bool()
@@ -335,11 +325,20 @@ class MaskedReconstructionPart(nn.Module):
                     output_dim = task.config.output_dims.get(output_name)
                     output_specs[output_name] = (output_dim, task.config.head_norm)
 
-        # Build heads for each output type
+        # Build heads for each output type.
+        # Mask outputs use a separate q/k projection pair (not stored in heads) so the
+        # masking representation is decoupled from the kinematics/objectness subspace.
+        # The projections are built here and stored as mask_q_projs / mask_k_projs.
         MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
+        self.mask_q_projs = nn.ModuleDict()
+        self.mask_k_projs = nn.ModuleDict()
         for output_name, (output_dim, head_norm) in output_specs.items():
             if output_name in MASK_OUTPUT_NAMES:
-                # Mask logits computed via query-memory dot product (einsum), not a learned head.
+                # Learned projection into a dedicated mask subspace.
+                # Both query and memory projected to embedding_size; scaled dot product.
+                self.mask_q_projs[output_name] = nn.Linear(embedding_size, embedding_size, bias=False)
+                self.mask_k_projs[output_name] = nn.Linear(embedding_size, embedding_size, bias=False)
+                # Placeholder so the output name participates in layer_output_map
                 heads[output_name] = nn.Identity()
             elif output_dim is not None:
                 layers = []
@@ -366,35 +365,13 @@ class MaskedReconstructionPart(nn.Module):
         src_mask = X["src_mask"]
         targets = X.get("targets", None)
         
-        # Input validation: check for NaNs in raw inputs (exclude infs which might be intentional padding)
-        if torch.isnan(jet).any():
-            nan_count = torch.isnan(jet).sum().item()
-            nan_pct = 100.0 * nan_count / jet.numel()
-            raise RuntimeError(f"NaN in input jet features! {nan_count} NaNs ({nan_pct:.2f}% of {jet.numel()} total values)")
-        if torch.isnan(interactions).any():
-            nan_count = torch.isnan(interactions).sum().item()
-            nan_pct = 100.0 * nan_count / interactions.numel()
-            raise RuntimeError(f"NaN in input interactions! {nan_count} NaNs ({nan_pct:.2f}% of {interactions.numel()} total values)")
-        
-        # Check for extreme values that might cause overflow
-        jet_max = jet.abs().max().item()
-        if jet_max > 1e6:
-            raise RuntimeError(f" Extreme value in jet features: max={jet_max:.2e}, this will cause NaN in embedder")
-        
         # Embed
         jet = self.particle_embedder(jet, src_mask=~src_mask)
-
-        # NaN detection after embeddings (-inf is allowed for attention masking)
-        if torch.isnan(jet).any():
-            raise RuntimeError(f"NaN after particle embedder!")
 
         if self.use_vanilla_attention:
             interactions = None
         else:
             interactions = self.interaction_embedder(interactions, src_mask=~src_mask)
-            if torch.isnan(interactions).any():
-                nan_mask = torch.isnan(interactions)
-                raise RuntimeError(f"NaN after interaction embedder! Found {nan_mask.sum()} NaN values")
 
         B, N, F = jet.shape
 
@@ -535,12 +512,17 @@ class MaskedReconstructionPart(nn.Module):
         needed = self._layer_output_map[layer_id]
 
         MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
+        mask_dim = queries.shape[-1]  # embedding_size
         outputs = {}
         for output_name, head in self.prediction_heads.items():
             if output_name not in needed:
                 continue
             if output_name in MASK_OUTPUT_NAMES:
-                outputs[output_name] = torch.einsum("bnd,bmd->bnm", queries, memory)
+                # Project queries and memory into a dedicated mask subspace,
+                # then scaled dot product to prevent sigmoid saturation.
+                q_proj = self.mask_q_projs[output_name](queries)   # [B, Q, D]
+                k_proj = self.mask_k_projs[output_name](memory)    # [B, N, D]
+                outputs[output_name] = torch.einsum("bqd,bnd->bqn", q_proj, k_proj) / (mask_dim ** 0.5)
             else:
                 outputs[output_name] = head(queries)
 

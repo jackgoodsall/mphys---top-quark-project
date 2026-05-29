@@ -158,9 +158,15 @@ class ParticleGatingModule(nn.Module):
         scores = torch.einsum('bgd,bnd->bgn', gate_q, memory) / (memory.size(-1) ** 0.5)  # [B, G, N]
         if src_key_padding_mask is not None:
             scores = scores.masked_fill(src_key_padding_mask.unsqueeze(1), float('-inf'))
-        relevance = torch.sigmoid(scores.max(dim=1).values)  # [B, N]
+        gate_logits = scores.max(dim=1).values               # [B, N]  raw logits
+        # Padding positions carry -inf (from masked_fill above).
+        # -inf logit with target=0 in BCE gives -inf*0 = NaN.
+        # Zero them out — valid_mask in the loss will suppress their contribution anyway.
+        if src_key_padding_mask is not None:
+            gate_logits = gate_logits.masked_fill(src_key_padding_mask, 0.0)
+        relevance = torch.sigmoid(gate_logits)               # [B, N]  for memory gating
         gated_memory = memory * relevance.unsqueeze(-1)
-        return relevance, gated_memory
+        return gate_logits, gated_memory
 
 
 class MIParticleAttentionBlock(nn.Module):
