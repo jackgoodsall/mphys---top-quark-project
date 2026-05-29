@@ -1,39 +1,10 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-import sys
-from typing import List
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from typing import Dict, List, Optional, Union
 from src.models.components.attention_layers import ParticleAttentionBlock, MIParticleAttentionBlock, InteractionDimReducer, ParticleGatingModule
 from src.models.components.masked_former_tasks import *
 from src.models.components.matcher import *
-from typing import Dict, Optional, Union
-
-
-class ParticleBinaryClassificaitionHead(nn.Module):
-    def __init__(self, input_size: int,
-                 hidden_sizes: List[int],
-                 p_dropout : float,
-                 activation_function: str,
-                 n_classes: int,
-                 *args,
-                 **kwargs):
-        super().__init__()
-        self.layer_sizes = [input_size] + hidden_sizes + [n_classes]
-        self.linear_layers = nn.ModuleList([
-            nn.Linear(in_size, out_size) for in_size, out_size in zip(self.layer_sizes[: -1 ], self.layer_sizes[1: ])
-        ])
-        if activation_function == "relu":
-            self.activation_function = F.relu
-        self.dropout = nn.Dropout(p_dropout)
-
-    def forward(self, x : torch.Tensor) -> torch.Tensor:
-        for layer in self.linear_layers[: -1]:
-            x = layer(x)
-            x = self.activation_function(x)
-            x = self.dropout(x)
-        return self.linear_layers[-1](x)
 
 
 class ParticleEmbedder(nn.Module):
@@ -64,28 +35,6 @@ class ParticleEmbedder(nn.Module):
             X = X.masked_fill(mask, 0.0)
 
         return X
-
-class ReverseEmbedder(nn.Module):
-    def __init__(self,
-                 n_input,
-                 hidden_sizes,
-                 output_size,
-                 p_dropout):
-        super().__init__()
-
-        self.layer_sizes = [n_input] + hidden_sizes 
-        self.layers = nn.ModuleList()
-        for size_1, size_2 in zip(self.layer_sizes[:-1], self.layer_sizes[1:]):
-            self.layers.extend([nn.LayerNorm(size_1), nn.Linear(size_1, size_2), nn.GELU(), nn.Dropout(p_dropout)])
-        self.layers.append(nn.Linear(size_2, output_size))
-        
-    def forward(self, X):
-
-        for layers in self.layers:
-            X = layers(X)
-        return X
-
-
 
 
 
