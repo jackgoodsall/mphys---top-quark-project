@@ -14,6 +14,9 @@ Custom threshold (overrides the default 0.0 for logits / 0.5 for probs):
 Prior-based binarisation (top-k particles per slot type):
     python analysis/evaluate.py --run_dir ... --prior top=3 W=2
     python analysis/evaluate.py --run_dir ... --prior top=3 W=2 --use_probs
+
+Save a plain-text summary:
+    python analysis/evaluate.py --run_dir ... --save_summary
 """
 
 import argparse
@@ -22,6 +25,58 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Quick per-task metrics (objectness precision/recall/F1, type accuracy, mask IoU)
+# ---------------------------------------------------------------------------
+
+def compute_objectness_metrics(obj_path: Path) -> dict:
+    """Precision, recall, F1 for the objectness head."""
+    with h5py.File(obj_path, "r") as f:
+        logits  = f["predicted_objectness_logit"][:]  # [N, Q]
+        targets = f["target_objectness"][:]            # [N, Q]
+    probs     = 1.0 / (1.0 + np.exp(-logits))
+    preds     = (probs > 0.5).astype(int).ravel()
+    tgts      = targets.astype(int).ravel()
+    tp = int(((preds == 1) & (tgts == 1)).sum())
+    fp = int(((preds == 1) & (tgts == 0)).sum())
+    fn = int(((preds == 0) & (tgts == 1)).sum())
+    precision = tp / max(tp + fp, 1)
+    recall    = tp / max(tp + fn, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-8)
+    return {"obj_precision": precision, "obj_recall": recall, "obj_f1": f1,
+            "obj_tp": tp, "obj_fp": fp, "obj_fn": fn}
+
+
+def compute_type_accuracy(type_path: Path) -> dict:
+    """Binary top-vs-W accuracy evaluated only on real (non-null) query slots."""
+    with h5py.File(type_path, "r") as f:
+        logits  = f["predicted_type_logit"][:]   # [N, Q]
+        targets = f["target_type"][:]             # [N, Q]
+        classes = f["target_classes"][:]          # [N, Q]
+    real_mask = classes > 0
+    if not real_mask.any():
+        return {"type_accuracy": 0.0, "type_n_real": 0}
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    preds = (probs > 0.5).astype(float)
+    accuracy = float((preds[real_mask] == targets[real_mask]).mean())
+    return {"type_accuracy": accuracy, "type_n_real": int(real_mask.sum())}
+
+
+def compute_mask_iou(mask_path: Path) -> dict:
+    """Mean IoU between predicted and target masks over slots with ≥1 target particle."""
+    with h5py.File(mask_path, "r") as f:
+        pred_logits = f["predicted_masks_logits"][:]  # [N, Q, P]
+        targets     = f["target_masks"][:]             # [N, Q, P]
+    pred_bin     = (pred_logits > 0).astype(float)
+    intersection = (pred_bin * targets).sum(axis=-1)
+    union        = np.clip(pred_bin + targets, 0, 1).sum(axis=-1)
+    has_particles = targets.sum(axis=-1) > 0
+    if not has_particles.any():
+        return {"mask_mean_iou": 0.0, "mask_n_objects": 0}
+    iou = intersection[has_particles] / (union[has_particles] + 1e-8)
+    return {"mask_mean_iou": float(iou.mean()), "mask_n_objects": int(has_particles.sum())}
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +437,19 @@ def print_results(run_dir: Path, results: dict):
 
     _print_mult_table("EFFICIENCY BY SIGNAL JET MULTIPLICITY (jets fed to model)", br)
     _print_mult_table("EFFICIENCY BY ORIGINAL JET MULTIPLICITY (all jets in event)", results.get("breakdown_orig", {}))
+
+    if results.get("quick_metrics"):
+        qm = results["quick_metrics"]
+        print("QUICK METRICS (threshold = 0.5 on sigmoid)")
+        print("─" * 70)
+        if "obj_f1" in qm:
+            print(f"  Objectness  precision={qm['obj_precision']:.4f}  recall={qm['obj_recall']:.4f}  F1={qm['obj_f1']:.4f}"
+                  f"  (TP={qm['obj_tp']}, FP={qm['obj_fp']}, FN={qm['obj_fn']})")
+        if "type_accuracy" in qm:
+            print(f"  Type accuracy (real slots only): {qm['type_accuracy']:.4f}  (N={qm['type_n_real']})")
+        if "mask_mean_iou" in qm:
+            print(f"  Mask mean IoU: {qm['mask_mean_iou']:.4f}  (N objects={qm['mask_n_objects']})")
+        print("─" * 70)
     print()
 
 
@@ -730,6 +798,10 @@ def main():
         help="Require objectness prediction to also mark the slot as real for efficiency metrics"
     )
     parser.add_argument(
+        "--save_summary", action="store_true",
+        help="Save a plain-text evaluation_summary.txt to --run_dir"
+    )
+    parser.add_argument(
         "--prior", nargs="+", metavar="TYPE=K", default=[],
         help=(
             "Per-type top-k binarisation prior, e.g. --prior top=3 W=2. "
@@ -762,13 +834,47 @@ def main():
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
+    # Collect quick per-task metrics
+    quick_metrics = {}
+    obj_path  = run_dir / "test_outputs_objectness.h5"
+    type_path = run_dir / "test_outputs_object_type.h5"
+    mask_path = run_dir / "test_outputs_mask.h5"
+    if obj_path.exists():
+        quick_metrics.update(compute_objectness_metrics(obj_path))
+    if type_path.exists():
+        quick_metrics.update(compute_type_accuracy(type_path))
+    if mask_path.exists():
+        quick_metrics.update(compute_mask_iou(mask_path))
+
     results = compute_efficiencies(
         pred_scores, target_masks, jet_valid, target_obj, target_cls,
         pred_obj=pred_obj, pred_type=pred_type, priors=priors,
         use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
         original_mult=original_mult,
     )
+    results["quick_metrics"] = quick_metrics
     print_results(run_dir, results)
+
+    if args.save_summary:
+        out = run_dir / "evaluation_summary.txt"
+        lines = [
+            f"top_eff: {results['top_eff']:.4f}",
+            f"W_eff: {results['W_eff']:.4f}",
+            f"ttbar_eff: {results['ttbar_eff']:.4f}",
+            f"all_eff: {results['all_eff']:.4f}",
+        ]
+        if results.get("obj_purity") is not None:
+            lines += [
+                f"obj_purity: {results['obj_purity']:.4f}",
+                f"top_purity: {results['top_purity']:.4f}",
+                f"W_purity: {results['W_purity']:.4f}",
+                f"ttbar_purity: {results['ttbar_purity']:.4f}",
+            ]
+        for k, v in quick_metrics.items():
+            lines.append(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+        with open(out, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  Saved summary: {out}")
 
     if args.plot:
         make_plots(run_dir, results)
