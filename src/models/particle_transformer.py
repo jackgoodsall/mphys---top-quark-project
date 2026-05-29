@@ -5,6 +5,11 @@ from typing import Dict, List, Optional, Union
 from src.models.components.attention_layers import ParticleAttentionBlock, MIParticleAttentionBlock, InteractionDimReducer, ParticleGatingModule
 from src.models.components.masked_former_tasks import *
 from src.models.components.matcher import *
+from constants import TARGETS_KEY
+
+# Output names that use the dedicated mask q/k projection rather than a standard head.
+# Any new mask-type outputs must be added here so they get the right projection.
+MASK_OUTPUT_NAMES: frozenset = frozenset({'mask_predictions', 'mask_W'})
 
 
 class ParticleEmbedder(nn.Module):
@@ -278,7 +283,6 @@ class MaskedReconstructionPart(nn.Module):
         # Mask outputs use a separate q/k projection pair (not stored in heads) so the
         # masking representation is decoupled from the kinematics/objectness subspace.
         # The projections are built here and stored as mask_q_projs / mask_k_projs.
-        MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
         self.mask_q_projs = nn.ModuleDict()
         self.mask_k_projs = nn.ModuleDict()
         for output_name, (output_dim, head_norm) in output_specs.items():
@@ -311,16 +315,20 @@ class MaskedReconstructionPart(nn.Module):
         # Unpack
         jet = X["jet"]
         interactions = X["interactions"]
-        src_mask = X["src_mask"]
+        # particle_valid: True = real particle, False = padding.
+        # Embedders and attention layers expect a pad_mask (True = padding),
+        # so we pass ~particle_valid at each call site.
+        particle_valid = X["src_mask"]
+        pad_mask = ~particle_valid  # True = padding position
         targets = X.get("targets", None)
-        
+
         # Embed
-        jet = self.particle_embedder(jet, src_mask=~src_mask)
+        jet = self.particle_embedder(jet, src_mask=pad_mask)
 
         if self.use_vanilla_attention:
             interactions = None
         else:
-            interactions = self.interaction_embedder(interactions, src_mask=~src_mask)
+            interactions = self.interaction_embedder(interactions, src_mask=pad_mask)
 
         B, N, F = jet.shape
 
@@ -329,7 +337,7 @@ class MaskedReconstructionPart(nn.Module):
         if self.use_vanilla_attention:
             # Native flash attention path — no interactions needed
             for layer in self.encoder_stack:
-                memory = layer(memory, src_key_padding_mask=~src_mask)
+                memory = layer(memory, src_key_padding_mask=pad_mask)
         elif self.use_mia_encoder:
             # Phase 1: MIA blocks with high-dim interactions
             for layer in self.mia_encoder_stack:
@@ -338,18 +346,18 @@ class MaskedReconstructionPart(nn.Module):
             # Conv1d with mixed-sign weights turns -inf (padding marker) into NaN
             # (-inf * w_pos + -inf * w_neg = -inf + +inf = NaN).  Zero the padding
             # positions before the linear reduction then restore -inf afterwards.
-            padding_col_mask = ~src_mask[:, None, None, :]  # [B,1,1,N] True=padding col
+            padding_col_mask = pad_mask[:, None, None, :]  # [B,1,1,N] True=padding col
             interactions_finite = interactions.masked_fill(padding_col_mask, 0.0)
             interactions = self.interaction_reducer(interactions_finite)
             interactions = interactions.masked_fill(padding_col_mask, float('-inf'))
         # Phase 2 (or full encoder for non-MIA): P-MHA blocks
         for layer in self.encoder_stack:
             memory = layer(memory, interactions)
-        
+
         # Particle gating: scale encoder memory by learned per-particle relevance
         gate_relevance = None
         if self.particle_gating is not None:
-            gate_relevance, memory = self.particle_gating(memory, src_key_padding_mask=~src_mask)
+            gate_relevance, memory = self.particle_gating(memory, src_key_padding_mask=pad_mask)
 
         # Initialize queries
         if self.chain_queries:
@@ -379,13 +387,14 @@ class MaskedReconstructionPart(nn.Module):
             # Phase 1: queries attend to particle memory
             phase1_tgt = tgt
             for i, layer in enumerate(phase1_stack):
-                phase1_tgt = layer(phase1_tgt, memory, memory_key_padding_mask=~src_mask)
+                phase1_tgt = layer(phase1_tgt, memory, memory_key_padding_mask=pad_mask)
                 layer_outputs[i] = self._compute_layer_outputs(
                     phase1_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
 
             # Extended memory: particles + phase-1 states
-            chain_valid = src_mask.new_ones(B, self.num_query_tokens)
-            extended_src_mask = torch.cat([src_mask, chain_valid], dim=1)
+            # query slots are never padding, so their pad_mask entries are False
+            chain_pad = pad_mask.new_zeros(B, self.num_query_tokens)
+            extended_pad_mask = torch.cat([pad_mask, chain_pad], dim=1)
             extended_memory = torch.cat([memory, phase1_tgt], dim=1)  # [B, N+Q, D]
 
             # Phase 2: warm-started queries attend to extended memory
@@ -393,7 +402,7 @@ class MaskedReconstructionPart(nn.Module):
             for j, layer in enumerate(phase2_stack):
                 layer_id = n_phase1_layers + j
                 phase2_tgt = layer(phase2_tgt, extended_memory,
-                                   memory_key_padding_mask=~extended_src_mask)
+                                   memory_key_padding_mask=extended_pad_mask)
                 layer_outputs[layer_id] = self._compute_layer_outputs(
                     phase2_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
 
@@ -413,25 +422,26 @@ class MaskedReconstructionPart(nn.Module):
 
             # --- Phase 1: W decoding ---
             for i, w_layer in enumerate(self.w_decoder_stack):
-                w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
+                w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=pad_mask)
                 combined = torch.cat([top_tgt, w_tgt], dim=1)  # top_tgt still at init
                 layer_outputs[i] = self._compute_layer_outputs(combined, memory, layer_id=i, gate_relevance=gate_relevance)
 
             # Build extended memory once from final W states
-            w_valid = src_mask.new_ones(B, self.n_w_queries)
-            extended_src_mask = torch.cat([src_mask, w_valid], dim=1)
+            # query slots are never padding, so their pad_mask entries are False
+            w_pad = pad_mask.new_zeros(B, self.n_w_queries)
+            extended_pad_mask = torch.cat([pad_mask, w_pad], dim=1)
             extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q_W, D]
 
             # --- Phase 2: Top decoding ---
             for j, top_layer in enumerate(self.top_decoder_stack):
                 layer_id = n_w_layers + j
                 top_tgt = top_layer(top_tgt, extended_memory,
-                                    memory_key_padding_mask=~extended_src_mask)
+                                    memory_key_padding_mask=extended_pad_mask)
                 combined = torch.cat([top_tgt, w_tgt], dim=1)  # w_tgt frozen
                 layer_outputs[layer_id] = self._compute_layer_outputs(combined, memory, layer_id=layer_id, gate_relevance=gate_relevance)
         else:
             for i, layer in enumerate(self.decoder_stack):
-                tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
+                tgt = layer(tgt, memory, memory_key_padding_mask=pad_mask)
 
                 # Only compute heads needed at this layer (zero-weight layers are skipped)
                 layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i, gate_relevance=gate_relevance)
@@ -460,7 +470,6 @@ class MaskedReconstructionPart(nn.Module):
         """
         needed = self._layer_output_map[layer_id]
 
-        MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
         mask_dim = queries.shape[-1]  # embedding_size
         outputs = {}
         for output_name, head in self.prediction_heads.items():
@@ -709,7 +718,7 @@ class MaskedReconstructionPart(nn.Module):
 
         # gate_relevance is [B, N] (per-particle), not [B, Q, D] — pass through directly
         # without permutation (particle order is fixed and doesn't need reordering).
-        NON_QUERY_OUTPUTS = {'gate_relevance', '__targets__'}
+        NON_QUERY_OUTPUTS = {'gate_relevance', TARGETS_KEY}
 
         for output_name in all_output_names:
             layers_with = [lid for lid in layer_ids if output_name in decoder_outputs[lid]]
@@ -800,6 +809,6 @@ class MaskedReconstructionPart(nn.Module):
 
         # ---- 5. Inject __targets__ into each layer dict ----
         for layer_id in permuted_outputs:
-            permuted_outputs[layer_id]['__targets__'] = padded_targets
+            permuted_outputs[layer_id][TARGETS_KEY] = padded_targets
 
         return permuted_outputs

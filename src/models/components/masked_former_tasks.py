@@ -5,11 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import h5py
-
-# Object class constants
-CLASS_NULL = 0
-CLASS_TOP = 1
-CLASS_W = 2
+from constants import CLASS_NULL, CLASS_TOP, CLASS_W
 
 
 @dataclass
@@ -1551,21 +1547,22 @@ class MaskOverlapTask(BaseTask):
             if Q < 2:
                 continue
 
-            overlap = probs.new_tensor(0.0)
-            n_pairs = 0
-            for i in range(Q):
-                for j in range(i + 1, Q):
-                    p_i = probs[:, i, :]                  # [B, N]
-                    p_j = probs[:, j, :]
-                    intersection = (p_i * p_j).sum(-1)    # [B]
-                    denom = p_i.sum(-1) + p_j.sum(-1) + self.eps
-                    dice_overlap = (2 * intersection / denom).mean()
-                    overlap = overlap + dice_overlap
-                    n_pairs += 1
+            # Vectorized pairwise Dice overlap — avoids O(Q^2) Python loop.
+            # For each pair (i, j) with i < j:
+            #   intersection = (p_i * p_j).sum(N)         [B]
+            #   denom        = p_i.sum(N) + p_j.sum(N)    [B]
+            #   dice_overlap = 2 * intersection / denom    [B]
+            #
+            # Build upper-triangle index pairs once, gather, vectorise.
+            rows, cols = torch.triu_indices(Q, Q, offset=1, device=probs.device)
+            p_i = probs[:, rows, :]                          # [B, n_pairs, N]
+            p_j = probs[:, cols, :]
+            intersection = (p_i * p_j).sum(-1)              # [B, n_pairs]
+            denom = p_i.sum(-1) + p_j.sum(-1) + self.eps    # [B, n_pairs]
+            dice_overlap = (2 * intersection / denom).mean()  # scalar
 
-            if n_pairs > 0:
-                total_loss = total_loss + overlap / n_pairs
-                n_terms += 1
+            total_loss = total_loss + dice_overlap
+            n_terms += 1
 
         if n_terms > 0:
             total_loss = total_loss / n_terms

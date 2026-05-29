@@ -442,7 +442,7 @@ if __name__ == "__main__":
     )
     
     # DataModule
-    topantitopquark = MaskedFormerTopsWsDataModule(config)
+    data_module = MaskedFormerTopsWsDataModule(config)
 
     # --- Mode dispatch ---
     inf_cfg = config.get("inference", {})
@@ -454,10 +454,10 @@ if __name__ == "__main__":
         trainer, model = train_reconstruction_model(
             model=transformer_model,
             task_registry=task_registry,
-            data_module=topantitopquark,
+            data_module=data_module,
             config=config,
         )
-        trainer.test(model, datamodule=topantitopquark)
+        trainer.test(model, datamodule=data_module)
 
     elif mode == "test":
         assert ckpt_path is not None, (
@@ -474,7 +474,7 @@ if __name__ == "__main__":
         version = int(slurm_id) if slurm_id else None
         logger = TensorBoardLogger(log_dir, version=version)
         trainer = pl.Trainer(default_root_dir=log_dir, logger=logger)
-        trainer.test(lightning_model, datamodule=topantitopquark)
+        trainer.test(lightning_model, datamodule=data_module)
 
     elif mode == "resume":
         if ckpt_path is None:
@@ -488,11 +488,11 @@ if __name__ == "__main__":
         trainer, model = train_reconstruction_model(
             model=transformer_model,
             task_registry=task_registry,
-            data_module=topantitopquark,
+            data_module=data_module,
             config=config,
             ckpt_path=ckpt_path,
         )
-        trainer.test(model, datamodule=topantitopquark)
+        trainer.test(model, datamodule=data_module)
 
     elif mode == "finetune":
         assert ckpt_path is not None, (
@@ -516,10 +516,10 @@ if __name__ == "__main__":
         trainer, model = train_reconstruction_model(
             model=lightning_model.model,
             task_registry=task_registry,
-            data_module=topantitopquark,
+            data_module=data_module,
             config=config,
         )
-        trainer.test(model, datamodule=topantitopquark)
+        trainer.test(model, datamodule=data_module)
 
     elif mode == "lr_find":
         from lightning.pytorch.tuner import Tuner
@@ -540,7 +540,7 @@ if __name__ == "__main__":
         tuner = Tuner(lr_trainer)
         lr_finder = tuner.lr_find(
             lightning_model,
-            datamodule=topantitopquark,
+            datamodule=data_module,
             min_lr=1e-6,
             max_lr=1e-1,
             num_training=200,        # steps: more steps → smoother curve

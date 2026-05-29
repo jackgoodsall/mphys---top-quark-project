@@ -4,11 +4,7 @@ from pathlib import Path
 import h5py
 import torch
 import numpy as np
-
-# Object class constants
-CLASS_NULL = 0
-CLASS_TOP = 1
-CLASS_W = 2
+from constants import CLASS_NULL, CLASS_TOP, CLASS_W
 
 
 def _load_object_type(f: h5py.File, mask_key: str, kin_key: str):

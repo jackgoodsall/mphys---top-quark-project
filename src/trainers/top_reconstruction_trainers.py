@@ -22,7 +22,8 @@ class WarmupEarlyStopping(EarlyStopping):
         super().on_validation_epoch_end(trainer, pl_module)
 import h5py
 import torch_optimizer
-from src.models.components.masked_former_tasks import * 
+from src.models.components.masked_former_tasks import *
+from constants import TARGETS_KEY
 
 
 def _check_for_nans( name, x):
@@ -212,11 +213,11 @@ class ReconstructionTrainer(lightning.LightningModule):
         final_layer_id = max(outputs.keys())
 
         for layer_id, layer_predictions in outputs.items():
-            if "__targets__" in layer_predictions:
-                layer_targets = layer_predictions["__targets__"]
+            if TARGETS_KEY in layer_predictions:
+                layer_targets = layer_predictions[TARGETS_KEY]
                 valid_mask = layer_targets.get("jet_valid_mask")
                 preds = {k: v for k, v in layer_predictions.items()
-                         if k != "__targets__"}
+                         if k != TARGETS_KEY}
             else:
                 layer_targets = targets
                 preds = layer_predictions
@@ -507,10 +508,10 @@ class ReconstructionTrainer(lightning.LightningModule):
         layer_dict = outputs[final_layer]
 
         # Use matched/padded targets if available, else original targets
-        if "__targets__" in layer_dict:
-            save_targets = layer_dict["__targets__"]
+        if TARGETS_KEY in layer_dict:
+            save_targets = layer_dict[TARGETS_KEY]
             predictions = {k: v for k, v in layer_dict.items()
-                          if k != "__targets__"}
+                          if k != TARGETS_KEY}
         else:
             save_targets = targets
             predictions = layer_dict
