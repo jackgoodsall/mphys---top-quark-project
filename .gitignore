@@ -32,3 +32,12 @@ __pycache__/
 /analysis
 /failed_experiments
 /ExperimentOutputs
+/src/data/analysis_plots/
+/config/test_config.yaml
+compare_cmd.txt
+cv_masters_project.md
+submit_root_to_h5.sh
+submit_test.sh
+submit_vanilla_3m.sh
+*.venv/
+.venv/
