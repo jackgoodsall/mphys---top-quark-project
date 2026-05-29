@@ -85,8 +85,8 @@ class ParticleAttentionBlock(nn.Module):
         self.feed_for_dim = feed_for_dim
         self.n_heads = n_heads
 
-        assert embedded_dim % n_heads  == 0 ; "nheads needs to be a factor of embedded dimension"
-        self.head_dim  = embedded_dim // n_heads 
+        assert embedded_dim % n_heads == 0, "nheads needs to be a factor of embedded dimension"
+        self.head_dim = embedded_dim // n_heads
 
         self.attn_dropout = attn_dropout
         self.p_dropout = p_dropout
@@ -248,59 +248,3 @@ class InteractionDimReducer(nn.Module):
         B, D, N, M = u.shape
         u_flat = u.view(B, D, N * M)           # flatten pairs to length dim
         return self.conv(u_flat).view(B, -1, N, M)
-
-
-class ClassAttentionBlock(nn.Module):
-    """
-    Implements the class attention block desribed in the paper  https://arxiv.org/abs/2202.03772 
-    """
-    def __init__(self, embedded_dim,n_heads, feed_for_dim, 
-                  p_dropout):
-        super().__init__()
-
-        self.embedded_dim = embedded_dim
-        self.feed_for_dim = feed_for_dim
-        self.n_heads = n_heads
-        assert embedded_dim % n_heads  == 0 ; "nheads needs to be a factor of embedded dimension"
-        self.head_dim  = embedded_dim // n_heads 
-        self.p_dropout = p_dropout
-
-        ## Attention
-
-        self.ln1 = nn.LayerNorm(embedded_dim)
-
-
-        self.query_linear = nn.Linear(embedded_dim, embedded_dim)
-        self.attention = nn.MultiheadAttention(embedded_dim, n_heads, p_dropout, batch_first= True)
-        self.ln2 = nn.LayerNorm(embedded_dim)
-        ## Feedforward block
-        self.feed_forward_block = nn.Sequential(
-        nn.LayerNorm(self.embedded_dim),
-        nn.Linear(self.embedded_dim, self.feed_for_dim),
-        nn.GELU(),
-        nn.LayerNorm(self.feed_for_dim),
-        nn.Linear(self.feed_for_dim, self.embedded_dim),
-        )
-    
-    def forward(self, x, cls_tkn, src_mask = None):
-        B, N, _ = x.shape
-        inputs = torch.concat((x, cls_tkn), axis = 1)
-        if src_mask is not None:
-            src_mask = torch.concat((src_mask, torch.zeros(B, cls_tkn.shape[1]).to(x.device)), axis = 1)
-        attention_input = self.ln1(inputs)
-        
-        attention_scores, _ = self.attention(
-            cls_tkn,
-            attention_input,
-            attention_input,
-            key_padding_mask = src_mask
-        )
-
-        
-        attn = attention_scores + cls_tkn
-
-
-        post_attention_scores = self.ln2(attn) 
-
-        residual = self.feed_forward_block(post_attention_scores) + post_attention_scores
-        return residual
