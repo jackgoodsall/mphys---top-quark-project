@@ -76,9 +76,9 @@ data_modules:
 
 model_parameters:
   particle_embedder:
-    # Superset feature dim: original 7 jets + lepton iso/flavour/charge slots (zero for jets)
-    # Adjust n_input once the actual leptonic HDF5 feature count is known.
-    n_input: 9
+    # Same 7 features as hadronic: [pt_s, eta_s, sin_phi, cos_phi, E_s, m, btag].
+    # Lepton is distinguished via particle_type embedding, not extra feature columns.
+    n_input: 7
     hidden_sizes: [64]
     embedding_size: 128
     p_dropout: 0.0
