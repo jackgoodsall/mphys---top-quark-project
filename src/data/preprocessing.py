@@ -136,14 +136,18 @@ class TargetProcessor(ABC):
 
 class IndividualParticleMaskAndKinematicsProcessor(TargetProcessor):
     """Processes masks and kinematics for individual tops and W bosons."""
-    
-    def __init__(self):
+
+    def __init__(self, include_leptonic_keys: bool = False):
         self.top_transformers = None
         self.W_transformers = None
-    
+        # When True: also save the four leptonic-extension keys with default values
+        # (zeros/all-hadronic). Needed so hadronic files are compatible with the
+        # combined leptonic training pipeline.
+        self.include_leptonic_keys = include_leptonic_keys
+
     def get_target_count(self) -> int:
         return 2  # 2 tops and 2 Ws
-    
+
     def init_target_transformers(self) -> tuple:
         """Initialize transformers for both tops and Ws kinematics."""
         # Transformers for top kinematics (pt, eta, phi, energy)
@@ -153,7 +157,7 @@ class IndividualParticleMaskAndKinematicsProcessor(TargetProcessor):
             PhiTransformer(),       # phi -> cos(phi), sin(phi)
             LogMinMaxScaler(),      # energy
         )
-        
+
         # Transformers for W kinematics (same structure)
         W_trans = (
             LogMinMaxScaler(),      # pt
@@ -161,23 +165,26 @@ class IndividualParticleMaskAndKinematicsProcessor(TargetProcessor):
             PhiTransformer(),       # phi -> cos(phi), sin(phi)
             LogMinMaxScaler(),      # energy
         )
-        
+
         self.top_transformers = top_trans
         self.W_transformers = W_trans
-        
+
         return (top_trans, W_trans)
-    
+
     def process_targets(self, targets_dict: Dict[str, np.ndarray], is_temp: bool) -> Dict[str, np.ndarray]:
         """Masks don't need processing, kinematics handled in _transform_targets."""
         return targets_dict
-    
+
     def reshape_targets(self, targets_chunk: np.ndarray) -> np.ndarray:
         """Not used for this processor."""
         return targets_chunk
-    
+
     def get_save_keys(self) -> list:
-        return ["masks_tops", "masks_Ws", "kinematics_tops", "kinematics_Ws",
+        keys = ["masks_tops", "masks_Ws", "kinematics_tops", "kinematics_Ws",
                 "valid_tops", "valid_Ws"]
+        if self.include_leptonic_keys:
+            keys += ["particle_type", "chain_type", "globals", "neutrino_truth"]
+        return keys
 
 
 class InteractionProcessor(ABC):
@@ -230,7 +237,8 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
                  tag_W1: np.ndarray = None,
                  tag_W2: np.ndarray = None,
                  num_jets: int = 20,
-                 require_top_for_w: bool = False):
+                 require_top_for_w: bool = False,
+                 include_leptonic_keys: bool = False):
         # Set default truth-matching tags
         self.tag_top1 = tag_top1 if tag_top1 is not None else np.array([1, 2, 3])
         self.tag_top2 = tag_top2 if tag_top2 is not None else np.array([4, 5, 6])
@@ -238,7 +246,8 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
         self.tag_W2 = tag_W2 if tag_W2 is not None else np.array([5, 6])
         self.num_jets = num_jets
         self.require_top_for_w = require_top_for_w
-        
+        self.include_leptonic_keys = include_leptonic_keys
+
         # Define reconstruction tasks: (tags, particle_type, index)
         self.reco_tasks = [
             (self.tag_top1, "tops", 0),
@@ -377,7 +386,7 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
         if self.require_top_for_w:
             valid_Ws &= valid_tops
 
-        return {
+        result = {
             "masks_tops": masks_tops,
             "masks_Ws": masks_Ws,
             "kinematics_tops": kinematics_tops,
@@ -385,6 +394,227 @@ class IndividualParticleMaskAndKinematicsExtractor(TargetExtractor):
             "valid_tops": valid_tops.astype(np.uint8),  # [B, 2]
             "valid_Ws": valid_Ws.astype(np.uint8),      # [B, 2]
         }
+
+        # Leptonic-extension defaults for hadronic data:
+        # particle_type = all zeros (all jets), chain_type = all zeros (all hadronic),
+        # globals = [n_jets_from_src_mask, n_bjets, 0, 0, 0, 0] built in the pipeline,
+        # neutrino_truth = zeros.
+        if self.include_leptonic_keys:
+            result["particle_type"] = np.zeros((B, P), dtype=np.uint8)          # [B, P]
+            result["chain_type"]    = np.zeros((B, 2), dtype=np.uint8)           # [B, 2] all hadronic
+            result["neutrino_truth"] = np.zeros((B, 2, 1), dtype=np.float32)    # [B, 2, 1]
+            # globals placeholder — filled properly in _transform_file when event data is available
+            result["globals"]       = np.zeros((B, 6), dtype=np.float32)         # [B, 6]
+
+        return result
+
+
+class LeptonicMaskAndKinematicsExtractor(TargetExtractor):
+    """
+    Extracts masks, kinematics and leptonic-extension keys for semi-leptonic ttbar.
+
+    Expected raw HDF5 keys (from root_to_h5_leptonic.py):
+        jet          : [B, N_jets+1, 9]  unified jets+lepton, feature order:
+                       [pt, eta, phi, E, m, btag, charge, lep_type, truthtag]
+        particle_type: [B, N_jets+1]     0=jet, 1=lepton
+        MET          : [B, 2]            [MET_pt, MET_phi]
+        neutrino_pz_truth: [B, 1]        truth neutrino pz
+
+    Truthtag convention:
+        1 = b from hadronic top
+        2,3 = hadronic W decay jets
+        4 = b from leptonic top
+        7 = lepton (in unified array, last particle slot)
+        0 = unmatched
+
+    Produces all hadronic keys plus: particle_type, chain_type, globals, neutrino_truth.
+    chain_type [B, 2]: [0, 1] = [hadronic chain, leptonic chain] (chain 0 = had, chain 1 = lep).
+    globals [B, 6]: [n_jets, n_bjets, n_leptons=1, MET_pt, sin(MET_phi), cos(MET_phi)].
+    neutrino_truth [B, 2, 1]: [[0], [nu_pz]] — chain 0 has no neutrino.
+    """
+
+    HAD_B_TAG   = 1
+    HAD_W1_TAG  = 2
+    HAD_W2_TAG  = 3
+    LEP_B_TAG   = 4
+    LEPTON_TAG  = 7
+
+    def __init__(self, num_jets: int = 20):
+        self.num_jets = num_jets
+        # hadronic top = chain 0, leptonic top = chain 1 (fixed convention)
+        self.hadronic_top_tags = np.array([self.HAD_B_TAG, self.HAD_W1_TAG, self.HAD_W2_TAG])
+        self.hadronic_W_tags   = np.array([self.HAD_W1_TAG, self.HAD_W2_TAG])
+        self.leptonic_b_tag    = self.LEP_B_TAG
+        self.lepton_tag        = self.LEPTON_TAG
+
+    def extract_targets(
+        self,
+        jet_chunk: np.ndarray,        # [B, N_total, 9] — unified jet+lepton
+        extra_chunks: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Extract all targets for semi-leptonic ttbar.
+
+        Args:
+            jet_chunk:    [B, N_total, 9] unified jet+lepton feature array
+            extra_chunks: must contain 'particle_type' [B, N], 'MET' [B, 2],
+                          'neutrino_pz_truth' [B, 1]
+
+        Returns:
+            Dict with masks_tops, masks_Ws, kinematics_*, valid_*, particle_type,
+            chain_type, globals, neutrino_truth.
+        """
+        if extra_chunks is None:
+            extra_chunks = {}
+
+        B, N_total, F = jet_chunk.shape
+        truthtag = jet_chunk[..., -1].astype(np.int32)  # last feature = truthtag
+
+        particle_type_raw = extra_chunks.get("particle_type",
+                                             np.zeros((B, N_total), dtype=np.uint8))
+        met = extra_chunks.get("MET", np.zeros((B, 2), dtype=np.float32))
+        nu_pz_truth = extra_chunks.get("neutrino_pz_truth",
+                                        np.zeros((B, 1), dtype=np.float32))
+
+        met_pt  = met[:, 0]
+        met_phi = met[:, 1]
+
+        # ── Binary masks ──
+        def make_mask(tags):
+            return np.isin(truthtag, tags).astype(np.float32)  # [B, N]
+
+        had_top_mask = make_mask(self.hadronic_top_tags)   # [B, N] b + 2 jets
+        had_W_mask   = make_mask(self.hadronic_W_tags)     # [B, N] 2 jets only
+        lep_top_mask = (make_mask([self.leptonic_b_tag])   # b-jet
+                        + make_mask([self.lepton_tag]))     # + lepton
+        lep_top_mask = lep_top_mask.clip(0, 1)
+        lep_W_mask   = make_mask([self.lepton_tag])         # [B, N] lepton only
+
+        # Shape: [B, 2, N] — chain 0 = hadronic, chain 1 = leptonic
+        masks_tops = np.stack([had_top_mask, lep_top_mask], axis=1)  # [B, 2, N]
+        masks_Ws   = np.stack([had_W_mask,   lep_W_mask],   axis=1)  # [B, 2, N]
+
+        # ── Kinematics (vectorised 4-vector summation) ──
+        try:
+            flat_jets_vec = vector.zip({
+                "pt":     jet_chunk[..., 0].flatten(),
+                "eta":    jet_chunk[..., 1].flatten(),
+                "phi":    jet_chunk[..., 2].flatten(),
+                "energy": jet_chunk[..., 3].flatten(),
+            })
+            ev_idx  = np.repeat(np.arange(B), N_total)
+            flat_px = flat_jets_vec.px.to_numpy()
+            flat_py = flat_jets_vec.py.to_numpy()
+            flat_pz = flat_jets_vec.pz.to_numpy()
+            flat_E  = flat_jets_vec.energy.to_numpy()
+        except Exception:
+            # Fallback without vector library
+            flat_E  = jet_chunk[..., 3].flatten()
+            flat_px = (jet_chunk[..., 0] * np.cos(jet_chunk[..., 2])).flatten()
+            flat_py = (jet_chunk[..., 0] * np.sin(jet_chunk[..., 2])).flatten()
+            flat_pz = (jet_chunk[..., 0] * np.sinh(jet_chunk[..., 1])).flatten()
+            ev_idx  = np.repeat(np.arange(B), N_total)
+
+        flat_tags = truthtag.flatten()
+
+        def reco_4vec(tags):
+            """Sum 4-vectors of particles matched to `tags` → [B, 4] polar."""
+            tag_mask = np.isin(flat_tags, tags)
+            if not tag_mask.any():
+                return np.zeros((B, 4), dtype=np.float32)
+            ev = ev_idx[tag_mask]
+            sum_px = np.bincount(ev, weights=flat_px[tag_mask], minlength=B)
+            sum_py = np.bincount(ev, weights=flat_py[tag_mask], minlength=B)
+            sum_pz = np.bincount(ev, weights=flat_pz[tag_mask], minlength=B)
+            sum_E  = np.bincount(ev, weights=flat_E[tag_mask],  minlength=B)
+            try:
+                v = vector.zip({"px": sum_px, "py": sum_py, "pz": sum_pz, "E": sum_E})
+                return np.stack([v.pt.to_numpy(), v.eta.to_numpy(),
+                                 v.phi.to_numpy(), v.E.to_numpy()], axis=-1).astype(np.float32)
+            except Exception:
+                pt  = np.sqrt(sum_px**2 + sum_py**2)
+                p   = np.sqrt(sum_px**2 + sum_py**2 + sum_pz**2)
+                eta = np.arctanh(np.clip(sum_pz / np.maximum(p, 1e-9), -0.9999, 0.9999))
+                phi = np.arctan2(sum_py, sum_px)
+                return np.stack([pt, eta, phi, sum_E], axis=-1).astype(np.float32)
+
+        had_top_kin = reco_4vec(self.hadronic_top_tags)   # [B, 4]
+        had_W_kin   = reco_4vec(self.hadronic_W_tags)
+        lep_top_kin = reco_4vec([self.leptonic_b_tag, self.lepton_tag])
+        lep_W_kin   = reco_4vec([self.lepton_tag])
+
+        def with_placeholder(kin):  # [B, 4] → [B, 5] (adds zero column)
+            return np.concatenate([kin, np.zeros((B, 1), dtype=np.float32)], axis=-1)
+
+        kinematics_tops = np.stack([with_placeholder(had_top_kin),
+                                     with_placeholder(lep_top_kin)], axis=1)  # [B, 2, 5]
+        kinematics_Ws   = np.stack([with_placeholder(had_W_kin),
+                                     with_placeholder(lep_W_kin)],   axis=1)  # [B, 2, 5]
+
+        # ── Per-chain validity ──
+        def all_tags_present(tags_list):
+            ok = np.ones(B, dtype=bool)
+            for tag in tags_list:
+                ok &= np.any(truthtag == tag, axis=1)
+            return ok
+
+        had_top_valid = all_tags_present([self.HAD_B_TAG, self.HAD_W1_TAG, self.HAD_W2_TAG])
+        had_W_valid   = all_tags_present([self.HAD_W1_TAG, self.HAD_W2_TAG])
+        lep_b_valid   = all_tags_present([self.LEP_B_TAG])
+        lep_lep_valid = all_tags_present([self.LEPTON_TAG])
+        lep_top_valid = lep_b_valid & lep_lep_valid
+        lep_W_valid   = lep_lep_valid
+
+        valid_tops = np.stack([had_top_valid, lep_top_valid], axis=1).astype(np.uint8)
+        valid_Ws   = np.stack([had_W_valid,   lep_W_valid],   axis=1).astype(np.uint8)
+
+        # ── Leptonic-extension keys ──
+        # chain_type: chain 0 = hadronic (0), chain 1 = leptonic (1)
+        chain_type = np.zeros((B, 2), dtype=np.uint8)
+        chain_type[:, 1] = 1   # second chain is always leptonic
+
+        # globals: [n_jets, n_bjets, n_leptons, MET_pt, sin(MET_phi), cos(MET_phi)]
+        n_jets  = (particle_type_raw == 0).sum(axis=1).astype(np.float32)
+        n_bjets = (jet_chunk[..., 5] > 0).astype(np.float32).sum(axis=1)  # btag feature
+        n_leps  = (particle_type_raw == 1).sum(axis=1).astype(np.float32)
+        globals_arr = np.stack([n_jets, n_bjets, n_leps,
+                                 met_pt,
+                                 np.sin(met_phi),
+                                 np.cos(met_phi)], axis=-1).astype(np.float32)  # [B, 6]
+
+        # neutrino_truth: [B, 2, 1] — chain 0 has no neutrino (zeros), chain 1 has pz
+        neutrino_truth = np.stack([
+            np.zeros((B, 1), dtype=np.float32),        # hadronic chain: no neutrino
+            nu_pz_truth.reshape(B, 1),                  # leptonic chain: truth pz
+        ], axis=1)  # [B, 2, 1]
+
+        return {
+            "masks_tops":      masks_tops,
+            "masks_Ws":        masks_Ws,
+            "kinematics_tops": kinematics_tops,
+            "kinematics_Ws":   kinematics_Ws,
+            "valid_tops":      valid_tops,
+            "valid_Ws":        valid_Ws,
+            "particle_type":   particle_type_raw.astype(np.uint8),
+            "chain_type":      chain_type,
+            "globals":         globals_arr,
+            "neutrino_truth":  neutrino_truth,
+        }
+
+
+class LeptonicTargetProcessor(IndividualParticleMaskAndKinematicsProcessor):
+    """
+    Extends the hadronic processor with leptonic-extension keys.
+    Used when preprocessing semi-leptonic HDF5 files.
+    """
+
+    def __init__(self):
+        super().__init__(include_leptonic_keys=True)
+
+    def get_save_keys(self) -> list:
+        return ["masks_tops", "masks_Ws", "kinematics_tops", "kinematics_Ws",
+                "valid_tops", "valid_Ws",
+                "particle_type", "chain_type", "globals", "neutrino_truth"]
 
 
 class TopReconstructionDatasetFromH5:
@@ -419,6 +649,15 @@ class TopReconstructionDatasetFromH5:
         # Default 4 = old behaviour (fully-reconstructable events only).
         # Set to 1 to include all events with at least one object.
         self.min_objects = self.preprocessing_config.get("min_objects", 4)
+
+        # Extra raw-HDF5 keys to read and pass to extract_targets as extra_chunks.
+        # For semi-leptonic data: ['particle_type', 'MET', 'neutrino_pz_truth']
+        self.extra_read_keys: list = self.preprocessing_config.get("extra_read_keys", [])
+
+        # Keys from the extractor output that are stored as-is (no transformer scaling).
+        # These are categorical/integer or pre-computed arrays.
+        PASS_THROUGH_KEYS = {"particle_type", "chain_type", "globals", "neutrino_truth"}
+        self._pass_through_keys = PASS_THROUGH_KEYS
 
         print(f"[CONFIG] Raw path: {self.raw_file_prefix_and_path}", flush=True)
         print(f"[CONFIG] Save path: {self.save_file_prefix_and_path}", flush=True)
@@ -497,6 +736,14 @@ class TopReconstructionDatasetFromH5:
         print("[FIT] Fitted transformers will be applied to all files during transformation.", flush=True)
         self._transform_all()
 
+    def _read_extra_chunks(self, f: "h5py.File", start: int, stop: int) -> Dict[str, np.ndarray]:
+        """Read optional extra keys from an open raw HDF5 file."""
+        extra = {}
+        for key in self.extra_read_keys:
+            if key in f:
+                extra[key] = f[key][start:stop].copy()
+        return extra
+
     def _fit_file(self, raw_path: Path):
         """Fit transformers on a single file."""
         with h5py.File(raw_path, "r") as f:
@@ -509,13 +756,13 @@ class TopReconstructionDatasetFromH5:
             ):
                 jet_chunk = f["jet"][i : i + self.stream_size].copy()
                 event_chunk = f["event"][i : i + self.stream_size].copy()
-                # Note: f["targets"] is not read — extractor uses jet tags only
+                extra_chunks = self._read_extra_chunks(f, i, i + self.stream_size)
 
                 if jet_chunk.shape[0] == 0:
                     continue
 
                 # Extract targets first (validity needed to compute the event filter)
-                targets_dict = self.target_extractor.extract_targets(jet_chunk, None)
+                targets_dict = self.target_extractor.extract_targets(jet_chunk, extra_chunks if extra_chunks else None)
 
                 # Compute per-event filter from validity arrays
                 if "valid_tops" in targets_dict and "valid_Ws" in targets_dict:
@@ -649,10 +896,26 @@ class TopReconstructionDatasetFromH5:
             ):
                 jet_chunk = read_f["jet"][i : i + self.stream_size].copy()
                 event_chunk = read_f["event"][i : i + self.stream_size].copy()
-                # Note: f["targets"] is not read — extractor uses jet tags only
+                extra_chunks = self._read_extra_chunks(read_f, i, i + self.stream_size)
 
                 # Extract targets first (validity needed to compute the event filter)
-                targets_dict = self.target_extractor.extract_targets(jet_chunk, None)
+                targets_dict = self.target_extractor.extract_targets(jet_chunk, extra_chunks if extra_chunks else None)
+
+                # Fill globals from event array for hadronic data (particle_type=all-zeros path)
+                # event layout for hadronic: [n_jets, n_bjets, all_matched]
+                # For leptonic data with MET, globals are already set by the extractor.
+                if "globals" in targets_dict and "MET" not in extra_chunks:
+                    # Hadronic fallback: derive globals from event array
+                    B = jet_chunk.shape[0]
+                    n_jets  = event_chunk[:, 0].astype(np.float32)
+                    n_bjets = event_chunk[:, 1].astype(np.float32) if event_chunk.shape[1] > 1 else np.zeros(B, dtype=np.float32)
+                    targets_dict["globals"] = np.stack([
+                        n_jets, n_bjets,
+                        np.zeros(B, np.float32),  # n_leptons=0
+                        np.zeros(B, np.float32),  # MET_pt=0
+                        np.zeros(B, np.float32),  # sin(MET_phi)=0
+                        np.ones( B, np.float32),  # cos(MET_phi)=1 (phi=0)
+                    ], axis=-1)
 
                 # Compute per-event filter from validity arrays
                 if "valid_tops" in targets_dict and "valid_Ws" in targets_dict:
@@ -858,7 +1121,25 @@ class TopReconstructionDatasetFromH5:
                 compression="lzf",
                 dtype="float32",
             )
-        
+
+        # Leptonic-extension pass-through keys
+        for key in self._pass_through_keys:
+            if key in targets_dict:
+                arr = targets_dict[key]
+                if arr.ndim == 1:
+                    shape_rest = ()
+                else:
+                    shape_rest = arr.shape[1:]
+                dtype = "uint8" if key in {"particle_type", "chain_type"} else "float32"
+                file.create_dataset(
+                    key,
+                    shape=(0,) + shape_rest,
+                    maxshape=(None,) + shape_rest,
+                    compression="gzip",
+                    compression_opts=4,
+                    dtype=dtype,
+                )
+
         print(f"[TRANSFORM] Datasets created in HDF5 file", flush=True)
 
     def _save_data_chunks(
@@ -893,6 +1174,13 @@ class TopReconstructionDatasetFromH5:
         if interaction_chunk is not None:
             file["interactions"].resize((n1,) + file["interactions"].shape[1:])
             file["interactions"][n0:n1] = interaction_chunk.astype("float32")
+
+        # Leptonic-extension pass-through keys (no transformer scaling)
+        for key in self._pass_through_keys:
+            if key in targets_dict and key in file:
+                file[key].resize((n1,) + file[key].shape[1:])
+                dtype = "uint8" if key in {"particle_type", "chain_type"} else "float32"
+                file[key][n0:n1] = targets_dict[key].astype(dtype)
 
     def _pad_and_src_mask(
         self, 
