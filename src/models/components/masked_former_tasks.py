@@ -1360,6 +1360,196 @@ class ObjectTypeTask(BaseTask):
         file["target_classes"][start_idx:end_idx] = classes[:, :M].float().cpu().numpy()
 
 
+class ChainTypeTask(BaseTask):
+    """
+    Per-chain binary classification: hadronic (0) vs leptonic (1).
+    Used in chain_queries + enable_leptonic mode only.
+
+    Contributes a SOFT matching cost so the matcher preferentially assigns
+    chains to same-type targets while keeping free matching (no hard penalty).
+
+    Predictions: 'is_leptonic_logit' [B, Q, 1]
+    Targets: 'chain_type' [B, T] int (0=hadronic, 1=leptonic)
+    """
+
+    def __init__(self, config: TaskConfig):
+        super().__init__(config)
+        self.register_buffer('_correct_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer('_total_buf', torch.zeros(1, dtype=torch.long), persistent=False)
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if 'is_leptonic_logit' not in predictions or 'chain_type' not in targets:
+            first = next(iter(predictions.values()))
+            B, Q = first.shape[:2]
+            T = next(iter(targets.values())).shape[1]
+            return torch.zeros(B, Q, T, device=first.device)
+
+        pred_logit = predictions['is_leptonic_logit'].squeeze(-1)  # [B, Q]
+        chain_type = targets['chain_type'].float()                  # [B, T]
+        B, Q = pred_logit.shape
+        T = chain_type.shape[1]
+
+        pred_exp   = pred_logit.unsqueeze(2).expand(B, Q, T)
+        target_exp = chain_type.unsqueeze(1).expand(B, Q, T)
+        cost = F.binary_cross_entropy_with_logits(pred_exp, target_exp, reduction='none')
+        return self.config.cost_weights.get('chain_type', 1.0) * cost
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if 'is_leptonic_logit' not in predictions or 'chain_type' not in targets:
+            first = next(iter(predictions.values()))
+            return torch.tensor(0.0, device=first.device)
+
+        pred_logit = predictions['is_leptonic_logit'].squeeze(-1)  # [B, Q]
+        chain_type = targets['chain_type'].float()                  # [B, Q] post-padding
+        obj_valid  = targets.get('obj_valid_mask')
+
+        if obj_valid is None or not obj_valid.any():
+            return pred_logit.new_tensor(0.0)
+
+        real_logits = pred_logit[obj_valid]
+        real_labels = chain_type[obj_valid]
+
+        loss = F.binary_cross_entropy_with_logits(real_logits, real_labels, reduction='mean')
+
+        with torch.no_grad():
+            if getattr(self, '_stats_enabled', True):
+                preds = (real_logits.sigmoid() > 0.5).float()
+                self._correct_buf += (preds == real_labels).sum().long()
+                self._total_buf   += real_labels.numel()
+
+        return self.config.get_loss_weight('chain_type') * loss
+
+    def get_accuracy_stats(self) -> Dict[str, float]:
+        total = self._total_buf.item()
+        if total == 0:
+            return {'accuracy': 0.0, 'total_samples': 0}
+        return {'accuracy': self._correct_buf.item() / total, 'total_samples': total}
+
+    def reset_accuracy_stats(self):
+        self._correct_buf.zero_()
+        self._total_buf.zero_()
+
+    def create_test_datasets(self, file: h5py.File, number_events: int):
+        M = self.config.max_objects
+        file.create_dataset("predicted_is_leptonic_logit", shape=(number_events, M), dtype='float32')
+        file.create_dataset("predicted_is_leptonic_prob",  shape=(number_events, M), dtype='float32')
+        file.create_dataset("target_chain_type",           shape=(number_events, M), dtype='int32')
+
+    def save_test_predictions(
+        self,
+        file: h5py.File,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        start_idx: int,
+        batch_size: int,
+    ):
+        if 'is_leptonic_logit' not in predictions:
+            return
+        logit = predictions['is_leptonic_logit'].squeeze(-1)  # [B, Q]
+        prob  = logit.sigmoid()
+        ct    = targets.get('chain_type', torch.zeros_like(logit, dtype=torch.long))
+        M     = self.config.max_objects
+        end   = start_idx + batch_size
+        file["predicted_is_leptonic_logit"][start_idx:end] = logit[:, :M].float().cpu().numpy()
+        file["predicted_is_leptonic_prob"][start_idx:end]  = prob[:, :M].float().cpu().numpy()
+        file["target_chain_type"][start_idx:end]           = ct[:, :M].float().cpu().numpy()
+
+
+class NeutrinoRegressionTask(BaseTask):
+    """
+    Smooth-L1 regression of neutrino truth kinematics for leptonic chains.
+    Only fires on chains where chain_type == 1 (leptonic) AND obj_valid == True.
+
+    Optionally adds a soft m(ℓν) ≈ m_W constraint when 'lepton_p4' is provided
+    in targets (future extension — currently only regression loss is active).
+
+    Predictions: 'neutrino_pz'  [B, Q, K]  (K=1 for pz-only, or more)
+    Targets:     'neutrino_truth' [B, Q, K]  (post-padding)
+                 'chain_type'     [B, Q]     (0=had, 1=lep)
+    """
+
+    def __init__(self, config: TaskConfig, mw_gev: float = 80.379):
+        super().__init__(config)
+        self.mw_gev = mw_gev
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # No direct matching contribution — chain assignment driven by masks + chain_type.
+        first = next(iter(predictions.values()))
+        B, Q = first.shape[:2]
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=first.device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if 'neutrino_pz' not in predictions or 'neutrino_truth' not in targets:
+            first = next(iter(predictions.values()))
+            return torch.tensor(0.0, device=first.device)
+
+        pred_pz    = predictions['neutrino_pz']         # [B, Q, K]
+        nu_truth   = targets['neutrino_truth']           # [B, Q, K]
+        chain_type = targets.get('chain_type')           # [B, Q] or None
+        obj_valid  = targets.get('obj_valid_mask')       # [B, Q] or None
+
+        B, Q, K = pred_pz.shape
+
+        # Leptonic mask: valid AND leptonic chains
+        if chain_type is not None and obj_valid is not None:
+            lep_mask = (chain_type.float() > 0.5).bool() & obj_valid  # [B, Q]
+        elif obj_valid is not None:
+            lep_mask = obj_valid
+        else:
+            lep_mask = torch.ones(B, Q, dtype=torch.bool, device=pred_pz.device)
+
+        if not lep_mask.any():
+            return pred_pz.new_tensor(0.0)
+
+        pred_real  = pred_pz[lep_mask]    # [N_lep, K]
+        truth_real = nu_truth[lep_mask]   # [N_lep, K]
+
+        loss = F.smooth_l1_loss(pred_real, truth_real)
+        return self.config.get_loss_weight('neutrino') * loss
+
+    def create_test_datasets(self, file: h5py.File, number_events: int):
+        K = self.config.output_dims.get('neutrino_pz', 1)
+        M = self.config.max_objects
+        file.create_dataset("predicted_neutrino_pz",  shape=(number_events, M, K), dtype='float32')
+        file.create_dataset("target_neutrino_truth",  shape=(number_events, M, K), dtype='float32')
+
+    def save_test_predictions(
+        self,
+        file: h5py.File,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        start_idx: int,
+        batch_size: int,
+    ):
+        if 'neutrino_pz' not in predictions or 'neutrino_truth' not in targets:
+            return
+        pred = predictions['neutrino_pz']                # [B, Q, K]
+        truth = targets['neutrino_truth']                 # [B, Q, K]
+        M = self.config.max_objects
+        end = start_idx + batch_size
+        file["predicted_neutrino_pz"][start_idx:end]  = pred[:, :M].float().cpu().numpy()
+        file["target_neutrino_truth"][start_idx:end]  = truth[:, :M].float().cpu().numpy()
+
+
 class BackgroundSuppressionTask(BaseTask):
     """
     Penalises high mask logits for background particles (not in any real GT mask)

@@ -48,6 +48,25 @@ class ParticleEmbedder(nn.Module):
 
 
 
+class GlobalEmbedder(nn.Module):
+    """
+    Maps event-level global features [B, G] → [B, 1, D] global token.
+    Prepended to encoder memory so decoder queries can attend to it.
+    """
+
+    def __init__(self, global_dim: int, hidden_sizes: list, embedding_size: int, p_dropout: float):
+        super().__init__()
+        sizes = [global_dim] + list(hidden_sizes)
+        layers = []
+        for s1, s2 in zip(sizes[:-1], sizes[1:]):
+            layers.extend([nn.LayerNorm(s1, eps=1e-6), nn.Linear(s1, s2), nn.GELU(), nn.Dropout(p_dropout)])
+        layers.append(nn.Linear(sizes[-1] if len(sizes) > 1 else global_dim, embedding_size))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, g: torch.Tensor) -> torch.Tensor:  # g: [B, G]
+        return self.net(g).unsqueeze(1)                   # [B, 1, D]
+
+
 class InteractionEmbedder(nn.Module):
     def __init__(self,
         input_features,
@@ -128,6 +147,9 @@ class MaskedReconstructionPart(nn.Module):
                  use_particle_gating: bool = False,
                  n_gating_layers: int = 2,
                  n_gate_queries: int = 1,
+                 enable_leptonic: bool = False,
+                 global_dim: int = 0,
+                 global_hidden_sizes: Optional[List[int]] = None,
                  **kwargs
                  ):
         super().__init__()
@@ -140,6 +162,19 @@ class MaskedReconstructionPart(nn.Module):
         self.task_registry = task_registry
         self.use_mia_encoder = use_mia_encoder
         self.use_vanilla_attention = use_vanilla_attention
+        self.enable_leptonic = enable_leptonic
+
+        # Leptonic-extension: type embedding (0=jet, 1=lepton) and global token
+        if enable_leptonic:
+            self.particle_type_embedding = nn.Embedding(2, embedding_size)
+        else:
+            self.particle_type_embedding = None
+
+        if enable_leptonic and global_dim > 0:
+            _gh = global_hidden_sizes if global_hidden_sizes else []
+            self.global_embedder = GlobalEmbedder(global_dim, _gh, embedding_size, p_dropout)
+        else:
+            self.global_embedder = None
 
         if use_vanilla_attention:
             # Native torch encoder → gets flash attention automatically
@@ -337,6 +372,11 @@ class MaskedReconstructionPart(nn.Module):
         if torch.isnan(jet).any():
             raise RuntimeError(f"NaN after particle embedder!")
 
+        # Leptonic-extension: add per-particle type embedding (jet=0, lepton=1)
+        if self.particle_type_embedding is not None and 'particle_type' in X:
+            ptype = X['particle_type'].long().clamp(0, 1)  # guard pad tokens
+            jet = jet + self.particle_type_embedding(ptype)
+
         if self.use_vanilla_attention:
             interactions = None
         else:
@@ -347,7 +387,7 @@ class MaskedReconstructionPart(nn.Module):
 
         B, N, F = jet.shape
 
-        # Encode
+        # Encode (always over particles only — interactions matrix is [B,C,N,N])
         memory = jet
         if self.use_vanilla_attention:
             # Native flash attention path — no interactions needed
@@ -368,6 +408,20 @@ class MaskedReconstructionPart(nn.Module):
         # Phase 2 (or full encoder for non-MIA): P-MHA blocks
         for layer in self.encoder_stack:
             memory = layer(memory, interactions)
+
+        # Leptonic-extension: prepend global token to decoder cross-attention memory.
+        # The encoder sees particles only (interactions matrix is [B,C,N,N]).
+        # After encoding, we prepend the global token so decoder queries can attend to it.
+        # The mask einsum (query × memory) uses particle-only memory to stay aligned with
+        # target masks; global token is silently excluded from that computation.
+        if self.global_embedder is not None and 'globals' in X:
+            global_tok = self.global_embedder(X['globals'])          # [B, 1, D]
+            _global_valid = src_mask.new_ones(B, 1)
+            dec_memory   = torch.cat([global_tok, memory], dim=1)    # [B, N+1, D]
+            dec_src_mask = torch.cat([_global_valid, src_mask], dim=1)  # [B, N+1]
+        else:
+            dec_memory   = memory
+            dec_src_mask = src_mask
         
         # Particle gating: scale encoder memory by learned per-particle relevance
         gate_relevance = None
@@ -382,7 +436,9 @@ class MaskedReconstructionPart(nn.Module):
             tgt = (self.target_tokens + type_emb).unsqueeze(0).expand(B, -1, -1)
         layer_outputs = {}
 
-        # Decode
+        # Decode — use dec_memory/dec_src_mask for decoder cross-attention (may include
+        # the global token); pass particle-only `memory` to _compute_layer_outputs so
+        # the mask einsum stays aligned to the N particle positions.
         if self.hierarchical_decoding and self.chain_queries:
             # --- Chain-query hierarchical decode ---
             # Order-aware: hierarchy_order controls which decoder runs first.
@@ -399,17 +455,17 @@ class MaskedReconstructionPart(nn.Module):
 
             n_phase1_layers = len(phase1_stack)
 
-            # Phase 1: queries attend to particle memory
+            # Phase 1: queries attend to (optionally global-prepended) decoder memory
             phase1_tgt = tgt
             for i, layer in enumerate(phase1_stack):
-                phase1_tgt = layer(phase1_tgt, memory, memory_key_padding_mask=~src_mask)
+                phase1_tgt = layer(phase1_tgt, dec_memory, memory_key_padding_mask=~dec_src_mask)
                 layer_outputs[i] = self._compute_layer_outputs(
                     phase1_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
 
-            # Extended memory: particles + phase-1 states
+            # Extended memory: dec_memory (global+particles) + phase-1 states
             chain_valid = src_mask.new_ones(B, self.num_query_tokens)
-            extended_src_mask = torch.cat([src_mask, chain_valid], dim=1)
-            extended_memory = torch.cat([memory, phase1_tgt], dim=1)  # [B, N+Q, D]
+            extended_src_mask = torch.cat([dec_src_mask, chain_valid], dim=1)
+            extended_memory = torch.cat([dec_memory, phase1_tgt], dim=1)
 
             # Phase 2: warm-started queries attend to extended memory
             phase2_tgt = phase1_tgt
@@ -436,14 +492,14 @@ class MaskedReconstructionPart(nn.Module):
 
             # --- Phase 1: W decoding ---
             for i, w_layer in enumerate(self.w_decoder_stack):
-                w_tgt = w_layer(w_tgt, memory, memory_key_padding_mask=~src_mask)
+                w_tgt = w_layer(w_tgt, dec_memory, memory_key_padding_mask=~dec_src_mask)
                 combined = torch.cat([top_tgt, w_tgt], dim=1)  # top_tgt still at init
                 layer_outputs[i] = self._compute_layer_outputs(combined, memory, layer_id=i, gate_relevance=gate_relevance)
 
-            # Build extended memory once from final W states
+            # Build extended memory once from final W states (include global token)
             w_valid = src_mask.new_ones(B, self.n_w_queries)
-            extended_src_mask = torch.cat([src_mask, w_valid], dim=1)
-            extended_memory = torch.cat([memory, w_tgt], dim=1)  # [B, N+Q_W, D]
+            extended_src_mask = torch.cat([dec_src_mask, w_valid], dim=1)
+            extended_memory = torch.cat([dec_memory, w_tgt], dim=1)
 
             # --- Phase 2: Top decoding ---
             for j, top_layer in enumerate(self.top_decoder_stack):
@@ -454,7 +510,7 @@ class MaskedReconstructionPart(nn.Module):
                 layer_outputs[layer_id] = self._compute_layer_outputs(combined, memory, layer_id=layer_id, gate_relevance=gate_relevance)
         else:
             for i, layer in enumerate(self.decoder_stack):
-                tgt = layer(tgt, memory, memory_key_padding_mask=~src_mask)
+                tgt = layer(tgt, dec_memory, memory_key_padding_mask=~dec_src_mask)
 
                 # Only compute heads needed at this layer (zero-weight layers are skipped)
                 layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i, gate_relevance=gate_relevance)
@@ -661,6 +717,10 @@ class MaskedReconstructionPart(nn.Module):
             # Remove the merged 'classes' field — no per-query type in chain mode.
             targets_batched.pop('classes', None)
 
+            # Leptonic-extension: chain_type is already [B, T_chains] — no split needed.
+            # neutrino_truth is also [B, T_chains, K] — pass through unchanged.
+            # (Both keys are already in targets_batched if present, kept by dict copy.)
+
         # ---- 2. Compute matching indices (no gradients) ----
         with torch.no_grad():
             final_layer = max(decoder_outputs.keys())
@@ -815,6 +875,18 @@ class MaskedReconstructionPart(nn.Module):
                 )
             else:
                 padded_targets['classes'] = cls
+
+        # Leptonic-extension: pad chain_type [B, T_chains] → [B, Q]
+        if 'chain_type' in targets_batched:
+            ct = targets_batched['chain_type']
+            padded_targets['chain_type'] = F.pad(ct, (0, pad_q), value=0) if pad_q > 0 else ct
+
+        # Leptonic-extension: pad neutrino_truth [B, T_chains, K] → [B, Q, K]
+        if 'neutrino_truth' in targets_batched:
+            nt = targets_batched['neutrino_truth']
+            padded_targets['neutrino_truth'] = (
+                F.pad(nt, (0, 0, 0, pad_q), value=0.0) if pad_q > 0 else nt
+            )
 
         # ---- 5. Inject __targets__ into each layer dict ----
         for layer_id in permuted_outputs:

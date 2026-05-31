@@ -79,6 +79,9 @@ def masked_former_collate_fn(batch):
     Pre-pads and stacks targets on CPU so _collate_targets() is skipped on GPU,
     eliminating ~12,000 CUDA kernel launches per batch.
 
+    Handles optional leptonic-extension keys: 'particle_type' and 'globals'
+    (samples) and 'chain_type' and 'neutrino_truth' (targets).
+
     Returns:
         batched_samples: Dict[str, Tensor]
         batched_targets: Dict[str, Tensor] including 'target_valid_mask' [B, T_max]
@@ -157,6 +160,25 @@ def masked_former_collate_fn(batch):
             if T_i > 0:
                 cls[i, :T_i] = t['classes']
         batched_targets['classes'] = cls
+
+    # Leptonic-extension: chain_type [B, T_chains] — per chain, not per object-type
+    # T_chains == T_max // 2 in chain_queries mode (tops first half, Ws second half);
+    # chain_type is already per-chain so we stack at original T_chains length.
+    if 'chain_type' in targets[0]:
+        T_chains = targets[0]['chain_type'].shape[0]
+        ct = torch.zeros(B, T_chains, dtype=torch.long)
+        for i, t in enumerate(targets):
+            ct[i] = t['chain_type']
+        batched_targets['chain_type'] = ct
+
+    # Leptonic-extension: neutrino_truth [B, T_chains, K]
+    if 'neutrino_truth' in targets[0]:
+        T_chains = targets[0]['neutrino_truth'].shape[0]
+        K = targets[0]['neutrino_truth'].shape[1]
+        nt = torch.zeros(B, T_chains, K)
+        for i, t in enumerate(targets):
+            nt[i] = t['neutrino_truth']
+        batched_targets['neutrino_truth'] = nt
 
     return batched_samples, batched_targets
 
@@ -245,6 +267,13 @@ class LazyHDF5Dataset(Dataset):
             valid_tops = f["valid_tops"][()] if "valid_tops" in f else None
             valid_Ws = f["valid_Ws"][()] if "valid_Ws" in f else None
 
+            # Leptonic-extension: chain_type [N, 2] kept in RAM (small)
+            self._chain_type = f["chain_type"][()] if "chain_type" in f else None
+            # Flags for lazy-loaded leptonic keys
+            self._has_particle_type  = "particle_type"  in f
+            self._has_globals        = "globals"         in f
+            self._has_neutrino_truth = "neutrino_truth"  in f
+
         # Pre-compute per-event classes and object_valid (small arrays).
         # These stay in RAM; everything else is read lazily.
         N = self._length
@@ -299,6 +328,16 @@ class LazyHDF5Dataset(Dataset):
             "interactions": torch.from_numpy(interactions).float(),
         }
 
+        # Leptonic-extension: optional per-particle type and event globals
+        if self._has_particle_type:
+            sample["particle_type"] = torch.from_numpy(
+                self._file["particle_type"][idx]
+            ).long()
+        if self._has_globals:
+            sample["globals"] = torch.from_numpy(
+                self._file["globals"][idx]
+            ).float()
+
         # Read and concatenate tops + Ws masks/kinematics for this event
         masks_parts = []
         kins_parts = []
@@ -323,6 +362,16 @@ class LazyHDF5Dataset(Dataset):
             target["object_valid"] = torch.from_numpy(
                 self.object_valid[idx]
             ).bool()
+
+        # Leptonic-extension: optional per-chain type and neutrino truth
+        if self._chain_type is not None:
+            target["chain_type"] = torch.from_numpy(
+                self._chain_type[idx]
+            ).long()  # [2] for 2 chains
+        if self._has_neutrino_truth:
+            target["neutrino_truth"] = torch.from_numpy(
+                self._file["neutrino_truth"][idx]
+            ).float()  # [2, K]
 
         return sample, target
 

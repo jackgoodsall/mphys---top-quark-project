@@ -1,0 +1,170 @@
+max_objects: 2   # chain_queries: one query per decay chain (2 tops = 2 chains)
+
+
+tasks:
+
+  # --- W-phase mask (first 3 decoder layers in w_first order) ---
+  mask_W:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+
+  # --- Top-phase mask (last 3 decoder layers in w_first order) ---
+  mask:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+
+  objectness:
+    cost_weight: 0
+    loss_weight: 0
+    head_norm: True
+    layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+
+  # --- Leptonic-extension tasks ---
+
+  chain_type:
+    # Soft cost: biases matcher toward same-type assignments without hard penalty
+    cost_weight: 0.5
+    loss_weight: 1.0
+    head_norm: True
+    layer_weight_strategy: "final_only"
+
+  neutrino:
+    # Neutrino pz regression (applied to leptonic chains only)
+    output_dim: 1     # pz only (extend to 4 for full 4-vector later)
+    loss_weight: 0.5
+    head_norm: True
+    layer_weight_strategy: "final_only"
+
+
+pretraining:
+  mask_pretrain_epochs: 10   # mask-only pretraining before enabling kinematics/chain_type
+  tasks: ["mask_W"]
+  transition_ramp_epochs: 5
+
+
+data_modules:
+  # Combined hadronic + semi-leptonic HDF5 files (produced by prepare_combined_dataset.py)
+  input_path: data/topquarkreconstruction/leptonic_combined
+  input_prefix: "ttbar_leptonic_"
+  lazy: true
+  load_interactions: true
+  tops_mask_key: "masks_tops"
+  tops_kin_key: "kinematics_tops"
+  ws_mask_key: "masks_Ws"
+  ws_kin_key: "kinematics_Ws"
+  train:
+    batch_size: 512
+    shuffle: True
+    num_workers: 4
+    pin_memory: True
+  test:
+    batch_size: 1024
+    shuffle: False
+    num_workers: 4
+    pin_memory: False
+  val:
+    batch_size: 1024
+    shuffle: False
+    num_workers: 4
+    pin_memory: False
+
+model_parameters:
+  particle_embedder:
+    # Superset feature dim: original 7 jets + lepton iso/flavour/charge slots (zero for jets)
+    # Adjust n_input once the actual leptonic HDF5 feature count is known.
+    n_input: 9
+    hidden_sizes: [64]
+    embedding_size: 128
+    p_dropout: 0.0
+
+  interaction_embedder:
+    input_features: 4
+    hidden_layers: [32]
+    output_size: 4
+    p_dropout: 0.0
+
+  transformer:
+    embedding_size: 128
+    n_encoder_layers: 6
+    n_decoder_layers: 6
+    n_heads: 4
+    p_dropout: 0.0
+    dim_ff: 512
+    num_query_tokens: 2
+    hierarchical_decoding: True
+    chain_queries: True
+    hierarchy_order: "w_first"
+    use_hungarian_matching: True
+    matching_solver: "gpu_bruteforce"
+    max_targets: 10
+    use_mia_encoder: False
+    n_mia_layers: 0
+    mia_interaction_dim: 64
+    use_vanilla_attention: false
+    use_particle_gating: false
+    n_gating_layers: 2
+    n_gate_queries: 1
+    # --- Leptonic-extension flags ---
+    enable_leptonic: true
+    global_dim: 6           # [n_jets, n_bjets, n_leptons, MET, sin(MET_phi), cos(MET_phi)]
+    global_hidden_sizes: [32]
+
+model_training:
+  seed: null
+  learning_rate: 2e-4
+  weight_decay: 0.05
+  use_lookahead: False
+  gradient_clip_val: 2
+  precision: "bf16-mixed"
+  matmul_precision: "high"
+  min_epochs: 15
+  max_epochs: 150
+  num_nodes: 1
+  devices: 2
+  strategy: "ddp"
+  accelerator: "gpu"
+
+  scheduler:
+    type: "warmup_cosine"
+    update_interval: "step"
+    warmup_epochs: 5
+    T_max: 150
+    eta_min: 5e-6
+    lr_rewarmup_epochs: 5     # re-warmup at pretraining→full-loss phase transition
+    lr_rewarmup_fraction: 1.5
+
+    factor: 0.5
+    patience: 3
+    plateau_monitor: "val_loss"
+    step_size: 3000
+    gamma: 0.9
+
+training_callbacks:
+  checkpoint:
+    save_top_k: 3
+    monitor: "val_loss"
+    mode: "min"
+    save_weights_only: False
+    filename: "epoch={epoch}-val_loss={val_loss:.4f}"
+    save_last: True
+
+  early_stopping:
+    monitor: "val_loss"
+    patience: 25
+    min_delta: 0.0001
+    mode: "min"
+
+inference:
+  mode: "train"
+  checkpoint_path: null
+
+model_artefacts:
+  log_dir: "leptonic_reconstruction"
+  target_transformers: "data/topquarkreconstruction/leptonic_combined/target_transforms.joblib"
+  invariant_mass_transformers: "data/topquarkreconstruction/leptonic_combined/invariant_mass_transform.joblib"

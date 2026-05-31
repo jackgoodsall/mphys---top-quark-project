@@ -15,6 +15,7 @@ from models.components.masked_former_tasks import (
     TaskRegistry, TaskConfig,
     MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
     BackgroundSuppressionTask, ParticleGatingTask,
+    ChainTypeTask, NeutrinoRegressionTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
@@ -181,6 +182,57 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             top_weight=type_config.get('top_weight', 1.0)
         )
         task_registry.register_task(object_type_task)
+
+    # ========================================
+    # Leptonic-extension tasks (chain_queries + enable_leptonic mode)
+    # ========================================
+    enable_leptonic = config["model_parameters"]["transformer"].get("enable_leptonic", False)
+    if chain_queries and enable_leptonic:
+
+        # ChainTypeTask: per-chain hadronic/leptonic binary classification
+        ct_config = task_configs.get("chain_type", {})
+        chain_type_task = ChainTypeTask(
+            TaskConfig(
+                name='chain_type',
+                output_names=['is_leptonic_logit'],
+                output_dims={'is_leptonic_logit': 1},
+                cost_weights={'chain_type': ct_config.get('cost_weight', 0.5)},
+                loss_weights={'chain_type': ct_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=_build_layer_weights(
+                    layer_config=ct_config.get('layer_weights'),
+                    strategy=ct_config.get('layer_weight_strategy', 'final_only'),
+                    strategy_params=ct_config.get('layer_weight_params', {}),
+                    n_layers=n_decoder_layers,
+                ),
+                head_norm=ct_config.get('head_norm', False),
+            ),
+        )
+        task_registry.register_task(chain_type_task)
+
+        # NeutrinoRegressionTask: pz regression for leptonic chains
+        nu_config = task_configs.get("neutrino", {})
+        if nu_config:
+            nu_dim = nu_config.get('output_dim', 1)
+            neutrino_task = NeutrinoRegressionTask(
+                TaskConfig(
+                    name='neutrino',
+                    output_names=['neutrino_pz'],
+                    output_dims={'neutrino_pz': nu_dim},
+                    cost_weights={},
+                    loss_weights={'neutrino': nu_config.get('loss_weight', 1.0)},
+                    max_objects=max_objects,
+                    layer_weights=_build_layer_weights(
+                        layer_config=nu_config.get('layer_weights'),
+                        strategy=nu_config.get('layer_weight_strategy', 'final_only'),
+                        strategy_params=nu_config.get('layer_weight_params', {}),
+                        n_layers=n_decoder_layers,
+                    ),
+                    head_norm=nu_config.get('head_norm', False),
+                ),
+                mw_gev=nu_config.get('mw_gev', 80.379),
+            )
+            task_registry.register_task(neutrino_task)
 
     # ========================================
     # Background Suppression Task
