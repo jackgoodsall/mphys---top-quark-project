@@ -119,6 +119,8 @@ model_parameters:
     hierarchy_order: "w_first"  # "top_first" | "w_first" — controls which decoder phase runs first
     mask_logit_scale: false     # B1: multiply mask logits by embedding_size**-0.5 (attention temperature)
     phase1_mask_overwrite: true # B1: baseline. Set false with mask_embed_head + B2 deep supervision
+    masked_cross_attention: false     # C: queries attend only inside their predicted mask
+    masked_attention_start_epoch: 0   # C: epoch to switch masking on (3 if early val divergence)
     use_hungarian_matching: True
     matching_solver: "gpu_bruteforce"   # "gpu_bruteforce" | "scipy"
     max_targets: 10                     # GPU fallback threshold for gpu_bruteforce

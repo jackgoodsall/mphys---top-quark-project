@@ -152,6 +152,8 @@ class MaskedReconstructionPart(nn.Module):
                  global_hidden_sizes: Optional[List[int]] = None,
                  mask_logit_scale: bool = False,
                  phase1_mask_overwrite: bool = True,
+                 masked_cross_attention: bool = False,
+                 masked_attention_start_epoch: int = 0,
                  **kwargs
                  ):
         super().__init__()
@@ -174,6 +176,14 @@ class MaskedReconstructionPart(nn.Module):
         # mask is replaced by the phase-1 final-layer output (both forward + matching).
         # Turn OFF once a dedicated W-mask head + deep supervision are on.
         self.phase1_mask_overwrite = phase1_mask_overwrite
+
+        # Masked cross-attention (Stage C). n_heads stored for the [B*H, Q, S] mask.
+        self.n_heads = n_heads
+        self.masked_cross_attention = masked_cross_attention
+        self.masked_attention_start_epoch = masked_attention_start_epoch
+        # Epoch-gated by the trainer (on_train_epoch_start). Default = enabled when the
+        # feature is on, so test/val runs use masking; warmup can gate it off early.
+        self.masked_attention_active = masked_cross_attention
 
         # Leptonic-extension: type embedding (0=jet, 1=lepton) and global token
         if enable_leptonic:
@@ -304,6 +314,11 @@ class MaskedReconstructionPart(nn.Module):
         outputs (needed for the cost matrix and test saving).
         """
         final_layer = n_decoder_layers - 1
+        # With masked cross-attention, every layer conditions on the previous layer's
+        # mask, so both mask outputs must be produced at every layer even where their
+        # loss weight is 0. (Names without a head are silently ignored downstream.)
+        force_masks = getattr(self, 'masked_cross_attention', False)
+        MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
         output_map: Dict[int, set] = {}
         for i in range(n_decoder_layers):
             needed: set = set()
@@ -311,6 +326,8 @@ class MaskedReconstructionPart(nn.Module):
                 lw = task.config.get_layer_weight(i)
                 if lw != 0 or i == final_layer:
                     needed.update(task.config.output_names)
+            if force_masks:
+                needed |= MASK_OUTPUT_NAMES
             output_map[i] = needed
         return output_map
 
@@ -462,6 +479,16 @@ class MaskedReconstructionPart(nn.Module):
             tgt = (self.target_tokens + type_emb).unsqueeze(0).expand(B, -1, -1)
         layer_outputs = {}
 
+        # Masked cross-attention (Stage C): each query attends only to particles inside
+        # its previous-layer predicted mask. Epoch-gated via masked_attention_active.
+        use_masked = self.masked_cross_attention and self.masked_attention_active
+        n_global = dec_memory.shape[1] - N   # 1 if global token prepended, else 0
+        if use_masked and self.hierarchical_decoding and not self.chain_queries:
+            raise ValueError(
+                "masked_cross_attention is not supported with the legacy 4-query "
+                "hierarchical mode (chain_queries=False)."
+            )
+
         # Decode — use dec_memory/dec_src_mask for decoder cross-attention (may include
         # the global token); pass particle-only `memory` to _compute_layer_outputs so
         # the mask einsum stays aligned to the N particle positions.
@@ -481,10 +508,19 @@ class MaskedReconstructionPart(nn.Module):
 
             n_phase1_layers = len(phase1_stack)
 
-            # Phase 1: queries attend to (optionally global-prepended) decoder memory
+            phase2_mask_key = 'mask_predictions' if phase1_mask_key == 'mask_W' else 'mask_W'
+
+            # Phase 1: queries attend to (optionally global-prepended) decoder memory.
+            # Layer i>0 restricts attention to layer i-1's phase-native mask.
             phase1_tgt = tgt
             for i, layer in enumerate(phase1_stack):
-                phase1_tgt = layer(phase1_tgt, dec_memory, memory_key_padding_mask=~dec_src_mask)
+                mem_mask = None
+                if use_masked and i > 0:
+                    prev = layer_outputs[i - 1].get(phase1_mask_key)
+                    if prev is not None:
+                        mem_mask = self._build_cross_attn_mask(prev, src_mask, n_global, 0)
+                phase1_tgt = layer(phase1_tgt, dec_memory, memory_mask=mem_mask,
+                                   memory_key_padding_mask=~dec_src_mask)
                 layer_outputs[i] = self._compute_layer_outputs(
                     phase1_tgt, memory, layer_id=i, gate_relevance=gate_relevance)
 
@@ -492,15 +528,22 @@ class MaskedReconstructionPart(nn.Module):
             chain_valid = src_mask.new_ones(B, self.num_query_tokens)
             extended_src_mask = torch.cat([dec_src_mask, chain_valid], dim=1)
             extended_memory = torch.cat([dec_memory, phase1_tgt], dim=1)
+            n_extra = self.num_query_tokens  # always-attendable phase-1-state columns
 
-            # Phase 2: warm-started queries attend to extended memory
+            # Phase 2: warm-started queries attend to extended memory. Layer 0 uses the
+            # phase-1 final phase-2 mask if present (forced when masked attention is on).
             phase2_tgt = phase1_tgt
+            prev_p2 = layer_outputs[n_phase1_layers - 1].get(phase2_mask_key)
             for j, layer in enumerate(phase2_stack):
                 layer_id = n_phase1_layers + j
-                phase2_tgt = layer(phase2_tgt, extended_memory,
+                mem_mask = None
+                if use_masked and prev_p2 is not None:
+                    mem_mask = self._build_cross_attn_mask(prev_p2, src_mask, n_global, n_extra)
+                phase2_tgt = layer(phase2_tgt, extended_memory, memory_mask=mem_mask,
                                    memory_key_padding_mask=~extended_src_mask)
                 layer_outputs[layer_id] = self._compute_layer_outputs(
                     phase2_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
+                prev_p2 = layer_outputs[layer_id].get(phase2_mask_key)
 
             # Phase-1 mask overwrite (flag): _compute_layer_outputs forces all heads at
             # the final layer, so the phase-1 mask gets recomputed using phase-2 queries.
@@ -539,7 +582,13 @@ class MaskedReconstructionPart(nn.Module):
                 layer_outputs[layer_id] = self._compute_layer_outputs(combined, memory, layer_id=layer_id, gate_relevance=gate_relevance)
         else:
             for i, layer in enumerate(self.decoder_stack):
-                tgt = layer(tgt, dec_memory, memory_key_padding_mask=~dec_src_mask)
+                mem_mask = None
+                if use_masked and i > 0:
+                    prev = layer_outputs[i - 1].get('mask_predictions')
+                    if prev is not None:
+                        mem_mask = self._build_cross_attn_mask(prev, src_mask, n_global, 0)
+                tgt = layer(tgt, dec_memory, memory_mask=mem_mask,
+                            memory_key_padding_mask=~dec_src_mask)
 
                 # Only compute heads needed at this layer (zero-weight layers are skipped)
                 layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i, gate_relevance=gate_relevance)
@@ -554,6 +603,42 @@ class MaskedReconstructionPart(nn.Module):
         
         return layer_outputs
     
+    def _build_cross_attn_mask(
+        self,
+        prev_mask_logits: torch.Tensor,   # [B, Q, N] particle-only mask logits (prev layer)
+        valid_particles: torch.Tensor,    # [B, N] bool, True = real particle
+        n_global: int,                    # always-attendable prefix columns (global token)
+        n_extra: int,                     # always-attendable suffix columns (phase-1 states)
+    ) -> torch.Tensor:
+        """
+        Build a boolean cross-attention mask (True = blocked) for masked cross-attention
+        (Mask2Former-style): each query attends only to particles inside its predicted
+        mask. Global-token and phase-1-state columns are always attendable.
+
+        Mandatory fallback: any query with zero allowed particles is allowed to attend
+        to all valid particles, preventing an all -inf softmax row (NaN under bf16).
+
+        Returns [B*n_heads, Q, S] with S = n_global + N + n_extra.
+        """
+        with torch.no_grad():
+            B, Q, N = prev_mask_logits.shape
+            allowed = (prev_mask_logits.detach() > 0.0) & valid_particles.bool().unsqueeze(1)  # [B,Q,N]
+            empty = ~allowed.any(dim=-1)                                       # [B, Q]
+            allowed = allowed | (empty.unsqueeze(-1) & valid_particles.bool().unsqueeze(1))
+            blocked_particles = ~allowed                                       # [B, Q, N]
+
+            pieces = []
+            if n_global > 0:
+                pieces.append(prev_mask_logits.new_zeros(B, Q, n_global, dtype=torch.bool))
+            pieces.append(blocked_particles)
+            if n_extra > 0:
+                pieces.append(prev_mask_logits.new_zeros(B, Q, n_extra, dtype=torch.bool))
+            blocked = torch.cat(pieces, dim=-1)                                # [B, Q, S]
+
+            S = blocked.shape[-1]
+            blocked = blocked.unsqueeze(1).expand(B, self.n_heads, Q, S)
+            return blocked.reshape(B * self.n_heads, Q, S)
+
     def _compute_layer_outputs(
         self,
         queries: torch.Tensor,  # [B, num_queries, embedding_size]

@@ -529,6 +529,14 @@ class ReconstructionTrainer(lightning.LightningModule):
             if param_groups:
                 self.lr_history.append(param_groups[0]['lr'])
 
+        # Masked cross-attention warm-up (Stage C): epoch-gated, rank-identical, DDP-safe.
+        if getattr(self.model, 'masked_cross_attention', False):
+            active = self.trainer.current_epoch >= self.model.masked_attention_start_epoch
+            if active != self.model.masked_attention_active and self.global_rank == 0:
+                print(f"[MaskedAttn] epoch {self.trainer.current_epoch}: "
+                      f"masked cross-attention {'ON' if active else 'OFF'}")
+            self.model.masked_attention_active = active
+
         # Mask-only pretraining phase transitions
         if self._pretrain_phase_active:
             epoch = self.trainer.current_epoch
