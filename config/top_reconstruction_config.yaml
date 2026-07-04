@@ -61,6 +61,16 @@ tasks:
   #   margin: 0.0
   #   layer_weight_strategy: final_only
 
+  # D4: soft invariant-mass loss (needs jet_p4_raw in the v2 data; chain_queries only).
+  # invariant_mass:
+  #   loss_weight: 0.05
+  #   layer_weight_strategy: final_only
+  #   m_w: 80.4
+  #   m_top: 172.5
+  #   width_w: 15.0
+  #   width_top: 25.0
+  #   huber_delta: 1.0
+
 pretraining:
   mask_pretrain_epochs: 0   # disabled for R&D — train all tasks from the start
   tasks: ["mask_W"]

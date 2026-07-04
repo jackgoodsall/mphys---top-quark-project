@@ -216,6 +216,74 @@ def binarise_predictions(scores, jet_valid, prior_k, use_probs, threshold=None):
     return pred_bin
 
 
+def decode_constrained(scores_top, scores_W, jet_valid, mode,
+                       k_top=3, k_W=2, bg_threshold=None, use_probs=False,
+                       enforce_w_subset=False):
+    """
+    Cross-chain-constrained decoding of top / W masks.
+
+    scores_top, scores_W : [N, Q, P] logits (or probs if use_probs).
+    mode:
+      "exclusive"       – per particle, argmax over chains; assign iff the winning
+                          score beats the background threshold (cross-chain exclusivity).
+      "exclusive_prior" – as above, but each chain is expanded into k slots and a
+                          per-event Hungarian assignment (scipy.linear_sum_assignment
+                          on -score) caps cardinality (k_top per top, k_W per W).
+    enforce_w_subset:   intersect each chain's W mask with its own top mask.
+
+    Returns (top_bin, W_bin) boolean arrays [N, Q, P].
+    """
+    if bg_threshold is None:
+        bg_threshold = 0.5 if use_probs else 0.0
+
+    N, Q, P = scores_top.shape
+    valid = jet_valid.astype(bool)                       # [N, P]
+
+    def _exclusive(scores):
+        # per particle: pick the best chain, keep it only if it beats bg_threshold
+        masked = np.where(valid[:, None, :], scores, -np.inf)      # [N, Q, P]
+        best_q = np.argmax(masked, axis=1)                         # [N, P]
+        best_s = np.max(masked, axis=1)                            # [N, P]
+        assign = best_s > bg_threshold                             # [N, P]
+        out = np.zeros((N, Q, P), dtype=bool)
+        n_idx, p_idx = np.nonzero(assign & valid)
+        out[n_idx, best_q[n_idx, p_idx], p_idx] = True
+        return out
+
+    def _exclusive_prior(scores, k):
+        from scipy.optimize import linear_sum_assignment
+        out = np.zeros((N, Q, P), dtype=bool)
+        S = Q * k
+        for n in range(N):
+            vmask = valid[n]                                        # [P]
+            cols = np.nonzero(vmask)[0]
+            if cols.size == 0:
+                continue
+            # rows = Q*k slots, each slot belongs to chain slot_chain[r]
+            slot_chain = np.repeat(np.arange(Q), k)                 # [S]
+            cost = -scores[n][slot_chain][:, cols]                 # [S, n_valid]
+            # only assign slots whose best score beats bg (leave others unassigned)
+            r_idx, c_idx = linear_sum_assignment(cost)
+            for r, c in zip(r_idx, c_idx):
+                if -cost[r, c] > bg_threshold:
+                    out[n, slot_chain[r], cols[c]] = True
+        return out
+
+    if mode == "exclusive":
+        top_bin = _exclusive(scores_top)
+        W_bin   = _exclusive(scores_W)
+    elif mode == "exclusive_prior":
+        top_bin = _exclusive_prior(scores_top, k_top)
+        W_bin   = _exclusive_prior(scores_W, k_W)
+    else:
+        raise ValueError(f"Unknown constrained decode mode: {mode}")
+
+    if enforce_w_subset:
+        W_bin = W_bin & top_bin
+
+    return top_bin, W_bin
+
+
 # ---------------------------------------------------------------------------
 # Core efficiency computation
 # ---------------------------------------------------------------------------
@@ -390,6 +458,10 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     ttbar_eff = (all_tops_perfect & both_tops).sum() / max(both_tops.sum(), 1)
     all_eff   = perfect_all.sum()                    / len(perfect_all)
 
+    # Headline: event-level exact-match — every real object (both tops AND their Ws)
+    # perfectly reconstructed. Denominator = events with both chains real.
+    exact_match = (perfect_all & both_tops).sum() / max(both_tops.sum(), 1)
+
     # ── Purity (from objectness predictions) ──
     # Use top objectness for top purity, W objectness for W purity.
     # "obj_purity" (chain-level) uses top objectness as the primary indicator.
@@ -453,6 +525,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         "W_eff":     float(W_eff),
         "ttbar_eff": float(ttbar_eff),
         "all_eff":   float(all_eff),
+        "exact_match": float(exact_match),
         "obj_purity":       obj_purity,
         "ttbar_purity":     ttbar_purity,
         "top_purity":       top_purity,
@@ -494,7 +567,14 @@ def print_results(run_dir: Path, results: dict):
 
     print(f"\n=== Evaluation (chain_queries): {run_dir} ===")
     print(f"Events: {N:,}  |  Query slots Q: {Q}  |  Particles P: {P}")
-    print(f"Scores: {scores_str}  |  Binarisation: {prior_str}\n")
+    print(f"Scores: {scores_str}  |  Binarisation: {results.get('decode', prior_str)}\n")
+
+    # Headline metric (printed FIRST): event-level exact-match.
+    if "exact_match" in results:
+        print("━" * 70)
+        print(f"  HEADLINE  event-level exact-match (both tops+Ws correct):  "
+              f"{results['exact_match']*100:6.2f}%   (N={results['n_both_tops']:,})")
+        print("━" * 70)
 
     mode_parts = []
     if results.get("strict"):
@@ -960,6 +1040,23 @@ def main():
         "--require_top_for_w", action="store_true",
         help="Only count a W as real when its corresponding top is also real",
     )
+    parser.add_argument(
+        "--decode", choices=["threshold", "topk", "exclusive", "exclusive_prior"],
+        default="threshold",
+        help=(
+            "Decoding strategy. 'threshold'/'topk' use --threshold/--prior (default). "
+            "'exclusive' = per-particle argmax over chains (cross-chain exclusivity). "
+            "'exclusive_prior' = exclusive + per-chain cardinality via Hungarian."
+        ),
+    )
+    parser.add_argument(
+        "--enforce_w_subset", action="store_true",
+        help="Constrained decoding: intersect each chain's W mask with its top mask.",
+    )
+    parser.add_argument(
+        "--compare_decodings", action="store_true",
+        help="Print top/W/ttbar efficiency + exact-match side-by-side for all decodings.",
+    )
     args = parser.parse_args()
 
     # Parse --prior top=3 W=2
@@ -991,21 +1088,56 @@ def main():
         run_dir, args.data_file, use_probs=args.use_probs
     )
 
-    results = compute_efficiencies(
-        pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
-        jet_valid, target_obj_top,
-        pred_obj_top=pred_obj_top, target_obj_W=target_obj_W,
-        pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
-        use_probs=args.use_probs, threshold=args.threshold, strict=args.strict,
-        joint=args.joint, original_mult=original_mult,
-        valid_tops_truth=valid_tops_truth,
-        valid_Ws_truth=valid_Ws_truth,
-        slot_valid_top=slot_valid_top,
-        slot_valid_W=slot_valid_W,
+    _common = dict(
+        target_obj_W=target_obj_W, original_mult=original_mult,
+        valid_tops_truth=valid_tops_truth, valid_Ws_truth=valid_Ws_truth,
+        slot_valid_top=slot_valid_top, slot_valid_W=slot_valid_W,
         legacy_output_targets=args.legacy_output_targets,
         require_complete_truth=args.require_complete_truth,
         require_top_for_w=args.require_top_for_w,
+        strict=args.strict, joint=args.joint,
     )
+
+    def _run_decode(decode):
+        if decode in ("threshold", "topk"):
+            res = compute_efficiencies(
+                pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
+                jet_valid, target_obj_top, pred_obj_top=pred_obj_top,
+                pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
+                use_probs=args.use_probs, threshold=args.threshold, **_common,
+            )
+        else:
+            top_bin, W_bin = decode_constrained(
+                pred_scores_top, pred_scores_W, jet_valid, mode=decode,
+                k_top=(prior_top or 3), k_W=(prior_W or 2),
+                use_probs=args.use_probs, enforce_w_subset=args.enforce_w_subset,
+            )
+            # Feed binarised masks back through the standard pipeline as {0,1}
+            # pseudo-probabilities at threshold 0.5 (recovers the exact masks).
+            res = compute_efficiencies(
+                top_bin.astype(np.float32), target_masks_top,
+                W_bin.astype(np.float32), target_masks_W,
+                jet_valid, target_obj_top, pred_obj_top=pred_obj_top,
+                pred_obj_W=pred_obj_W, prior_top=None, prior_W=None,
+                use_probs=True, threshold=0.5, **_common,
+            )
+        res["decode"] = decode
+        return res
+
+    if args.compare_decodings:
+        modes = ["threshold", "exclusive", "exclusive_prior"]
+        all_res = {m: _run_decode(m) for m in modes}
+        print(f"\n=== Decoding comparison: {run_dir} ===")
+        hdr = f"  {'decode':<16}{'top_eff':>9}{'W_eff':>9}{'ttbar_eff':>11}{'exact_match':>13}"
+        print(hdr); print("  " + "-" * (len(hdr) - 2))
+        for m in modes:
+            r = all_res[m]
+            print(f"  {m:<16}{r['top_eff']*100:>8.2f}%{r['W_eff']*100:>8.2f}%"
+                  f"{r['ttbar_eff']*100:>10.2f}%{r['exact_match']*100:>12.2f}%")
+        results = all_res[args.decode if args.decode in modes else "threshold"]
+    else:
+        results = _run_decode(args.decode)
+
     print_results(run_dir, results)
 
     if args.plot:

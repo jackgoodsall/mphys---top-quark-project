@@ -206,6 +206,8 @@ def masked_former_collate_fn(batch):
             batched_targets['kinematics'] = tk
         if 'classes' in targets[0]:
             batched_targets['classes'] = torch.zeros(B, 0, dtype=torch.long)
+        if 'jet_p4_raw' in targets[0]:
+            batched_targets['jet_p4_raw'] = torch.stack([t['jet_p4_raw'] for t in targets])
         return batched_samples, batched_targets
 
     # Pre-allocate and fill jet_mask_true [B, T_max, P]
@@ -273,6 +275,10 @@ def masked_former_collate_fn(batch):
             nt[i] = t['neutrino_truth']
         batched_targets['neutrino_truth'] = nt
 
+    # Invariant-mass loss: raw per-particle 4-vectors [B, N, 4] (fixed shape).
+    if 'jet_p4_raw' in targets[0]:
+        batched_targets['jet_p4_raw'] = torch.stack([t['jet_p4_raw'] for t in targets])
+
     return batched_samples, batched_targets
 
 
@@ -280,8 +286,9 @@ class MaskedFormerDataSet(Dataset):
     """In-memory dataset. Used by analysis scripts and as a fallback."""
 
     def __init__(self, jet, interactions, src_mask, targets, target_kinematics,
-                 classes=None, object_valid=None, augmenter=None):
+                 classes=None, object_valid=None, augmenter=None, jet_p4_raw=None):
         self.augmenter = augmenter
+        self.jet_p4_raw = np.asarray(jet_p4_raw) if jet_p4_raw is not None else None
         self.jet = np.asarray(jet)
         self.src_mask = np.asarray(src_mask)
         self.targets = np.asarray(targets)
@@ -326,6 +333,10 @@ class MaskedFormerDataSet(Dataset):
             target["object_valid"] = torch.from_numpy(
                 np.asarray(self.object_valid[idx])
             ).bool()
+        if self.jet_p4_raw is not None:
+            target["jet_p4_raw"] = torch.from_numpy(
+                np.asarray(self.jet_p4_raw[idx])
+            ).float()
 
         if self.augmenter is not None:
             sample, target = self.augmenter(sample, target)
@@ -371,6 +382,7 @@ class LazyHDF5Dataset(Dataset):
             self._has_particle_type  = "particle_type"  in f
             self._has_globals        = "globals"         in f
             self._has_neutrino_truth = "neutrino_truth"  in f
+            self._has_jet_p4_raw     = "jet_p4_raw"      in f
 
         # Pre-compute per-event classes and object_valid (small arrays).
         # These stay in RAM; everything else is read lazily.
@@ -470,6 +482,10 @@ class LazyHDF5Dataset(Dataset):
             target["neutrino_truth"] = torch.from_numpy(
                 self._file["neutrino_truth"][idx]
             ).float()  # [2, K]
+        if self._has_jet_p4_raw:
+            target["jet_p4_raw"] = torch.from_numpy(
+                self._file["jet_p4_raw"][idx]
+            ).float()  # [N, 4] raw (E, px, py, pz)
 
         if self.augmenter is not None:
             sample, target = self.augmenter(sample, target)
@@ -502,7 +518,7 @@ class MemmapDataset(Dataset):
         """
         npy_dir = MemmapDataset.npy_dir(h5_path)
         npy_dir.mkdir(exist_ok=True)
-        keys_to_save = ["jet", "src_mask"]
+        keys_to_save = ["jet", "src_mask", "jet_p4_raw"]
         if load_interactions:
             keys_to_save.append("interactions")
         for k in [tops_mask_key, tops_kin_key, ws_mask_key, ws_kin_key,
@@ -534,6 +550,7 @@ class MemmapDataset(Dataset):
 
         self._jet = _mmap("jet")
         self._src_mask = _mmap("src_mask")
+        self._jet_p4_raw = _mmap("jet_p4_raw")
         self._interactions = _mmap("interactions") if load_interactions else None
 
         self._tops_masks = _mmap(tops_mask_key) if tops_mask_key else None
@@ -605,6 +622,10 @@ class MemmapDataset(Dataset):
             target["object_valid"] = torch.from_numpy(
                 self.object_valid[idx]
             ).bool()
+        if self._jet_p4_raw is not None:
+            target["jet_p4_raw"] = torch.from_numpy(
+                np.array(self._jet_p4_raw[idx])
+            ).float()
 
         if self.augmenter is not None:
             sample, target = self.augmenter(sample, target)
@@ -723,6 +744,8 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             valid_tops = f["valid_tops"][()] if "valid_tops" in f else None
             valid_Ws = f["valid_Ws"][()] if "valid_Ws" in f else None
 
+            jet_p4_raw = f["jet_p4_raw"][()] if "jet_p4_raw" in f else None
+
         masks, kins, classes, object_valid = merge_object_types(
             tops_masks, tops_kins, ws_masks, ws_kins, valid_tops, valid_Ws
         )
@@ -738,6 +761,7 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             classes=classes,
             object_valid=object_valid if has_partial else None,
             augmenter=augmenter,
+            jet_p4_raw=jet_p4_raw,
         )
         return ds
 

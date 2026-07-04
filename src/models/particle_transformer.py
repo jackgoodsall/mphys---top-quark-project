@@ -707,6 +707,8 @@ class MaskedReconstructionPart(nn.Module):
                 batched['kinematics'] = batched['target_kinematics']
             if 'classes' in targets_list[0]:
                 batched['classes'] = torch.zeros(B, 0, dtype=torch.long, device=device)
+            if 'jet_p4_raw' in targets_list[0]:
+                batched['jet_p4_raw'] = torch.stack([t['jet_p4_raw'] for t in targets_list])
             target_valid_mask = torch.zeros(B, 0, dtype=torch.bool, device=device)
             return batched, target_valid_mask
 
@@ -728,6 +730,10 @@ class MaskedReconstructionPart(nn.Module):
                 [t['jet_valid_mask'] for t in targets_list]
             ),  # [B, P]
         }
+
+        # Raw per-particle 4-vectors (fixed shape) for the invariant-mass loss.
+        if 'jet_p4_raw' in targets_list[0]:
+            batched['jet_p4_raw'] = torch.stack([t['jet_p4_raw'] for t in targets_list])
 
         # Pad and stack target_kinematics if present
         if 'target_kinematics' in targets_list[0]:
@@ -948,6 +954,11 @@ class MaskedReconstructionPart(nn.Module):
             'jet_valid_mask': targets_batched['jet_valid_mask'],  # [B, P]
             'obj_valid_mask': obj_valid_mask,  # [B, Q]
         }
+
+        # Raw per-particle 4-vectors pass through UNPADDED (per-particle, like
+        # jet_valid_mask — not the T->Q object padding) for the invariant-mass loss.
+        if 'jet_p4_raw' in targets_batched:
+            padded_targets['jet_p4_raw'] = targets_batched['jet_p4_raw']
 
         # Pad jet_mask_true [B, T_max, P] -> [B, Q, P]
         jmt = targets_batched['jet_mask_true']  # already 3D

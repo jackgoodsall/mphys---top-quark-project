@@ -1725,6 +1725,92 @@ class MaskHierarchyConsistencyTask(BaseTask):
         return self.config.get_loss_weight('consistency') * loss
 
 
+class InvariantMassTask(BaseTask):
+    """
+    Soft invariant-mass loss (headless, no params, zero matching cost).
+
+    Reconstructs each chain's top and W 4-vectors as a soft (sigmoid-weighted)
+    sum of the raw particle 4-vectors ``jet_p4_raw`` [B, N, 4] = (E, px, py, pz),
+    computes the invariant mass, and applies a width-normalised Huber loss toward
+    m_top / m_W. Hadronic chains only (leptonic chains lack the neutrino, so their
+    reconstructed mass is meaningless). Runs in an fp32 island for numerical safety.
+    """
+
+    def __init__(self, config: TaskConfig, m_w: float = 80.4, m_top: float = 172.5,
+                 width_w: float = 15.0, width_top: float = 25.0, huber_delta: float = 1.0):
+        super().__init__(config)
+        self.m_w = m_w
+        self.m_top = m_top
+        self.width_w = width_w
+        self.width_top = width_top
+        self.huber_delta = huber_delta
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        ref = predictions.get('mask_predictions', next(iter(predictions.values())))
+        B, Q, _ = ref.shape
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=ref.device)
+
+    def _mass_term(self, mask_logits, p4, jet_valid, sel, m_target, width):
+        # mask_logits [B,Q,N]; p4 [B,N,4]; jet_valid [B,N]; sel [B,Q] bool
+        probs = mask_logits.sigmoid().float() * jet_valid[:, None, :]     # [B,Q,N]
+        P4 = torch.einsum('bqn,bnk->bqk', probs, p4)                      # [B,Q,4]
+        E, px, py, pz = P4[..., 0], P4[..., 1], P4[..., 2], P4[..., 3]
+        m2 = (E * E - px * px - py * py - pz * pz).clamp(min=0.0)
+        m = torch.sqrt(m2 + 1e-6)
+        z = (m - m_target) / width                                       # [B,Q]
+        z_sel = z[sel]
+        if z_sel.numel() == 0:
+            return mask_logits.new_tensor(0.0), 0
+        loss = F.huber_loss(z_sel, torch.zeros_like(z_sel),
+                            delta=self.huber_delta, reduction='sum')
+        return loss, z_sel.numel()
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if 'mask_predictions' not in predictions or 'mask_W' not in predictions:
+            ref = next(iter(predictions.values()))
+            return ref.new_tensor(0.0)
+        p4 = targets.get('jet_p4_raw')
+        if p4 is None:
+            return predictions['mask_predictions'].new_tensor(0.0)
+
+        top_logits = predictions['mask_predictions']
+        w_logits = predictions['mask_W']
+        B, Q, N = top_logits.shape
+
+        jet_valid = valid_mask if valid_mask is not None else targets.get('jet_valid_mask')
+        jet_valid = top_logits.new_ones(B, N) if jet_valid is None else jet_valid.float()
+
+        obj_valid = targets.get('obj_valid_mask')
+        if obj_valid is not None:
+            sel = obj_valid.bool()
+        else:
+            sel = torch.ones(B, Q, dtype=torch.bool, device=top_logits.device)
+        ct = targets.get('chain_type')
+        if ct is not None:
+            sel = sel & (ct == 0)   # hadronic chains only
+
+        with torch.autocast(device_type=top_logits.device.type, enabled=False):
+            p4f = p4.float()
+            top_loss, n_top = self._mass_term(top_logits, p4f, jet_valid, sel, self.m_top, self.width_top)
+            w_loss, n_w = self._mass_term(w_logits, p4f, jet_valid, sel, self.m_w, self.width_w)
+
+        n = n_top + n_w
+        if n == 0:
+            return top_logits.new_tensor(0.0)
+        total = (top_loss + w_loss) / n
+        return self.config.get_loss_weight('invariant_mass') * total
+
+
 class BackgroundSuppressionTask(BaseTask):
     """
     Penalises high mask logits for background particles (not in any real GT mask)

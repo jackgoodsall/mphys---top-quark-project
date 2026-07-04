@@ -17,6 +17,7 @@ from models.components.masked_former_tasks import (
     BackgroundSuppressionTask, ParticleGatingTask,
     ChainTypeTask, NeutrinoRegressionTask,
     ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
+    InvariantMassTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
@@ -301,6 +302,34 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             margin=cons_config.get('margin', 0.0),
         )
         task_registry.register_task(cons_task)
+
+    # ========================================
+    # Invariant-Mass Task (soft m(top)/m(W) constraint; chain_queries only)
+    # ========================================
+    im_config = task_configs.get("invariant_mass")
+    if im_config and chain_queries:
+        im_task = InvariantMassTask(
+            TaskConfig(
+                name='invariant_mass',
+                output_names=['mask_predictions', 'mask_W'],
+                output_dims={},
+                cost_weights={},
+                loss_weights={'invariant_mass': im_config.get('loss_weight', 0.05)},
+                max_objects=max_objects,
+                layer_weights=_build_layer_weights(
+                    layer_config=im_config.get('layer_weights'),
+                    strategy=im_config.get('layer_weight_strategy', 'final_only'),
+                    strategy_params=im_config.get('layer_weight_params', {}),
+                    n_layers=n_decoder_layers,
+                ),
+            ),
+            m_w=im_config.get('m_w', 80.4),
+            m_top=im_config.get('m_top', 172.5),
+            width_w=im_config.get('width_w', 15.0),
+            width_top=im_config.get('width_top', 25.0),
+            huber_delta=im_config.get('huber_delta', 1.0),
+        )
+        task_registry.register_task(im_task)
 
     # ========================================
     # Background Suppression Task
