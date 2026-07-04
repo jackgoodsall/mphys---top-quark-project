@@ -18,6 +18,8 @@
 set -euo pipefail
 
 export UV_PROJECT_ENVIRONMENT=.transformer_env
+# preprocessing.py imports both `from src.data_utils...` and `from kinematics...`.
+export PYTHONPATH="/net/scratch/b58521jg/transformers:/net/scratch/b58521jg/transformers/src:${PYTHONPATH:-}"
 
 echo "=== Stage D v2 preprocessing ==="
 echo "Start: $(date)   Node: ${SLURM_NODELIST:-local}"

@@ -16,6 +16,9 @@ module load libs/cuda
 export CUDA_VISIBLE_DEVICES=0,1
 export UV_PROJECT_ENVIRONMENT=.transformer_env
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+# main.py uses `from models...` (needs src/) while modules use `from src.models...`
+# (needs repo root). Put both on the path.
+export PYTHONPATH="/net/scratch/b58521jg/transformers:/net/scratch/b58521jg/transformers/src:${PYTHONPATH:-}"
 
 source .transformer_env/bin/activate
 
