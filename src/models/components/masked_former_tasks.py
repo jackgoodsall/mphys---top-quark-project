@@ -235,6 +235,7 @@ class MaskReconstructionTask(BaseTask):
         pred_key: str = 'mask_predictions',
         target_key: str = 'jet_mask_true',
         bce_pos_weight: bool = False,
+        cost_bce_weight: float = 0.0,
     ):
         super().__init__(config)
         self.pred_key = pred_key
@@ -242,6 +243,10 @@ class MaskReconstructionTask(BaseTask):
         self.eps = 1e-6  # Increased from 1e-8 for better numerical stability in Dice loss
         self.null_mask_penalty = null_mask_penalty
         self.bce_pos_weight = bce_pos_weight
+        # Weight on a BCE term added to the Hungarian matching cost (0.0 = Dice-only,
+        # bitwise-identical to previous behaviour). Complements the Dice cost with a
+        # per-particle assignment signal so matching is less degenerate on small masks.
+        self.cost_bce_weight = cost_bce_weight
         # 0.0 = suppressed (during mask-only pretraining), 1.0 = full penalty.
         # Ramped from 0→1 during phase transition to avoid "predict nothing" snap-on.
         self.null_penalty_scale = 1.0
@@ -257,28 +262,48 @@ class MaskReconstructionTask(BaseTask):
         predictions: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
-        """Compute mask cost using Dice coefficient"""
-        pred_masks = predictions[self.pred_key].sigmoid()
+        """Compute mask cost using Dice coefficient (+ optional BCE term)"""
+        logits = predictions[self.pred_key]
+        pred_masks = logits.sigmoid()
         target_masks = targets[self.target_key].float()
-        
+
         # Handle 2D targets
         if target_masks.ndim == 2:
             target_masks = target_masks.unsqueeze(1)
-        
+
         B, num_queries, N = pred_masks.shape
         num_targets = target_masks.shape[1]
-        
+
         # Compute pairwise Dice
         pred_expanded = pred_masks.unsqueeze(2)
         target_expanded = target_masks.unsqueeze(1)
-        
+
         intersection = (pred_expanded * target_expanded).sum(dim=-1)
         pred_sizes = pred_masks.sum(dim=-1, keepdim=True)
         target_sizes = target_masks.sum(dim=-1).unsqueeze(1)
-        
+
         dice = (2 * intersection) / (pred_sizes + target_sizes + self.eps)
-        cost = self.config.cost_weights['mask'] * (1 - dice)
-        
+        w_dice = self.config.cost_weights['mask']
+        cost = w_dice * (1 - dice)
+
+        # Optional per-particle BCE matching term. Runs under no_grad (matching);
+        # cast to float to avoid bf16 saturation of logsigmoid. Normalised by the
+        # number of valid particles so it scales O(1) like the Dice term.
+        if self.cost_bce_weight > 0:
+            logits_f = logits.float()
+            valid = targets.get('jet_valid_mask')
+            if valid is None:
+                valid = logits_f.new_ones(B, N)
+            else:
+                valid = valid.float()
+            tgt = target_masks                                  # [B, T, N]
+            pos = -F.logsigmoid(logits_f) * valid[:, None, :]   # [B, Q, N]
+            neg = -F.logsigmoid(-logits_f) * valid[:, None, :]  # [B, Q, N]
+            bce_cost = (torch.einsum('bqn,btn->bqt', pos, tgt)
+                        + torch.einsum('bqn,btn->bqt', neg, (1 - tgt) * valid[:, None, :]))
+            bce_cost = bce_cost / valid.sum(-1).clamp(min=1)[:, None, None]
+            cost = cost + self.cost_bce_weight * bce_cost
+
         return cost
     
     def compute_loss(

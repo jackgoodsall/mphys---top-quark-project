@@ -88,6 +88,7 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         ),
         null_mask_penalty=mask_config.get('null_mask_penalty', 0.1),
         bce_pos_weight=mask_config.get('bce_pos_weight', False),
+        cost_bce_weight=mask_config.get('cost_bce_weight', 0.0),
     )
     task_registry.register_task(mask_task)
 
@@ -121,6 +122,7 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             ),
             null_mask_penalty=mask_W_config.get('null_mask_penalty', mask_config.get('null_mask_penalty', 0.1)),
             bce_pos_weight=mask_W_config.get('bce_pos_weight', mask_config.get('bce_pos_weight', False)),
+            cost_bce_weight=mask_W_config.get('cost_bce_weight', mask_config.get('cost_bce_weight', 0.0)),
             pred_key='mask_W',
             target_key='jet_mask_true_W',
         )
@@ -133,26 +135,30 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
     # ========================================
     obj_config = task_configs.get("objectness", {})
 
-    obj_layer_weights = _build_layer_weights(
-        layer_config=obj_config.get('layer_weights'),
-        strategy=obj_config.get('layer_weight_strategy'),
-        strategy_params=obj_config.get('layer_weight_params', {}),
-        n_layers=n_decoder_layers
-    )
+    # Conditional registration (DDP-safe on/off): default enabled = baseline.
+    # NOTE: old checkpoints were trained WITH objectness — set enabled: true to
+    # load / test such a run.
+    if obj_config.get('enabled', True):
+        obj_layer_weights = _build_layer_weights(
+            layer_config=obj_config.get('layer_weights'),
+            strategy=obj_config.get('layer_weight_strategy'),
+            strategy_params=obj_config.get('layer_weight_params', {}),
+            n_layers=n_decoder_layers
+        )
 
-    objectness_task = ObjectnessTask(
-        TaskConfig(
-            name='objectness',
-            output_names=['objectness_logit'],
-            output_dims={'objectness_logit': 1},
-            cost_weights={'objectness': obj_config.get('cost_weight', 1.0)},
-            loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
-            max_objects=max_objects,
-            layer_weights=obj_layer_weights,
-            head_norm=obj_config.get('head_norm', False),
-        ),
-    )
-    task_registry.register_task(objectness_task)
+        objectness_task = ObjectnessTask(
+            TaskConfig(
+                name='objectness',
+                output_names=['objectness_logit'],
+                output_dims={'objectness_logit': 1},
+                cost_weights={'objectness': obj_config.get('cost_weight', 1.0)},
+                loss_weights={'objectness': obj_config.get('loss_weight', 1.0)},
+                max_objects=max_objects,
+                layer_weights=obj_layer_weights,
+                head_norm=obj_config.get('head_norm', False),
+            ),
+        )
+        task_registry.register_task(objectness_task)
 
     # ========================================
     # Object Type Task (top vs W classification)

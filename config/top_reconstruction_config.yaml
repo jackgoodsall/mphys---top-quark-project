@@ -1,6 +1,15 @@
 max_objects: 2   # chain_queries: one query per decay chain
 
 
+# ============================================================================
+# Experiment matrix (Stage A3) — run as separate SLURM jobs, each toggling
+# one axis relative to this baseline:
+#   E1  mask_W.bce_pos_weight: true  (already supported end-to-end)
+#   E2  transformer.n_heads: 8  +  interaction_embedder.output_size: 8  (move together)
+#   E3  transformer.p_dropout: 0.05  or  0.1
+#   E4  transformer.hierarchy_order: top_first  + swap mask/mask_W layer_weights
+#   E5  mask.cost_bce_weight: 0.5  (BCE term in Hungarian cost, Stage A2)
+# ============================================================================
 tasks:
 
   # --- w_first layer weights (active) ---
@@ -9,6 +18,7 @@ tasks:
     dice_weight: 1.0
     bce_weight: 0.5
     null_mask_penalty: 0.2
+    cost_bce_weight: 0.0       # E5: BCE term added to Hungarian matching cost (0 = Dice-only)
     layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
 
   mask_W:
@@ -16,9 +26,11 @@ tasks:
     dice_weight: 1.0
     bce_weight: 0.5
     null_mask_penalty: 0.2
+    cost_bce_weight: 0.0       # falls back to mask.cost_bce_weight if omitted
     layer_weights: {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
 
   objectness:
+    enabled: True             # conditional registration; old ckpts trained WITH objectness
     cost_weight: 0
     loss_weight: 0
     head_norm: True
