@@ -150,6 +150,8 @@ class MaskedReconstructionPart(nn.Module):
                  enable_leptonic: bool = False,
                  global_dim: int = 0,
                  global_hidden_sizes: Optional[List[int]] = None,
+                 mask_logit_scale: bool = False,
+                 phase1_mask_overwrite: bool = True,
                  **kwargs
                  ):
         super().__init__()
@@ -163,6 +165,15 @@ class MaskedReconstructionPart(nn.Module):
         self.use_mia_encoder = use_mia_encoder
         self.use_vanilla_attention = use_vanilla_attention
         self.enable_leptonic = enable_leptonic
+
+        # Mask-logit √d scaling (B1) — attention-style temperature on the query·memory
+        # dot product. Independent of the mask-embed MLP; recommended together.
+        self.mask_logit_scale = mask_logit_scale
+        self._mask_scale = embedding_size ** -0.5
+        # Phase-1 mask overwrite (B1) — when True (baseline) the final layer's phase-1
+        # mask is replaced by the phase-1 final-layer output (both forward + matching).
+        # Turn OFF once a dedicated W-mask head + deep supervision are on.
+        self.phase1_mask_overwrite = phase1_mask_overwrite
 
         # Leptonic-extension: type embedding (0=jet, 1=lepton) and global token
         if enable_leptonic:
@@ -309,22 +320,37 @@ class MaskedReconstructionPart(nn.Module):
         Each task defines what outputs it needs.
         """
         heads = nn.ModuleDict()
-        
+
         # Collect all unique output names from all tasks
-        output_specs = {}  # {output_name: (output_dim, head_norm)}
+        output_specs = {}  # {output_name: (output_dim, head_norm, mask_embed_head)}
 
         for task in self.task_registry.tasks.values():
             for output_name in task.config.output_names:
                 if output_name not in output_specs:
                     output_dim = task.config.output_dims.get(output_name)
-                    output_specs[output_name] = (output_dim, task.config.head_norm)
+                    output_specs[output_name] = (
+                        output_dim, task.config.head_norm, task.config.mask_embed_head)
 
         # Build heads for each output type
         MASK_OUTPUT_NAMES = {'mask_predictions', 'mask_W'}
-        for output_name, (output_dim, head_norm) in output_specs.items():
+        for output_name, (output_dim, head_norm, mask_embed_head) in output_specs.items():
             if output_name in MASK_OUTPUT_NAMES:
-                # Mask logits computed via query-memory dot product (einsum), not a learned head.
-                heads[output_name] = nn.Identity()
+                # Mask logits = dot product of a (possibly transformed) query embedding
+                # with the encoder memory. Identity (default) reproduces the raw
+                # query·memory logit; the MLP gives each mask output its own learned
+                # embedding so the two mask heads stop sharing one distribution.
+                if mask_embed_head:
+                    layers = []
+                    if head_norm:
+                        layers.append(nn.LayerNorm(embedding_size))
+                    layers.extend([
+                        nn.Linear(embedding_size, embedding_size),
+                        nn.GELU(),
+                        nn.Linear(embedding_size, embedding_size),
+                    ])
+                    heads[output_name] = nn.Sequential(*layers)
+                else:
+                    heads[output_name] = nn.Identity()
             elif output_dim is not None:
                 layers = []
                 if head_norm:
@@ -476,13 +502,16 @@ class MaskedReconstructionPart(nn.Module):
                 layer_outputs[layer_id] = self._compute_layer_outputs(
                     phase2_tgt, memory, layer_id=layer_id, gate_relevance=gate_relevance)
 
-            # Fix: _compute_layer_outputs forces all heads at the final layer,
-            # so phase-1 mask gets recomputed using phase-2 queries (wrong).
-            # Replace it with the correct output from the phase-1 final layer.
-            phase1_final = n_phase1_layers - 1
-            final_layer = n_phase1_layers + len(phase2_stack) - 1
-            if phase1_mask_key in layer_outputs.get(phase1_final, {}):
-                layer_outputs[final_layer][phase1_mask_key] = layer_outputs[phase1_final][phase1_mask_key]
+            # Phase-1 mask overwrite (flag): _compute_layer_outputs forces all heads at
+            # the final layer, so the phase-1 mask gets recomputed using phase-2 queries.
+            # When enabled (baseline) replace it with the phase-1 final-layer output.
+            # When disabled, the dedicated phase-native mask head predicts from phase-2
+            # queries and every layer is supervised on its own outputs (Mask2Former-style).
+            if self.phase1_mask_overwrite:
+                phase1_final = n_phase1_layers - 1
+                final_layer = n_phase1_layers + len(phase2_stack) - 1
+                if phase1_mask_key in layer_outputs.get(phase1_final, {}):
+                    layer_outputs[final_layer][phase1_mask_key] = layer_outputs[phase1_final][phase1_mask_key]
 
         elif self.hierarchical_decoding:
             # --- Original 4-query hierarchical decode (top + W split) ---
@@ -545,7 +574,12 @@ class MaskedReconstructionPart(nn.Module):
             if output_name not in needed:
                 continue
             if output_name in MASK_OUTPUT_NAMES:
-                outputs[output_name] = torch.einsum("bnd,bmd->bnm", queries, memory)
+                # head is Identity (default) or a mask-embedding MLP (B1).
+                q_emb = head(queries)
+                logits = torch.einsum("bnd,bmd->bnm", q_emb, memory)
+                if self.mask_logit_scale:
+                    logits = logits * self._mask_scale
+                outputs[output_name] = logits
             else:
                 outputs[output_name] = head(queries)
 
@@ -725,7 +759,7 @@ class MaskedReconstructionPart(nn.Module):
         with torch.no_grad():
             final_layer = max(decoder_outputs.keys())
 
-            if self.chain_queries:
+            if self.chain_queries and self.phase1_mask_overwrite:
                 # Matching cost must use phase-1 mask from the phase-1 final layer,
                 # not from phase-2 queries (which would be incorrect).
                 if self.hierarchy_order == "top_first":
@@ -741,6 +775,9 @@ class MaskedReconstructionPart(nn.Module):
                 if phase1_final_id in decoder_outputs and phase1_mask_key in decoder_outputs[phase1_final_id]:
                     final_output[phase1_mask_key] = decoder_outputs[phase1_final_id][phase1_mask_key]
             else:
+                # Overwrite off (or non-chain): match against each head's own final-layer
+                # output — requires the phase-native mask head to be supervised at the
+                # final layer, which deep-supervision layer weights (B2) provide.
                 final_output = decoder_outputs[final_layer]
 
             cost_matrix = self.task_registry.compute_total_cost(

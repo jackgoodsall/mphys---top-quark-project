@@ -23,6 +23,7 @@ class TaskConfig:
     max_objects: int
     layer_weights: Optional[Dict[int, float]] = None
     head_norm: bool = False  # LayerNorm before prediction head MLP
+    mask_embed_head: bool = False  # mask outputs: learned MLP on queries before the einsum
     
     def get_layer_weight(self, layer_id: int) -> float:
         """Get weight for a specific layer"""

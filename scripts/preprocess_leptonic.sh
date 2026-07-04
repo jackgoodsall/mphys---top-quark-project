@@ -13,10 +13,10 @@
 # Or run interactively:
 #   bash scripts/preprocess_leptonic.sh
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH -p cpu               # CPU partition — preprocessing needs no GPU
+#SBATCH -p serial               # CPU partition — preprocessing needs no GPU
 #SBATCH --time=4:00:00       # Wall time: 4 hours (generous for ~30M events)
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --job-name=preprocess_leptonic
 #SBATCH --output=slurm_outputs/preprocess_leptonic_%j.out

@@ -19,7 +19,10 @@ tasks:
     bce_weight: 0.5
     null_mask_penalty: 0.2
     cost_bce_weight: 0.0       # E5: BCE term added to Hungarian matching cost (0 = Dice-only)
+    mask_embed_head: false     # B1: learned MLP on queries before the mask einsum
     layer_weights: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 1.0}
+    # B2 deep-supervision weights (use with mask_embed_head + phase1_mask_overwrite off):
+    # layer_weights: {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.3, 4: 0.5, 5: 1.0}
 
   mask_W:
     cost_weight: 1.0
@@ -27,7 +30,10 @@ tasks:
     bce_weight: 0.5
     null_mask_penalty: 0.2
     cost_bce_weight: 0.0       # falls back to mask.cost_bce_weight if omitted
+    mask_embed_head: false     # falls back to mask.mask_embed_head if omitted
     layer_weights: {0: 0.0, 1: 0.5, 2: 1.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    # B2 deep-supervision weights:
+    # layer_weights: {0: 0.3, 1: 0.5, 2: 1.0, 3: 0.2, 4: 0.2, 5: 1.0}
 
   objectness:
     enabled: True             # conditional registration; old ckpts trained WITH objectness
@@ -94,6 +100,8 @@ model_parameters:
     hierarchical_decoding: True
     chain_queries: True       # W-phase then top-phase from the SAME query token
     hierarchy_order: "w_first"  # "top_first" | "w_first" — controls which decoder phase runs first
+    mask_logit_scale: false     # B1: multiply mask logits by embedding_size**-0.5 (attention temperature)
+    phase1_mask_overwrite: true # B1: baseline. Set false with mask_embed_head + B2 deep supervision
     use_hungarian_matching: True
     matching_solver: "gpu_bruteforce"   # "gpu_bruteforce" | "scipy"
     max_targets: 10                     # GPU fallback threshold for gpu_bruteforce
