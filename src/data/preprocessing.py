@@ -1250,7 +1250,11 @@ if __name__ == "__main__":
     print("="*60 + "\n", flush=True)
     
     try:
-        config = load_any_config("config/preprocessing_config.yaml")
+        import argparse
+        _p = argparse.ArgumentParser()
+        _p.add_argument("--config", default="config/preprocessing_config.yaml")
+        _args, _ = _p.parse_known_args()
+        config = load_any_config(_args.config)
         _interaction_scaling = config.get("preprocessing", {}).get("interaction_scaling", "logminmax")
 
         if not config:

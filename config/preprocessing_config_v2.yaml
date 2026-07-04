@@ -1,0 +1,19 @@
+# Stage D v2 preprocessing: adds jet mass scaling + jet_p4_raw + per-feature
+# interaction scaling. Writes to a NEW dir so v1 (masked_targets_combined) stays
+# intact. Old checkpoints are NOT compatible with v2 data.
+#
+# Run: uv run src/data/preprocessing.py --config config/preprocessing_config_v2.yaml
+root_dataset_prepper:
+  root_path: "data/topquarkreconstruction/root_data"
+  save_path: "data/topquarkreconstruction/h5py_data/combined"
+  train_file_name:  "ttbar_train"
+  val_file_name: "ttbar_val"
+  test_file_name: "ttbar_test"
+  save_file_prefix: "ttbar_h5py_raw_"
+
+preprocessing:
+  stream_size: 500000
+  save_path: "data/topquarkreconstruction/masked_targets_combined_v2"
+  save_file_prefix: "ttbar_preprocessed_"
+  min_objects: 1
+  interaction_scaling: "per_feature"   # physically-correct per-column scaling (D1)

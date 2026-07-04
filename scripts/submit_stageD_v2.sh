@@ -1,0 +1,24 @@
+#!/bin/bash --login
+#SBATCH -p gpuL
+#SBATCH --gres=gpu:2
+#SBATCH --time=3-00:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --job-name=exp_stageD_v2
+#SBATCH --output=slurm_outputs/exp_stageD_v2_%j.out
+
+# Full Stage-D training on v2 data (config/exp_stageD_v2.yaml).
+# Requires scripts/preprocess_v2.sh to have produced masked_targets_combined_v2 first.
+module purge
+module load libs/cuda
+
+export CUDA_VISIBLE_DEVICES=0,1
+export UV_PROJECT_ENVIRONMENT=.transformer_env
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+cd "$(dirname "$0")/.."
+source .transformer_env/bin/activate
+
+echo "Job ID: $SLURM_JOB_ID  Node: $SLURM_NODELIST  Start: $(date)"
+uv run src/main.py --config config/exp_stageD_v2.yaml
+echo "Completed at: $(date)"
