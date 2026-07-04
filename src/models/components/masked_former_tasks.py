@@ -1663,6 +1663,68 @@ class ExclusiveAssignmentTask(BaseTask):
         return self.config.get_loss_weight(self.loss_key) * loss
 
 
+class MaskHierarchyConsistencyTask(BaseTask):
+    """
+    Soft W-in-top consistency: within a chain, the W-mask should be a subset of
+    the top-mask, so sigmoid(w_logit) <= sigmoid(top_logit) per particle. Any
+    excess is penalised quadratically:
+
+        viol = relu(sigmoid(w) - sigmoid(top) + margin) ** 2
+
+    Headless (no params, zero matching cost). Restricted to valid chains
+    (obj_valid) × valid particles. The stronger b-union structural formulation
+    (W ⊂ top by construction) is deferred (user decision).
+    """
+
+    def __init__(self, config: TaskConfig, margin: float = 0.0,
+                 top_key: str = 'mask_predictions', w_key: str = 'mask_W'):
+        super().__init__(config)
+        self.margin = margin
+        self.top_key = top_key
+        self.w_key = w_key
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        B, Q, _ = predictions[self.top_key].shape
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=predictions[self.top_key].device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if self.top_key not in predictions or self.w_key not in predictions:
+            # Layer where one head is inactive — nothing to constrain.
+            ref = next(iter(predictions.values()))
+            return ref.new_tensor(0.0)
+
+        top_logit = predictions[self.top_key]   # [B, Q, N]
+        w_logit = predictions[self.w_key]        # [B, Q, N]
+        B, Q, N = top_logit.shape
+
+        viol = F.relu(w_logit.sigmoid() - top_logit.sigmoid() + self.margin) ** 2  # [B, Q, N]
+
+        # Selection mask over valid chains × valid particles.
+        sel = top_logit.new_ones(B, Q, 1, dtype=torch.bool)
+        obj_valid = targets.get('obj_valid_mask')
+        if obj_valid is not None:
+            sel = sel & obj_valid.bool().unsqueeze(-1)          # [B, Q, 1]
+        sel = sel.expand(B, Q, N)
+        if valid_mask is not None:
+            sel = sel & valid_mask.bool().unsqueeze(1)          # [B, Q, N]
+
+        denom = sel.float().sum()
+        if denom < 1:
+            return top_logit.new_tensor(0.0)
+        loss = (viol * sel.float()).sum() / denom.clamp(min=1)
+        return self.config.get_loss_weight('consistency') * loss
+
+
 class BackgroundSuppressionTask(BaseTask):
     """
     Penalises high mask logits for background particles (not in any real GT mask)

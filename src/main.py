@@ -16,7 +16,7 @@ from models.components.masked_former_tasks import (
     MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
     BackgroundSuppressionTask, ParticleGatingTask,
     ChainTypeTask, NeutrinoRegressionTask,
-    ExclusiveAssignmentTask,
+    ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
@@ -277,6 +277,30 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
                 background=exc_config.get('background', 'zero'),
             )
             task_registry.register_task(exc_task)
+
+    # ========================================
+    # Mask Hierarchy Consistency Task (soft W-in-top; chain_queries only)
+    # ========================================
+    cons_config = task_configs.get("mask_consistency")
+    if cons_config and chain_queries:
+        cons_task = MaskHierarchyConsistencyTask(
+            TaskConfig(
+                name='mask_consistency',
+                output_names=['mask_predictions', 'mask_W'],  # forces both into layer map
+                output_dims={},
+                cost_weights={},
+                loss_weights={'consistency': cons_config.get('loss_weight', 0.1)},
+                max_objects=max_objects,
+                layer_weights=_build_layer_weights(
+                    layer_config=cons_config.get('layer_weights'),
+                    strategy=cons_config.get('layer_weight_strategy', 'final_only'),
+                    strategy_params=cons_config.get('layer_weight_params', {}),
+                    n_layers=n_decoder_layers,
+                ),
+            ),
+            margin=cons_config.get('margin', 0.0),
+        )
+        task_registry.register_task(cons_task)
 
     # ========================================
     # Background Suppression Task

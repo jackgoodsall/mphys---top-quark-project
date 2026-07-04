@@ -55,6 +55,12 @@ tasks:
   #   background: "zero"
   #   layer_weights: {0: 0.3, 1: 0.5, 2: 1.0, 3: 0.2, 4: 0.2, 5: 1.0}
 
+  # B4: soft W-in-top consistency (headless, chain_queries only). Uncomment to enable.
+  # mask_consistency:
+  #   loss_weight: 0.1
+  #   margin: 0.0
+  #   layer_weight_strategy: final_only
+
 pretraining:
   mask_pretrain_epochs: 0   # disabled for R&D — train all tasks from the start
   tasks: ["mask_W"]
