@@ -88,24 +88,29 @@ try:
         calculate_energy_value,
         convert_polar_to_cartesian,
         create_interaction_matrix,
+        px_py_pz_from_pt_eta_phi,
     )
     print("[OK] kinematics functions imported", flush=True)
 except Exception as e:
     print(f"[FAIL] kinematics import: {e}", flush=True)
     print("[WARN] Proceeding with dummy utils", flush=True)
-    
+
     def apply_mask(arrays, mask):
         return tuple(a[mask] for a in arrays)
-    
+
     def calculate_energy_value(x):
         return x[..., 3]
-    
+
     def convert_polar_to_cartesian(x):
         return x[..., :4]
-    
+
     def create_interaction_matrix(jet_chunk):
         B, P, F = jet_chunk.shape
         return np.zeros((B, P, P, 1))
+
+    def px_py_pz_from_pt_eta_phi(X):
+        pt, eta, phi = X[..., 0], X[..., 1], X[..., 2]
+        return pt * np.cos(phi), pt * np.sin(phi), pt * np.sinh(eta)
 
 print("\n[SUCCESS] All imports completed\n", flush=True)
 
@@ -208,10 +213,19 @@ class NoInteractionProcessor(InteractionProcessor):
 
 
 class WithInteractionProcessor(InteractionProcessor):
+    def __init__(self, scaling: str = "logminmax"):
+        # "logminmax" (default, legacy) = single shared LogMinMaxScaler over all 4
+        # interaction features; "per_feature" = PerFeatureScaler with a physically
+        # appropriate transform per column (ΔR/z standardised, kT/m² log-min-max).
+        self.scaling = scaling
+
     def needs_interaction(self) -> bool:
         return True
 
     def init_interaction_transformer(self):
+        if self.scaling == "per_feature":
+            from src.data_utils.scalers import PerFeatureScaler
+            return PerFeatureScaler()
         return LogMinMaxScaler()
 
 
@@ -691,12 +705,13 @@ class TopReconstructionDatasetFromH5:
         return Path(directory) / prefix
 
     def _init_jet_transformers(self) -> tuple:
-        """Initialize jet transformers."""
+        """Initialize jet transformers (columns: pt, eta, phi, E, mass)."""
         return (
-            LogMinMaxScaler(),
-            StandardScaler(),
-            PhiTransformer(),
-            LogMinMaxScaler(),
+            LogMinMaxScaler(),   # pt
+            StandardScaler(),    # eta
+            PhiTransformer(),    # phi -> sin, cos
+            LogMinMaxScaler(),   # E
+            LogMinMaxScaler(),   # mass (>= 0); previously passed through raw. n_input stays 7.
         )
 
     def _get_file_pattern(self, prefix_path: Path, suffix: str) -> str:
@@ -932,6 +947,15 @@ class TopReconstructionDatasetFromH5:
                 if jet_chunk.shape[0] == 0:
                     continue
 
+                # Raw 4-vectors [E, px, py, pz] for the soft invariant-mass loss (D4).
+                # Computed from the filtered RAW chunk before scaling; NaN padding -> 0.
+                # Intentionally NOT augmented downstream (mass is rotation/flip invariant).
+                _px, _py, _pz = px_py_pz_from_pt_eta_phi(jet_chunk[..., :3])  # (pt, eta, phi)
+                jet_p4_raw = np.stack(
+                    [jet_chunk[..., 3], _px, _py, _pz], axis=-1
+                ).astype(np.float32)                                          # [B, P, 4]
+                jet_p4_raw = np.nan_to_num(jet_p4_raw, nan=0.0)
+
                 # Build interaction matrix from raw jets and transform in batches.
                 # Must happen BEFORE jet transformation (interactions use raw kinematics).
                 interaction_chunk = None
@@ -960,6 +984,7 @@ class TopReconstructionDatasetFromH5:
                         event_chunk.shape,
                         targets_dict,
                         interaction_chunk.shape if interaction_chunk is not None else None,
+                        jet_p4_raw_shape=jet_p4_raw.shape,
                     )
                     datasets_created = True
 
@@ -970,6 +995,7 @@ class TopReconstructionDatasetFromH5:
                     src_mask,
                     targets_dict,
                     interaction_chunk,
+                    jet_p4_raw=jet_p4_raw,
                 )
         
         print(f"[TRANSFORM] Saved to {save_path}", flush=True)
@@ -1051,6 +1077,7 @@ class TopReconstructionDatasetFromH5:
         event_shape: Tuple,
         targets_dict: Dict[str, np.ndarray],
         interaction_shape: Optional[Tuple] = None,
+        jet_p4_raw_shape: Optional[Tuple] = None,
     ):
         """Create HDF5 dataset groups."""
         _, N_jets, jet_features = jet_shape
@@ -1122,6 +1149,17 @@ class TopReconstructionDatasetFromH5:
                 dtype="float32",
             )
 
+        # Raw 4-vectors for the invariant-mass loss (D4). Explicit, not in get_save_keys.
+        if jet_p4_raw_shape is not None:
+            _, N_p4, F_p4 = jet_p4_raw_shape
+            file.create_dataset(
+                "jet_p4_raw",
+                shape=(0, N_p4, F_p4),
+                maxshape=(None, N_p4, F_p4),
+                compression="lzf",
+                dtype="float32",
+            )
+
         # Leptonic-extension pass-through keys
         for key in self._pass_through_keys:
             if key in targets_dict:
@@ -1150,6 +1188,7 @@ class TopReconstructionDatasetFromH5:
         src_mask_chunk: np.ndarray,
         targets_dict: Dict[str, np.ndarray],
         interaction_chunk: Optional[np.ndarray] = None,
+        jet_p4_raw: Optional[np.ndarray] = None,
     ):
         """Save data chunks to HDF5."""
         cur_len = file["jet"].shape[0]
@@ -1174,6 +1213,10 @@ class TopReconstructionDatasetFromH5:
         if interaction_chunk is not None:
             file["interactions"].resize((n1,) + file["interactions"].shape[1:])
             file["interactions"][n0:n1] = interaction_chunk.astype("float32")
+
+        if jet_p4_raw is not None and "jet_p4_raw" in file:
+            file["jet_p4_raw"].resize((n1,) + file["jet_p4_raw"].shape[1:])
+            file["jet_p4_raw"][n0:n1] = jet_p4_raw.astype("float32")
 
         # Leptonic-extension pass-through keys (no transformer scaling)
         for key in self._pass_through_keys:
@@ -1208,7 +1251,8 @@ if __name__ == "__main__":
     
     try:
         config = load_any_config("config/preprocessing_config.yaml")
-        
+        _interaction_scaling = config.get("preprocessing", {}).get("interaction_scaling", "logminmax")
+
         if not config:
             print("[WARN] Config is empty, using defaults", flush=True)
             config = {
@@ -1236,7 +1280,7 @@ if __name__ == "__main__":
         dataset = TopReconstructionDatasetFromH5(
             config,
             target_processor=processor,
-            interaction_processor=WithInteractionProcessor(),
+            interaction_processor=WithInteractionProcessor(scaling=_interaction_scaling),
             target_extractor=extractor,
         )
         

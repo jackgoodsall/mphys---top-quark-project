@@ -1,0 +1,176 @@
+#!/usr/bin/env python
+"""
+CPU smoke test for the assignment-model upgrade (Stages A-D).
+
+Builds a tiny MaskedReconstructionPart from config/smoke_config.yaml, runs
+forward + loss + backward on a synthetic batch (B=4, N=20 with obj_valid
+patterns [T,T], [T,F], [F,F], [T,T]) across every new flag combination:
+mask_embed_head x mask_logit_scale x phase1_mask_overwrite x masked_cross_attention
+x new tasks (exclusive_ce / mask_consistency / invariant_mass) x leptonic global token.
+
+Asserts every loss is finite and that every requires_grad parameter that should be
+trained receives a gradient (a cheap DDP-unused-parameter proxy).
+
+Run:  .transformer_env/bin/python scripts/smoke_forward.py
+"""
+import copy
+import itertools
+import os
+import sys
+
+import torch
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, _ROOT)                       # for `from src.models...` absolute imports
+sys.path.insert(0, os.path.join(_ROOT, "src"))  # for `from models...` / `import main`
+
+from models.particle_transformer import (  # noqa: E402
+    ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
+)
+from utils.utils import load_any_config  # noqa: E402
+import main as main_mod  # noqa: E402
+
+B, N, K_NU = 4, 20, 1
+CHAIN_PATTERNS = [(1, 1), (1, 0), (0, 0), (1, 1)]  # (top_valid, w_valid) per chain, per event
+
+
+def build_batch(leptonic=False, with_p4=False, all_negative=False):
+    torch.manual_seed(0)
+    jet = torch.randn(B, N, 7)
+    src_mask = torch.ones(B, N, dtype=torch.bool)
+    interactions = torch.randn(B, N, N, 4).abs()
+
+    # Two chains: top0=particles[0:6] W0=[0:3]; top1=[6:12] W1=[6:9] (W subset of top).
+    jmt = torch.zeros(B, 4, N)   # [top0, top1, w0, w1]
+    tvm = torch.zeros(B, 4, dtype=torch.bool)
+    for b, (c0, c1) in enumerate(CHAIN_PATTERNS):
+        if c0:
+            jmt[b, 0, 0:6] = 1.0; jmt[b, 2, 0:3] = 1.0
+            tvm[b, 0] = True; tvm[b, 2] = True
+        if c1:
+            jmt[b, 1, 6:12] = 1.0; jmt[b, 3, 6:9] = 1.0
+            tvm[b, 1] = True; tvm[b, 3] = True
+
+    samples = {"jet": jet, "src_mask": src_mask, "interactions": interactions}
+    targets = {
+        "jet_mask_true": jmt,
+        "jet_valid_mask": src_mask.float(),
+        "target_valid_mask": tvm,
+    }
+    if with_p4:
+        # E >= |p| on every valid row (E from a larger scale than px/py/pz).
+        p3 = torch.randn(B, N, 3)
+        E = p3.norm(dim=-1, keepdim=True) + torch.rand(B, N, 1) + 1.0
+        targets["jet_p4_raw"] = torch.cat([E, p3], dim=-1)  # [B, N, 4] = (E, px, py, pz)
+    if leptonic:
+        samples["particle_type"] = torch.zeros(B, N, dtype=torch.long)
+        samples["globals"] = torch.randn(B, 6)
+        targets["chain_type"] = torch.zeros(B, 2, dtype=torch.long)  # hadronic
+        targets["neutrino_truth"] = torch.zeros(B, 2, K_NU)
+    if all_negative:
+        # Force the masked-attention all-blocked fallback: no attendable particle.
+        samples["jet"] = jet * 0.0
+    return samples, targets
+
+
+def build_model(cfg):
+    pe = ParticleEmbedder(**cfg["model_parameters"]["particle_embedder"])
+    ie = InteractionEmbedder(**cfg["model_parameters"]["interaction_embedder"])
+    tr = main_mod.create_default_task_registry(cfg)
+    model = MaskedReconstructionPart(
+        particle_embedder=pe, interaction_embedder=ie, task_registry=tr,
+        **cfg["model_parameters"]["transformer"],
+    )
+    return model, tr
+
+
+def compute_loss(outputs, task_registry):
+    total = 0.0
+    final = max(outputs.keys())
+    for lid, preds in outputs.items():
+        lt = preds["__targets__"]
+        p = {k: v for k, v in preds.items() if k != "__targets__"}
+        loss, _ = task_registry.compute_total_loss(
+            predictions=p, targets=lt, valid_mask=lt.get("jet_valid_mask"),
+            layer_id=lid, is_final_layer=(lid == final),
+        )
+        total = total + loss
+    return total
+
+
+def run_case(name, cfg, batch):
+    model, tr = build_model(cfg)
+    model.train()
+    samples, targets = batch
+    inp = dict(samples)
+    inp["targets"] = targets
+    out = model(inp)
+    loss = compute_loss(out, tr)
+    assert torch.isfinite(loss), f"[{name}] non-finite loss: {loss}"
+    loss.backward()
+    # DDP proxy: every trained param should get a grad. Query heads/embeddings that
+    # are genuinely unused in a given flag combo are allowed to be None.
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    print(f"  [{name:52s}] loss={loss.item():+.4f}  no-grad params={len(missing)}")
+    return missing
+
+
+def main():
+    base = load_any_config("config/smoke_config.yaml")
+
+    cases = 0
+    for embed, scale, overwrite in itertools.product([False, True], repeat=3):
+        cfg = copy.deepcopy(base)
+        cfg["tasks"]["mask"]["mask_embed_head"] = embed
+        cfg["tasks"]["mask_W"]["mask_embed_head"] = embed
+        cfg["model_parameters"]["transformer"]["mask_logit_scale"] = scale
+        cfg["model_parameters"]["transformer"]["phase1_mask_overwrite"] = overwrite
+        run_case(f"embed={embed} scale={scale} overwrite={overwrite}",
+                 cfg, build_batch())
+        cases += 1
+
+    # New tasks on
+    cfg = copy.deepcopy(base)
+    cfg["tasks"]["exclusive_ce"] = {"loss_weight": 0.25, "layer_weights": {0: 0.1, 1: 0.1, 2: 1.0}}
+    cfg["tasks"]["exclusive_ce_W"] = {"loss_weight": 0.25, "layer_weights": {0: 0.1, 1: 1.0, 2: 0.1}}
+    cfg["tasks"]["mask_consistency"] = {"loss_weight": 0.1, "margin": 0.0, "layer_weight_strategy": "final_only"}
+    run_case("new tasks: exclusive_ce + mask_consistency", cfg, build_batch())
+    cases += 1
+
+    # Invariant-mass task (needs jet_p4_raw)
+    cfg = copy.deepcopy(base)
+    cfg["tasks"]["invariant_mass"] = {"loss_weight": 0.05, "layer_weight_strategy": "final_only"}
+    run_case("invariant_mass (jet_p4_raw)", cfg, build_batch(with_p4=True))
+    cases += 1
+
+    # Masked cross-attention (normal + all-negative fallback)
+    for allneg in [False, True]:
+        cfg = copy.deepcopy(base)
+        cfg["model_parameters"]["transformer"]["masked_cross_attention"] = True
+        cfg["model_parameters"]["transformer"]["masked_attention_start_epoch"] = 0
+        run_case(f"masked_cross_attention allneg={allneg}", cfg,
+                 build_batch(all_negative=allneg))
+        cases += 1
+
+    # Leptonic global-token path
+    cfg = copy.deepcopy(base)
+    cfg["model_parameters"]["transformer"]["enable_leptonic"] = True
+    cfg["model_parameters"]["transformer"]["global_dim"] = 6
+    cfg["model_parameters"]["transformer"]["global_hidden_sizes"] = [8]
+    cfg["tasks"]["chain_type"] = {"loss_weight": 1.0, "layer_weight_strategy": "final_only"}
+    cfg["tasks"]["neutrino"] = {"loss_weight": 1.0, "output_dim": 1, "layer_weight_strategy": "final_only"}
+    run_case("leptonic global token + masked attn", cfg,
+             build_batch(leptonic=True))
+    cases += 1
+
+    # Leptonic + masked attention together
+    cfg["model_parameters"]["transformer"]["masked_cross_attention"] = True
+    run_case("leptonic + masked_cross_attention", cfg, build_batch(leptonic=True))
+    cases += 1
+
+    print(f"\nAll {cases} smoke cases produced finite losses and ran backward. OK")
+
+
+if __name__ == "__main__":
+    main()

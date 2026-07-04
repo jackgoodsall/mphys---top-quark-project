@@ -56,7 +56,7 @@ try:
 except ImportError:
     _HAS_VECTOR = False
 
-from src.data_utils.scalers import LogMinMaxScaler, StandardScaler
+from src.data_utils.scalers import LogMinMaxScaler, StandardScaler, PerFeatureScaler
 
 # ── Config ───────────────────────────────────────────────────────────────────
 MAX_P      = 20      # unified particle slots (jets + lepton)
@@ -81,17 +81,31 @@ class CombinedScalers:
         self.eta_scaler = StandardScaler()
         self.E_scaler   = LogMinMaxScaler()
         self.met_scaler = LogMinMaxScaler()
+        self.mass_scaler = LogMinMaxScaler()          # jet mass (col 5, >= 0)
+        self.interaction_scaler = PerFeatureScaler()  # [ΔR, kT, z, m²] per-feature
 
-    def partial_fit_particles(self, pt: np.ndarray, eta: np.ndarray, E: np.ndarray):
+    def partial_fit_particles(self, pt: np.ndarray, eta: np.ndarray, E: np.ndarray,
+                              m: Optional[np.ndarray] = None):
         """Partial-fit on valid (non-NaN) particle values."""
         valid = ~np.isnan(pt)
         if valid.any():
             self.pt_scaler.partial_fit(pt[valid].reshape(-1, 1))
             self.eta_scaler.partial_fit(eta[valid].reshape(-1, 1))
             self.E_scaler.partial_fit(E[valid].reshape(-1, 1))
+            if m is not None:
+                self.mass_scaler.partial_fit(m[valid].reshape(-1, 1))
 
     def partial_fit_met(self, met: np.ndarray):
         self.met_scaler.partial_fit(met.reshape(-1, 1))
+
+    def partial_fit_interactions(self, interactions: np.ndarray):
+        """interactions: [B, P, P, 4] raw-built. Fits the per-feature scaler."""
+        self.interaction_scaler.partial_fit(interactions.reshape(-1, interactions.shape[-1]))
+
+    def transform_interactions(self, interactions: np.ndarray) -> np.ndarray:
+        B, P, P2, F = interactions.shape
+        flat = self.interaction_scaler.transform(interactions.reshape(-1, F))
+        return flat.reshape(B, P, P2, F).astype(np.float32)
 
     def transform_particles(self, pt, eta, sin_phi, cos_phi, E, m, btag):
         """Apply scalers; NaN propagates for padding."""
@@ -101,21 +115,25 @@ class CombinedScalers:
         pt_s  = np.full_like(pt, 0.0)
         eta_s = np.full_like(eta, 0.0)
         E_s   = np.full_like(E, 0.0)
+        m_s   = np.array(m, dtype=np.float32)
 
         if mask_valid.any():
             flat = lambda x: x[mask_valid].reshape(-1, 1)
             pt_s[mask_valid]  = self.pt_scaler.transform(flat(pt)).ravel()
             eta_s[mask_valid] = self.eta_scaler.transform(flat(eta)).ravel()
             E_s[mask_valid]   = self.E_scaler.transform(flat(E)).ravel()
+            m_s[mask_valid]   = self.mass_scaler.transform(flat(m)).ravel()
 
-        return np.stack([pt_s, eta_s, sin_phi, cos_phi, E_s, m, btag], axis=-1)
+        return np.stack([pt_s, eta_s, sin_phi, cos_phi, E_s, m_s, btag], axis=-1)
 
     def transform_met_pt(self, met_pt: np.ndarray) -> np.ndarray:
         return self.met_scaler.transform(met_pt.reshape(-1, 1)).ravel()
 
     def save(self, path: Path):
         joblib.dump({'pt': self.pt_scaler, 'eta': self.eta_scaler,
-                     'E': self.E_scaler, 'met': self.met_scaler}, path)
+                     'E': self.E_scaler, 'met': self.met_scaler,
+                     'mass': self.mass_scaler,
+                     'interaction': self.interaction_scaler}, path)
         print(f"[SAVE] Scalers → {path}", flush=True)
 
     @classmethod
@@ -124,6 +142,11 @@ class CombinedScalers:
         s = cls()
         s.pt_scaler = d['pt']; s.eta_scaler = d['eta']
         s.E_scaler  = d['E'];  s.met_scaler  = d['met']
+        # Backward compat: older joblibs lack mass / interaction scalers.
+        if 'mass' in d:
+            s.mass_scaler = d['mass']
+        if 'interaction' in d:
+            s.interaction_scaler = d['interaction']
         return s
 
 
@@ -135,12 +158,45 @@ def compute_E(pt, eta, m):
     return np.sqrt(p**2 + m**2)
 
 
+def build_interaction_matrix_raw(pt, eta, sin_phi, cos_phi, E) -> np.ndarray:
+    """
+    Compute pairwise [ΔR, kT, z, m²] from RAW (unscaled) kinematics.
+
+    All inputs are [B, P] raw arrays (padding rows = 0). This is the physically
+    correct version: ΔR uses raw η/φ, not standardised η. Returns [B, P, P, 4].
+    (The output still needs scaling via CombinedScalers.transform_interactions.)
+    """
+    deta = eta[:, :, None] - eta[:, None, :]
+    phi  = np.arctan2(sin_phi, cos_phi)
+    dphi = phi[:, :, None] - phi[:, None, :]
+    dphi = (dphi + np.pi) % (2 * np.pi) - np.pi
+    dR   = np.sqrt(deta**2 + dphi**2)
+
+    pt_i = pt[:, :, None]; pt_j = pt[:, None, :]
+    kT   = np.minimum(pt_i, pt_j) * dR
+    z    = np.minimum(pt_i, pt_j) / (pt_i + pt_j + 1e-9)
+
+    px = pt * cos_phi; py = pt * sin_phi; pz = pt * np.sinh(eta)
+    E_i  = E[:, :, None];  E_j  = E[:, None, :]
+    px_i = px[:, :, None]; px_j = px[:, None, :]
+    py_i = py[:, :, None]; py_j = py[:, None, :]
+    pz_i = pz[:, :, None]; pz_j = pz[:, None, :]
+    m2 = ((E_i + E_j)**2 - (px_i + px_j)**2 -
+          (py_i + py_j)**2 - (pz_i + pz_j)**2).clip(0)
+
+    return np.stack([dR, kT, z, m2], axis=-1).astype(np.float32)
+
+
 def build_interaction_matrix(jet_chunk: np.ndarray) -> np.ndarray:
     """
     Compute pairwise [ΔR, kT, z, m²] for each (i,j) particle pair.
     jet_chunk: [B, P, 7] with features [pt, eta, sin_phi, cos_phi, E, m, btag].
     Padding rows (pt==0) produce zeros in the interaction matrix.
     Returns [B, P, P, 4].
+
+    DEPRECATED for production: this reads scaled features (ΔR from standardised η
+    is physically wrong). Kept for reference; the process functions now use
+    build_interaction_matrix_raw on raw kinematics.
     """
     B, P, _ = jet_chunk.shape
     pt  = jet_chunk[:, :, 0]   # [B, P]
@@ -255,8 +311,15 @@ def had_fit_chunk(jet_raw: np.ndarray, scalers: CombinedScalers):
     """Fit scalers on one hadronic chunk."""
     pt   = jet_raw[:, :, 0]
     eta  = jet_raw[:, :, 1]
+    phi  = jet_raw[:, :, 2]
     E    = jet_raw[:, :, 3]
-    scalers.partial_fit_particles(pt, eta, E)
+    m    = jet_raw[:, :, 4]
+    scalers.partial_fit_particles(pt, eta, E, m)
+    # Fit the interaction scaler on RAW-built interactions (physical distribution).
+    ptz, etaz, phiz, Ez = (np.nan_to_num(pt), np.nan_to_num(eta),
+                           np.nan_to_num(phi), np.nan_to_num(E))
+    inter = build_interaction_matrix_raw(ptz, etaz, np.sin(phiz), np.cos(phiz), Ez)
+    scalers.partial_fit_interactions(inter)
     # MET not available in hadronic data — skip met_scaler for this source
 
 
@@ -300,8 +363,20 @@ def had_process_chunk(jet_raw: np.ndarray, event_raw: np.ndarray,
     jet_out = scalers.transform_particles(pt, eta, sin_phi, cos_phi, E_raw, m, btag)
     jet_out[~src_mask] = 0.0  # zero-out padding rows
 
-    # Interaction matrix (computed on scaled jet_out)
-    interactions = build_interaction_matrix(jet_out)
+    # Interaction matrix — built from RAW kinematics (padding zeroed), then scaled.
+    # (Previously built from the SCALED jet_out and left unscaled — physically wrong.)
+    pt_z  = np.where(src_mask, pt, 0.0)
+    eta_z = np.where(src_mask, eta, 0.0)
+    sin_z = np.where(src_mask, sin_phi, 0.0)
+    cos_z = np.where(src_mask, cos_phi, 0.0)
+    E_z   = np.where(src_mask, E_raw, 0.0)
+    interactions = build_interaction_matrix_raw(pt_z, eta_z, sin_z, cos_z, E_z)
+    interactions = scalers.transform_interactions(interactions)
+
+    # Raw 4-vectors [E, px, py, pz] for the invariant-mass loss (D4).
+    jet_p4_raw = np.stack([
+        E_z, pt_z * cos_z, pt_z * sin_z, pt_z * np.sinh(eta_z)
+    ], axis=-1).astype(np.float32)
 
     # Build masks from truth tags
     # ht (top+) = chain 0, lt (top-) = chain 1
@@ -386,6 +461,7 @@ def had_process_chunk(jet_raw: np.ndarray, event_raw: np.ndarray,
         'chain_type': chain_type,
         'globals': globals_arr.astype(np.float32),
         'neutrino_truth': neutrino_truth,
+        'jet_p4_raw': jet_p4_raw,
     }
 
 
@@ -396,15 +472,26 @@ def slep_fit_chunk(f: h5py.File, start: int, stop: int, scalers: CombinedScalers
     pt   = f['INPUTS/Momenta/pt'][start:stop]
     eta  = f['INPUTS/Momenta/eta'][start:stop]
     m    = f['INPUTS/Momenta/mass'][start:stop]
+    sin_phi = f['INPUTS/Momenta/sin_phi'][start:stop]
+    cos_phi = f['INPUTS/Momenta/cos_phi'][start:stop]
     mask = f['INPUTS/Momenta/MASK'][start:stop]  # [B, P] bool
 
     # Mask out padding positions with NaN
     pt_v  = np.where(mask, pt, np.nan)
     eta_v = np.where(mask, eta, np.nan)
+    m_v   = np.where(mask, m, np.nan)
     E_v   = np.where(mask, compute_E(pt, eta, m), np.nan)
 
-    scalers.partial_fit_particles(pt_v, eta_v, E_v)
+    scalers.partial_fit_particles(pt_v, eta_v, E_v, m_v)
     scalers.partial_fit_met(f['INPUTS/Met/met'][start:stop])
+
+    # Fit interaction scaler on RAW-built interactions (padding zeroed).
+    E_raw = compute_E(pt, eta, m)
+    ptz, etaz, Ez = (np.where(mask, pt, 0.0), np.where(mask, eta, 0.0),
+                     np.where(mask, E_raw, 0.0))
+    sinz, cosz = np.where(mask, sin_phi, 0.0), np.where(mask, cos_phi, 0.0)
+    inter = build_interaction_matrix_raw(ptz, etaz, sinz, cosz, Ez)
+    scalers.partial_fit_interactions(inter)
 
 
 def slep_process_chunk(f: h5py.File, start: int, stop: int,
@@ -467,10 +554,29 @@ def slep_process_chunk(f: h5py.File, start: int, stop: int,
         eta_s.ravel()[valid_flat] = scalers.eta_scaler.transform(eta.ravel()[valid_flat].reshape(-1,1)).ravel()
         E_s.ravel()[valid_flat]   = scalers.E_scaler.transform(E_raw.ravel()[valid_flat].reshape(-1,1)).ravel()
 
-    jet_out = np.stack([pt_s, eta_s, sin_phi, cos_phi, E_s, mass, btag], axis=-1)  # [B, MAX_P, 7]
+    # Scale mass (col 5) too — matches the hadronic transform_particles.
+    mass_s = np.array(mass, dtype=np.float32)
+    if valid_flat.any():
+        mass_s.ravel()[valid_flat] = scalers.mass_scaler.transform(
+            mass.ravel()[valid_flat].reshape(-1, 1)).ravel()
+
+    jet_out = np.stack([pt_s, eta_s, sin_phi, cos_phi, E_s, mass_s, btag], axis=-1)  # [B, MAX_P, 7]
     jet_out[~src_mask] = 0.0
 
-    interactions = build_interaction_matrix(jet_out)
+    # Interaction matrix — built from RAW kinematics (padding zeroed), then scaled.
+    # E recomputed from the padded pt/eta/mass so shapes align with src_mask [B, MAX_P].
+    pt_z  = np.where(src_mask, pt, 0.0)
+    eta_z = np.where(src_mask, eta, 0.0)
+    sin_z = np.where(src_mask, sin_phi, 0.0)
+    cos_z = np.where(src_mask, cos_phi, 0.0)
+    E_z   = np.where(src_mask, compute_E(pt, eta, mass), 0.0)
+    interactions = build_interaction_matrix_raw(pt_z, eta_z, sin_z, cos_z, E_z)
+    interactions = scalers.transform_interactions(interactions)
+
+    # Raw 4-vectors [E, px, py, pz] for the invariant-mass loss (D4).
+    jet_p4_raw = np.stack([
+        E_z, pt_z * cos_z, pt_z * sin_z, pt_z * np.sinh(eta_z)
+    ], axis=-1).astype(np.float32)
 
     # Build masks from TARGETS indices
     def make_mask(idx_arrays):
@@ -551,6 +657,7 @@ def slep_process_chunk(f: h5py.File, start: int, stop: int,
         'chain_type': chain_type,
         'globals': globals_arr.astype(np.float32),
         'neutrino_truth': neutrino_truth,
+        'jet_p4_raw': jet_p4_raw,
     }
 
 
@@ -570,6 +677,7 @@ DATASET_SPECS = {
     'chain_type':      ('uint8',   'gzip', 4),
     'globals':         ('float32', 'gzip', 4),
     'neutrino_truth':  ('float32', 'gzip', 4),
+    'jet_p4_raw':      ('float32', 'lzf',  None),
 }
 
 

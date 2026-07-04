@@ -1,0 +1,51 @@
+# Tiny config for scripts/smoke_forward.py — CPU forward/backward sanity across
+# all new flag combinations (Stages A–D). Not for training.
+max_objects: 2
+
+tasks:
+  mask:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    cost_bce_weight: 0.0
+    mask_embed_head: false
+    layer_weights: {0: 0.1, 1: 0.1, 2: 1.0}
+  mask_W:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    layer_weights: {0: 0.1, 1: 1.0, 2: 0.1}
+  objectness:
+    enabled: true
+    cost_weight: 0.0
+    loss_weight: 0.0
+    head_norm: true
+    layer_weights: {0: 0.0, 1: 0.0, 2: 1.0}
+
+model_parameters:
+  particle_embedder:
+    n_input: 7
+    hidden_sizes: [16]
+    embedding_size: 16
+    p_dropout: 0.0
+  interaction_embedder:
+    input_features: 4
+    hidden_layers: [8]
+    output_size: 2
+    p_dropout: 0.0
+  transformer:
+    embedding_size: 16
+    n_encoder_layers: 2
+    n_decoder_layers: 3
+    n_heads: 2
+    p_dropout: 0.0
+    dim_ff: 32
+    num_query_tokens: 2
+    hierarchical_decoding: true
+    chain_queries: true
+    hierarchy_order: "w_first"
+    use_hungarian_matching: true
+    matching_solver: "scipy"
+    max_targets: 10

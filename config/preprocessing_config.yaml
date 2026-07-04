@@ -8,7 +8,11 @@ root_dataset_prepper:
 
 preprocessing:
   stream_size: 500000
+  # Stage D: mass scaling + jet_p4_raw + per-feature interaction scaling change the
+  # on-disk format. Write to a NEW v2 dir; do NOT overwrite v1 (old ckpts <-> v2 data
+  # are NOT interchangeable). Example: masked_targets_combined_v2.
   save_path: "data/topquarkreconstruction/masked_targets_combined"
   save_file_prefix: "ttbar_preprocessed_"
   min_objects: 1    # keep events with >= this many reconstructable objects
                     # set to 4 to restore original fully-matched-only behaviour
+  interaction_scaling: "logminmax"   # "logminmax" (legacy) | "per_feature" (D1)
