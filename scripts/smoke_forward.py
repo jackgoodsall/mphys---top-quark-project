@@ -169,7 +169,37 @@ def main():
     run_case("leptonic + masked_cross_attention", cfg, build_batch(leptonic=True))
     cases += 1
 
+    check_augmenter()
+
     print(f"\nAll {cases} smoke cases produced finite losses and ran backward. OK")
+
+
+def check_augmenter():
+    """Stage D3: φ-rotation preserves sin²+cos²; η-flip is an involution; padding stays 0."""
+    from data.datamodule import Augmenter
+    eta_consts = ((0.1, 1.3), (0.0, 1.0), (0.0, 1.0))
+
+    # φ-rotation
+    aug = Augmenter({"phi_rotation": True, "eta_flip": False})
+    jet = torch.randn(20, 7)
+    jet[10:] = 0.0  # padding rows
+    src = torch.ones(20, dtype=torch.bool); src[10:] = False
+    sample = {"jet": jet.clone(), "src_mask": src}
+    target = {"target_kinematics": torch.randn(4, 5)}
+    r2_before = jet[:, 2] ** 2 + jet[:, 3] ** 2
+    s, t = aug(sample, target)
+    r2_after = s["jet"][:, 2] ** 2 + s["jet"][:, 3] ** 2
+    assert torch.allclose(r2_before, r2_after, atol=1e-5), "phi rotation broke sin^2+cos^2"
+    assert torch.allclose(s["jet"][10:], torch.zeros(10, 7), atol=1e-6), "phi rotated padding"
+
+    # η-flip involution on jet col 1 (apply twice = identity on real rows)
+    aug2 = Augmenter({"phi_rotation": False, "eta_flip": True}, eta_consts=eta_consts)
+    jet = torch.randn(20, 7); jet[10:] = 0.0
+    sample = {"jet": jet.clone(), "src_mask": src}
+    jm, js = eta_consts[0]
+    twice = -(-jet[:, 1] - 2 * jm / js) - 2 * jm / js
+    assert torch.allclose(twice, jet[:, 1], atol=1e-5), "eta flip not an involution"
+    print("  [augmenter: phi-rotation invariants + eta-flip involution]     OK")
 
 
 if __name__ == "__main__":

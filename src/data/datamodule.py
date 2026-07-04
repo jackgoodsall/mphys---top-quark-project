@@ -11,6 +11,99 @@ CLASS_TOP = 1
 CLASS_W = 2
 
 
+def _load_eta_constants(joblib_path):
+    """
+    Load (mean, scale) of the η StandardScaler for the jet input and the two
+    target types, from either transformer-joblib format.
+
+    preprocessing.py  → {'jet_transformers': (pt, eta, phi, E[, m]),
+                         'target_transformers': proc with top_/W_transformers}
+    preprocess_combined → {'eta': StandardScaler, ...}  (shared for jet + targets)
+
+    Returns ((jet_mean, jet_scale), (top_mean, top_scale), (w_mean, w_scale)).
+    """
+    import joblib
+    d = joblib.load(joblib_path)
+    if 'jet_transformers' in d:
+        eta_sc = d['jet_transformers'][1]
+        jet_c = (float(eta_sc.mean_[0]), float(eta_sc.scale_[0]))
+        tp = d['target_transformers']
+        top_sc = tp.top_transformers[1]
+        w_sc = tp.W_transformers[1]
+        return (jet_c,
+                (float(top_sc.mean_[0]), float(top_sc.scale_[0])),
+                (float(w_sc.mean_[0]),   float(w_sc.scale_[0])))
+    # combined format: one shared eta scaler for jets and reco kinematics
+    eta_sc = d['eta']
+    c = (float(eta_sc.mean_[0]), float(eta_sc.scale_[0]))
+    return (c, c, c)
+
+
+class Augmenter:
+    """
+    φ-rotation and η-flip data augmentation for a single (sample, target) pair.
+
+    Both are symmetries of the physics: interactions are provably invariant
+    (Δη², global φ shift; kT/z pt-only; m² has pz² in the sum) and are left
+    untouched. Applied on the TRAIN split only. RNG is the legacy ``np.random``
+    module, which Lightning's ``seed_everything(workers=True)`` seeds per worker.
+
+    φ-rotation (α~U(0,2π)): rotate (sin, cos) columns of jet (2,3) and target
+    kinematics (2,3); leptonic globals (sinMETφ, cosMETφ) = (4,5). Zero rows stay 0.
+    η-flip (p=0.5): raw η → −η, i.e. scaled η_s → −η_s − 2μ/σ, applied only on
+    real particles (src_mask) for the jet, and per-type for target kinematics.
+    """
+
+    def __init__(self, cfg, enable_leptonic=False, eta_consts=None):
+        self.phi_rotation = bool(cfg.get('phi_rotation', False))
+        self.eta_flip = bool(cfg.get('eta_flip', False))
+        self.enable_leptonic = enable_leptonic
+        if self.eta_flip and enable_leptonic:
+            raise ValueError(
+                "eta_flip augmentation is not supported with enable_leptonic "
+                "(neutrino pz sign flip is unhandled). Disable one of them.")
+        if self.eta_flip:
+            if eta_consts is None:
+                raise ValueError(
+                    "eta_flip requires η scaler constants — set "
+                    "model_artefacts.target_transformers to the joblib path.")
+            self.jet_eta, self.top_eta, self.w_eta = eta_consts
+
+    def active(self) -> bool:
+        return self.phi_rotation or self.eta_flip
+
+    @staticmethod
+    def _rotate_sincos(arr, ca, sa, i_sin, i_cos):
+        s = arr[..., i_sin].clone()
+        c = arr[..., i_cos].clone()
+        arr[..., i_sin] = s * ca + c * sa
+        arr[..., i_cos] = c * ca - s * sa
+
+    def __call__(self, sample, target):
+        if self.phi_rotation:
+            alpha = float(np.random.uniform(0.0, 2.0 * np.pi))
+            ca, sa = np.cos(alpha), np.sin(alpha)
+            self._rotate_sincos(sample['jet'], ca, sa, 2, 3)
+            if 'target_kinematics' in target:
+                self._rotate_sincos(target['target_kinematics'], ca, sa, 2, 3)
+            if self.enable_leptonic and 'globals' in sample:
+                self._rotate_sincos(sample['globals'], ca, sa, 4, 5)
+
+        if self.eta_flip and np.random.random() < 0.5:
+            src = sample['src_mask'].bool()
+            jm, js = self.jet_eta
+            jet = sample['jet']
+            flipped = -jet[:, 1] - 2.0 * jm / js
+            jet[:, 1] = torch.where(src, flipped, jet[:, 1])
+            if 'target_kinematics' in target:
+                kin = target['target_kinematics']            # [n_obj, 5], col1 = eta_s
+                for i in range(kin.shape[0]):
+                    m, s = self.top_eta if i < 2 else self.w_eta
+                    kin[i, 1] = -kin[i, 1] - 2.0 * m / s
+
+        return sample, target
+
+
 def _load_object_type(f: h5py.File, mask_key: str, kin_key: str):
     """
     Load masks and kinematics for one object type from an open HDF5 file.
@@ -187,7 +280,8 @@ class MaskedFormerDataSet(Dataset):
     """In-memory dataset. Used by analysis scripts and as a fallback."""
 
     def __init__(self, jet, interactions, src_mask, targets, target_kinematics,
-                 classes=None, object_valid=None):
+                 classes=None, object_valid=None, augmenter=None):
+        self.augmenter = augmenter
         self.jet = np.asarray(jet)
         self.src_mask = np.asarray(src_mask)
         self.targets = np.asarray(targets)
@@ -233,6 +327,9 @@ class MaskedFormerDataSet(Dataset):
                 np.asarray(self.object_valid[idx])
             ).bool()
 
+        if self.augmenter is not None:
+            sample, target = self.augmenter(sample, target)
+
         return sample, target
 
 
@@ -249,8 +346,9 @@ class LazyHDF5Dataset(Dataset):
     """
 
     def __init__(self, h5_path, tops_mask_key, tops_kin_key,
-                 ws_mask_key, ws_kin_key):
+                 ws_mask_key, ws_kin_key, augmenter=None):
         self.h5_path = str(h5_path)
+        self.augmenter = augmenter
 
         # Read only small arrays + metadata into RAM
         with h5py.File(self.h5_path, "r") as f:
@@ -373,6 +471,9 @@ class LazyHDF5Dataset(Dataset):
                 self._file["neutrino_truth"][idx]
             ).float()  # [2, K]
 
+        if self.augmenter is not None:
+            sample, target = self.augmenter(sample, target)
+
         return sample, target
 
 
@@ -421,9 +522,11 @@ class MemmapDataset(Dataset):
         return npy_dir
 
     def __init__(self, npy_dir: Path, tops_mask_key, tops_kin_key,
-                 ws_mask_key, ws_kin_key, load_interactions: bool = True):
+                 ws_mask_key, ws_kin_key, load_interactions: bool = True,
+                 augmenter=None):
         self.npy_dir = npy_dir
         self.load_interactions = load_interactions
+        self.augmenter = augmenter
 
         def _mmap(key):
             p = npy_dir / f"{key}.npy"
@@ -502,6 +605,10 @@ class MemmapDataset(Dataset):
             target["object_valid"] = torch.from_numpy(
                 self.object_valid[idx]
             ).bool()
+
+        if self.augmenter is not None:
+            sample, target = self.augmenter(sample, target)
+
         return sample, target
 
 
@@ -537,32 +644,47 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         self.lazy = self.config.get("lazy", False)   # False | True | "memmap"
         self.load_interactions = self.config.get("load_interactions", True)
 
+        # Train-only augmentation (Stage D3). Built once; RNG per worker.
+        self.train_augmenter = None
+        aug_cfg = self.train_config.get("augment")
+        if aug_cfg and (aug_cfg.get("phi_rotation") or aug_cfg.get("eta_flip")):
+            enable_leptonic = (config.get("model_parameters", {})
+                                     .get("transformer", {})
+                                     .get("enable_leptonic", False))
+            eta_consts = None
+            if aug_cfg.get("eta_flip"):
+                joblib_path = config.get("model_artefacts", {}).get("target_transformers")
+                eta_consts = _load_eta_constants(joblib_path)
+            self.train_augmenter = Augmenter(
+                aug_cfg, enable_leptonic=enable_leptonic, eta_consts=eta_consts)
+
         self.train_dataset = None
         self.test_dataset = None
         self.val_dataset = None
 
-    def _load_split(self, name: str) -> Dataset:
+    def _load_split(self, name: str, augmenter=None) -> Dataset:
         path = Path(f"{self.data_prefix}{name}.h5")
         if not path.exists():
             raise FileNotFoundError(f"Missing split file: {path}")
 
         if self.lazy == "memmap":
-            return self._load_split_memmap(path)
+            return self._load_split_memmap(path, augmenter=augmenter)
         if self.lazy:
-            return self._load_split_lazy(path)
-        return self._load_split_eager(path)
+            return self._load_split_lazy(path, augmenter=augmenter)
+        return self._load_split_eager(path, augmenter=augmenter)
 
-    def _load_split_lazy(self, path: Path) -> LazyHDF5Dataset:
+    def _load_split_lazy(self, path: Path, augmenter=None) -> LazyHDF5Dataset:
         ds = LazyHDF5Dataset(
             h5_path=path,
             tops_mask_key=self.tops_mask_key,
             tops_kin_key=self.tops_kin_key,
             ws_mask_key=self.ws_mask_key,
             ws_kin_key=self.ws_kin_key,
+            augmenter=augmenter,
         )
         return ds
 
-    def _load_split_memmap(self, path: Path) -> MemmapDataset:
+    def _load_split_memmap(self, path: Path, augmenter=None) -> MemmapDataset:
         npy_dir = MemmapDataset.prepare(
             path,
             tops_mask_key=self.tops_mask_key,
@@ -578,9 +700,10 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             ws_mask_key=self.ws_mask_key,
             ws_kin_key=self.ws_kin_key,
             load_interactions=self.load_interactions,
+            augmenter=augmenter,
         )
 
-    def _load_split_eager(self, path: Path) -> MaskedFormerDataSet:
+    def _load_split_eager(self, path: Path, augmenter=None) -> MaskedFormerDataSet:
         with h5py.File(path, "r") as f:
             jet = f["jet"][()]
             src_mask = f["src_mask"][()]
@@ -614,12 +737,13 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             target_kinematics=kins,
             classes=classes,
             object_valid=object_valid if has_partial else None,
+            augmenter=augmenter,
         )
         return ds
 
     def setup(self, stage):
         if stage in (None, "fit", "validate"):
-            self.train_dataset = self._load_split("train")
+            self.train_dataset = self._load_split("train", augmenter=self.train_augmenter)
             self.val_dataset = self._load_split("val")
             mode = {False: "in-memory", True: "lazy", "memmap": "memmap"}.get(self.lazy, str(self.lazy))
             print(f"[DM TopsWs] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}  {mode}")

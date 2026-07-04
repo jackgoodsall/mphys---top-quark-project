@@ -82,6 +82,11 @@ data_modules:
     shuffle: True
     num_workers: 4
     pin_memory: True
+    # D3 train-only augmentation. eta_flip needs model_artefacts.target_transformers
+    # and is incompatible with enable_leptonic (raises at construction).
+    augment:
+      phi_rotation: false
+      eta_flip: false
   test:
     batch_size: 2048
     shuffle: False
