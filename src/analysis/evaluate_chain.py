@@ -23,6 +23,11 @@ Custom threshold (overrides the default 0.0 for logits / 0.5 for probs):
 
 Prior-based binarisation (top-k particles per mask type):
     python analysis/evaluate_chain.py --run_dir ... --prior top=3 W=2
+
+Constrained decoding (cross-chain exclusivity / cardinality) + comparison:
+    python analysis/evaluate_chain.py --run_dir ... --decode exclusive
+    python analysis/evaluate_chain.py --run_dir ... --decode exclusive_prior --enforce_w_subset
+    python analysis/evaluate_chain.py --run_dir ... --compare_decodings
 """
 
 import argparse
