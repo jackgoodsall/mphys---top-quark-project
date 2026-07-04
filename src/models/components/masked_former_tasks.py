@@ -1576,6 +1576,93 @@ class NeutrinoRegressionTask(BaseTask):
         file["target_neutrino_truth"][start_idx:end]  = truth[:, :M].float().cpu().numpy()
 
 
+class ExclusiveAssignmentTask(BaseTask):
+    """
+    Per-particle exclusive-assignment cross-entropy.
+
+    Each valid particle is softmax-assigned to at most one chain (or a
+    background class), enforcing cross-chain exclusivity that the independent
+    per-mask Dice/BCE losses never impose. Headless: reuses the mask logits
+    (``pred_key``) as class scores over the Q chains plus one background class.
+    GT masks per type are chain-exclusive by truthtag construction, so a hard
+    argmax label is well defined.
+
+    ``background="zero"`` (default) appends a constant-0 background column, so a
+    particle is assigned to a chain only when that chain's logit beats 0. A
+    learned per-particle background head (``"learned"``) is deferred to a later
+    ablation: expose a memory-derived scalar via ``MEMORY_OUTPUT_NAMES`` and pass
+    it through ``NON_QUERY_OUTPUTS`` (as ``gate_relevance`` is), then use it as
+    the background column here.
+
+    Post-matching (queries already permuted to target order). Two instances are
+    registered: chains vs jet_mask_true, and chains vs jet_mask_true_W.
+    All Q slots stay in the softmax (fixed shapes); null slots are pushed down —
+    partially redundant with ``null_mask_penalty``, kept for exclusivity.
+    """
+
+    def __init__(
+        self,
+        config: TaskConfig,
+        pred_key: str = 'mask_predictions',
+        target_key: str = 'jet_mask_true',
+        loss_key: str = 'exclusive',
+        background: str = 'zero',
+    ):
+        super().__init__(config)
+        self.pred_key = pred_key
+        self.target_key = target_key
+        self.loss_key = loss_key
+        self.background = background
+
+    def compute_cost(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        # No influence on Hungarian matching.
+        B, Q, _ = predictions[self.pred_key].shape
+        T = next(iter(targets.values())).shape[1]
+        return torch.zeros(B, Q, T, device=predictions[self.pred_key].device)
+
+    def compute_loss(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        logits = predictions[self.pred_key]        # [B, Q, N]
+        tgt = targets[self.target_key]             # [B, Q, N]
+        if tgt.ndim == 2:
+            tgt = tgt.unsqueeze(1)
+
+        B, Q, N = logits.shape
+
+        obj_valid = targets.get('obj_valid_mask')  # [B, Q]
+        if obj_valid is not None:
+            tgt = tgt * obj_valid.float().unsqueeze(-1)   # drop null-slot targets
+
+        tgt_bool = tgt > 0.5
+        has_sig = tgt_bool.any(dim=1)                             # [B, N]
+        chain_idx = tgt_bool.float().argmax(dim=1)               # [B, N] in [0, Q)
+        bg_label = torch.full((B, N), Q, dtype=torch.long, device=logits.device)
+        label = torch.where(has_sig, chain_idx, bg_label)        # [B, N], bg class = Q
+
+        # Background column (constant 0) → class Q. cross_entropy wants [B, C, N].
+        bg_col = logits.new_zeros(B, 1, N)
+        logits_full = torch.cat([logits, bg_col], dim=1)          # [B, Q+1, N]
+
+        ce = F.cross_entropy(logits_full, label, reduction='none')  # [B, N]
+
+        if valid_mask is not None:
+            vm = valid_mask.float()
+            denom = vm.sum().clamp(min=1)
+            loss = (ce * vm).sum() / denom
+        else:
+            loss = ce.mean()
+
+        return self.config.get_loss_weight(self.loss_key) * loss
+
+
 class BackgroundSuppressionTask(BaseTask):
     """
     Penalises high mask logits for background particles (not in any real GT mask)

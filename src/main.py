@@ -16,6 +16,7 @@ from models.components.masked_former_tasks import (
     MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
     BackgroundSuppressionTask, ParticleGatingTask,
     ChainTypeTask, NeutrinoRegressionTask,
+    ExclusiveAssignmentTask,
 )
 from utils.utils import load_and_split_config, load_any_config
 
@@ -241,6 +242,41 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
                 mw_gev=nu_config.get('mw_gev', 80.379),
             )
             task_registry.register_task(neutrino_task)
+
+    # ========================================
+    # Exclusive-Assignment CE Tasks (per-particle cross-chain exclusivity)
+    # Registered only when the config block is present (headless, no params).
+    # ========================================
+    for exc_name, exc_pred, exc_tgt in (
+        ('exclusive_ce', 'mask_predictions', 'jet_mask_true'),
+        ('exclusive_ce_W', 'mask_W', 'jet_mask_true_W'),
+    ):
+        # mask_W / jet_mask_true_W only exist in chain_queries mode.
+        if exc_pred == 'mask_W' and not chain_queries:
+            continue
+        exc_config = task_configs.get(exc_name)
+        if exc_config:
+            exc_task = ExclusiveAssignmentTask(
+                TaskConfig(
+                    name=exc_name,
+                    output_names=[exc_pred],   # reuses existing mask head; no new params
+                    output_dims={},
+                    cost_weights={},
+                    loss_weights={'exclusive': exc_config.get('loss_weight', 0.25)},
+                    max_objects=max_objects,
+                    layer_weights=_build_layer_weights(
+                        layer_config=exc_config.get('layer_weights'),
+                        strategy=exc_config.get('layer_weight_strategy', 'final_only'),
+                        strategy_params=exc_config.get('layer_weight_params', {}),
+                        n_layers=n_decoder_layers,
+                    ),
+                ),
+                pred_key=exc_pred,
+                target_key=exc_tgt,
+                loss_key='exclusive',
+                background=exc_config.get('background', 'zero'),
+            )
+            task_registry.register_task(exc_task)
 
     # ========================================
     # Background Suppression Task
