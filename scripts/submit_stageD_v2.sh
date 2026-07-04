@@ -6,6 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=exp_stageD_v2
 #SBATCH --output=slurm_outputs/exp_stageD_v2_%j.out
+#SBATCH --chdir=/net/scratch/b58521jg/transformers
 
 # Full Stage-D training on v2 data (config/exp_stageD_v2.yaml).
 # Requires scripts/preprocess_v2.sh to have produced masked_targets_combined_v2 first.
@@ -16,7 +17,6 @@ export CUDA_VISIBLE_DEVICES=0,1
 export UV_PROJECT_ENVIRONMENT=.transformer_env
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-cd "$(dirname "$0")/.."
 source .transformer_env/bin/activate
 
 echo "Job ID: $SLURM_JOB_ID  Node: $SLURM_NODELIST  Start: $(date)"

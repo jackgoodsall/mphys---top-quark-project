@@ -6,16 +6,16 @@
 #
 #   sbatch scripts/preprocess_v2.sh      # or: bash scripts/preprocess_v2.sh
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH -p serial
+#SBATCH -p multicore
 #SBATCH --time=4:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=40G
 #SBATCH --job-name=preprocess_v2
 #SBATCH --output=slurm_outputs/preprocess_v2_%j.out
+#SBATCH --chdir=/net/scratch/b58521jg/transformers
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
 export UV_PROJECT_ENVIRONMENT=.transformer_env
 
