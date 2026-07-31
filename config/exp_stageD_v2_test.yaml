@@ -1,0 +1,176 @@
+max_objects: 2
+
+# ============================================================================
+# EXPERIMENT: Full Stage-D run on v2 data (masked_targets_combined_v2).
+# Everything in the recommended bundle PLUS the invariant-mass loss (needs
+# jet_p4_raw) and phi-rotation augmentation. Requires scripts/preprocess_v2.sh first.
+#   uv run src/main.py --config config/exp_stageD_v2.yaml
+# ============================================================================
+tasks:
+  mask:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.2
+    cost_bce_weight: 0.5
+    mask_embed_head: true
+    layer_weights: {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.3, 4: 0.5, 5: 1.0}
+
+  mask_W:
+    cost_weight: 1.0
+    dice_weight: 1.0
+    bce_weight: 0.5
+    null_mask_penalty: 0.1
+    cost_bce_weight: 0.5
+    mask_embed_head: true
+    layer_weights: {0: 0.3, 1: 0.5, 2: 1.0, 3: 0.2, 4: 0.2, 5: 1.0}
+
+  objectness:
+    enabled: false
+
+  exclusive_ce:
+    loss_weight: 0.25
+    background: "zero"
+    layer_weights: {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.3, 4: 0.5, 5: 1.0}
+  exclusive_ce_W:
+    loss_weight: 0.25
+    background: "zero"
+    layer_weights: {0: 0.3, 1: 0.5, 2: 1.0, 3: 0.2, 4: 0.2, 5: 1.0}
+
+  mask_consistency:
+    loss_weight: 0.1
+    margin: 0.0
+    layer_weight_strategy: final_only
+
+  # D4: soft invariant-mass loss (needs jet_p4_raw in the v2 data)
+  invariant_mass:
+    loss_weight: 0.05
+    layer_weight_strategy: final_only
+    m_w: 80.4
+    m_top: 172.5
+    width_w: 15.0
+    width_top: 25.0
+    huber_delta: 1.0
+
+pretraining:
+  mask_pretrain_epochs: 0
+  tasks: ["mask_W"]
+  transition_ramp_epochs: 5
+
+data_modules:
+  input_path: data/topquarkreconstruction/masked_targets_combined_v2   # v2 data
+  input_prefix: "ttbar_preprocessed_"
+  lazy: true
+  load_interactions: true
+  tops_mask_key: "masks_tops"
+  tops_kin_key: "kinematics_tops"
+  ws_mask_key: "masks_Ws"
+  ws_kin_key: "kinematics_Ws"
+  train:
+    batch_size: 1024
+    shuffle: True
+    num_workers: 4
+    pin_memory: True
+    augment:
+      phi_rotation: true             # D3: safe symmetry, no joblib needed
+      eta_flip: false                # enable after verifying v2 eta scaler load
+  test:
+    batch_size: 2048
+    shuffle: False
+    num_workers: 4
+    pin_memory: False
+  val:
+    batch_size: 2048
+    shuffle: False
+    num_workers: 4
+    pin_memory: False
+
+model_parameters:
+  particle_embedder:
+    n_input: 7
+    hidden_sizes: [64]
+    embedding_size: 128
+    p_dropout: 0.0
+
+  interaction_embedder:
+    input_features: 4
+    hidden_layers: [32]
+    output_size: 4
+    p_dropout: 0.0
+
+  transformer:
+    embedding_size: 128
+    n_encoder_layers: 6
+    n_decoder_layers: 6
+    n_heads: 4
+    p_dropout: 0.0
+    dim_ff: 512
+    num_query_tokens: 2
+    hierarchical_decoding: True
+    chain_queries: True
+    hierarchy_order: "w_first"
+    mask_logit_scale: true
+    phase1_mask_overwrite: false
+    masked_cross_attention: true
+    masked_attention_start_epoch: 0
+    use_hungarian_matching: True
+    matching_solver: "gpu_bruteforce"
+    max_targets: 10
+    use_mia_encoder: False
+    n_mia_layers: 0
+    mia_interaction_dim: 64
+    use_vanilla_attention: false
+    use_particle_gating: false
+    n_gating_layers: 2
+    n_gate_queries: 1
+
+model_training:
+  seed: null
+  learning_rate: 2e-4
+  weight_decay: 0.05
+  use_lookahead: False
+  gradient_clip_val: 2
+  precision: "bf16-mixed"
+  matmul_precision: "high"
+  min_epochs: 15
+  max_epochs: 100
+  num_nodes: 1
+  devices: 2
+  strategy: "ddp"
+  accelerator: "gpu"
+
+  scheduler:
+    type: "warmup_cosine"
+    update_interval: "step"
+    warmup_epochs: 5
+    T_max: 100
+    eta_min: 5e-6
+    lr_rewarmup_epochs: 0
+    lr_rewarmup_fraction: 1.5
+    factor: 0.5
+    patience: 3
+    plateau_monitor: "val_loss"
+    step_size: 3000
+    gamma: 0.9
+
+training_callbacks:
+  checkpoint:
+    save_top_k: 3
+    monitor: "val_loss"
+    mode: "min"
+    save_weights_only: False
+    filename: "epoch={epoch}-val_loss={val_loss:.4f}"
+    save_last: True
+  early_stopping:
+    monitor: "val_loss"
+    patience: 20
+    min_delta: 0.0001
+    mode: "min"
+
+inference:
+  mode: "test"
+  checkpoint_path: "exp_stageD_v2/lightning_logs/version_16796452/checkpoints/last.ckpt"
+
+model_artefacts:
+  log_dir: "exp_stageD_v2"
+  target_transformers: "data/topquarkreconstruction/masked_targets_combined_v2/target_transforms.joblib"

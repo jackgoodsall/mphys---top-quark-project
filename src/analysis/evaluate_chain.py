@@ -90,11 +90,15 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
         if not p.exists():
             sys.exit(f"ERROR: required file not found: {p}")
 
-    # At least one objectness file must exist
+    # Objectness is optional: chain-CE models predict slot validity via the mask
+    # decoding, not a separate objectness head. Truth validity comes from
+    # slot_valid in the mask files; pred_obj=None is handled downstream (strict
+    # mode simply falls back to mask-presence). Warn rather than exit when absent.
     if not obj_top_path.exists() and not obj_W_path.exists():
-        sys.exit(
-            f"ERROR: no objectness files found. Expected at least one of:\n"
-            f"  {obj_top_path}\n  {obj_W_path}"
+        print(
+            "[warn] no objectness files found — using slot_valid from mask outputs "
+            "for truth validity; predicted validity derived from mask decoding.",
+            file=sys.stderr,
         )
 
     scores_key = "predicted_masks_prob" if use_probs else "predicted_masks_logits"

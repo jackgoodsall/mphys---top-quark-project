@@ -507,16 +507,25 @@ if __name__ == "__main__":
         assert ckpt_path is not None, (
             "inference.checkpoint_path must be set in config for test mode"
         )
+        test_accel = config.get("model_training", {}).get("accelerator", "auto")
+        map_location = "cpu" if test_accel == "cpu" else None
         lightning_model = ReconstructionTrainer.load_from_checkpoint(
             ckpt_path,
             model=transformer_model,
             task_registry=task_registry,
             config=config,
+            map_location=map_location,
         )
         slurm_id = os.environ.get("SLURM_JOB_ID")
         version = int(slurm_id) if slurm_id else None
         logger = TensorBoardLogger(log_dir, version=version)
-        trainer = pl.Trainer(default_root_dir=log_dir, logger=logger)
+        trainer = pl.Trainer(
+            default_root_dir=log_dir,
+            logger=logger,
+            accelerator=test_accel,
+            devices=1,
+            limit_test_batches=inf_cfg.get("limit_test_batches", 1.0),
+        )
         trainer.test(lightning_model, datamodule=topantitopquark)
 
     elif mode == "resume":

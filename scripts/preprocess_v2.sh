@@ -6,7 +6,7 @@
 #
 #   sbatch scripts/preprocess_v2.sh      # or: bash scripts/preprocess_v2.sh
 # ─────────────────────────────────────────────────────────────────────────────
-#SBATCH -p multicore
+#SBATCH -p multicore_small
 #SBATCH --time=4:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -25,6 +25,8 @@ echo "=== Stage D v2 preprocessing ==="
 echo "Start: $(date)   Node: ${SLURM_NODELIST:-local}"
 
 mkdir -p slurm_outputs data/topquarkreconstruction/masked_targets_combined_v2
+
+source .transformer_env/bin/activate
 
 uv run src/data/preprocessing.py --config config/preprocessing_config_v2.yaml
 
