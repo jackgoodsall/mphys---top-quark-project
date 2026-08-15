@@ -1,0 +1,13 @@
+base_config: ../top_reconstruction_config.yaml
+
+# More capacity in the physics-aware pair pathway and eight attention heads.
+# Tests whether pair features are currently bottlenecked before the decoder.
+model_parameters:
+  interaction_embedder:
+    hidden_layers: [64, 64, 64]
+    output_size: 8
+  transformer:
+    n_heads: 8
+
+model_artefacts:
+  log_dir: model_improvement/E_arch02_pair_capacity

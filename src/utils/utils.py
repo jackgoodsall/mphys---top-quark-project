@@ -2,13 +2,9 @@ import yaml
 from pydantic import BaseModel
 from typing import Dict, Any
 from pathlib import Path
+from copy import deepcopy
 import h5py
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
 import numpy as np
-import vector
-import joblib
-from src.data_utils.scalers import *
 
 ## Define some config models so that we have a first layer file 
 ## on passing bricked configs
@@ -33,10 +29,31 @@ def load_and_split_config(config_input_file: str) -> BaseConfig:
     cfg = BaseConfig(**raw_config)
     return cfg
 
+def _merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge mapping values; lists and scalars replace the base."""
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
 def load_any_config(config_input_file: str) -> Dict[str, Any]:
-    with open(config_input_file, "r") as f:
-        raw_config = yaml.safe_load(f)
-    return raw_config
+    """Load YAML, optionally extending a base config relative to the file."""
+    path = Path(config_input_file).resolve()
+    with path.open("r") as f:
+        raw_config = yaml.safe_load(f) or {}
+
+    base_name = raw_config.pop("base_config", None)
+    if base_name is None:
+        return raw_config
+
+    base_path = (path.parent / base_name).resolve()
+    if base_path == path:
+        raise ValueError(f"Config cannot extend itself: {path}")
+    return _merge_config(load_any_config(str(base_path)), raw_config)
 
 def reverse_transform_variables(
         X,
@@ -46,6 +63,8 @@ def reverse_transform_variables(
     Takes in the variables and a reverse transformer, and returns the 
     reversered transformation of the variables.
     """
+    from src.data_utils.scalers import PhiTransformer
+
     parts = []
     off_set = 0
     for number, transformer in enumerate(reverse_transform_tuple):
@@ -111,6 +130,9 @@ def load_top_targets_with_event_selection(
     event_mask : np.ndarray, shape (n_events,)
         Boolean mask: True for events with all_W_matched == 1.
     """
+    import h5py
+    import vector
+
     with h5py.File(original_data_file_path, "r") as f:
         particles = f[particles_dataset][()]   # (N_events, N_particles, N_features)
         event_data = f[event_dataset][()]      # (N_events, N_event_features)
@@ -156,6 +178,8 @@ def add_four_momenta(p1, p2, cord_sys="polar"):
     Input is (..., 4): either (pt, eta, phi, E) or (E, px, py, pz).
     Returns (..., 5): (pt, eta, phi, E, inv_mass).
     """
+
+    import vector
 
     p1 = np.asarray(p1)
     p2 = np.asarray(p2)
@@ -210,7 +234,10 @@ def plot_2d_histogram(
         Y_label,
         title,
         fig_save_path
-):  
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
     fig  = plt.figure()
     X_plot_range = (np.min(X), np.max(X))
     Y_plot_range = (np.min(Y), np.max(Y))
@@ -254,6 +281,8 @@ def plot_difference_hist(
     """
     Plot histogram of (Y - X), i.e. reco - truth.
     """
+    import matplotlib.pyplot as plt
+
     X = X.reshape(-1)
     Y = Y.reshape(-1)
 
@@ -330,6 +359,8 @@ def plot_reco_truth(
     axes : tuple of matplotlib.axes.Axes
         (ax_top, ax_bottom)
     """
+    import matplotlib.pyplot as plt
+
     X = X.reshape(-1)
     Y = Y.reshape(-1)
     
@@ -430,6 +461,9 @@ def generate_reconstruction_report(
     if not Path(test_output_file_path).exists():
         raise FileNotFoundError(f"Test output file {test_output_file_path} does not exist")
     Path(report_file_dir).mkdir(exist_ok = True)
+
+    import h5py
+    import joblib
 
     with h5py.File(test_output_file_path, "r") as file_object:
         targets = file_object["targets"][()]
@@ -649,5 +683,3 @@ def generate_reconstruction_report(
     truth_label="Truth",
     reco_label="Reco",
     )
-
-  

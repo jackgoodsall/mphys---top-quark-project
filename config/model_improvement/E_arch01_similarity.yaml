@@ -1,0 +1,16 @@
+base_config: ../top_reconstruction_config.yaml
+
+# Learned query-to-jet embeddings plus scaled mask logits.
+# Tests whether the raw dot product is limiting jet ranking.
+tasks:
+  mask:
+    mask_embed_head: true
+  mask_W:
+    mask_embed_head: true
+
+model_parameters:
+  transformer:
+    mask_logit_scale: true
+
+model_artefacts:
+  log_dir: model_improvement/E_arch01_similarity

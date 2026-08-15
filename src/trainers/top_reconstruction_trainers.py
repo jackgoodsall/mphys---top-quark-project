@@ -5,7 +5,6 @@ from lightning.pytorch.loggers import TensorBoardLogger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from pathlib import Path
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
@@ -761,6 +760,8 @@ class ReconstructionTrainer(lightning.LightningModule):
             return
         if self.trainer.logger is None:
             return
+        import matplotlib.pyplot as plt
+
         out_dir = Path(self.trainer.logger.log_dir)
 
         fig_path = out_dir / "loss_curves.png"
