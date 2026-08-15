@@ -1,6 +1,6 @@
 """Data pipeline: HDF5 loading, Dataset, DataModule, and collate function."""
 
-from data.datamodule import (
+from .datamodule import (
     MaskedFormerDataSet,
     LazyHDF5Dataset,
     MaskedFormerTopsWsDataModule,

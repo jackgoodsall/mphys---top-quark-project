@@ -269,6 +269,12 @@ def main():
     # 1. Build model architecture from config
     # ------------------------------------------------------------------
     config = _load_config(args.config)
+    if config.get("model_parameters", {}).get("transformer", {}).get("chain_queries", False):
+        raise SystemExit(
+            "true_jets_inference.py is a legacy oracle utility for the typed-query "
+            "model. The active chain-query model writes top/W outputs directly; "
+            "use evaluate_chain.py for it."
+        )
 
     particle_embedder    = ParticleEmbedder(**config["model_parameters"]["particle_embedder"])
     interactions_embedder = InteractionEmbedder(**config["model_parameters"]["interaction_embedder"])
@@ -291,9 +297,11 @@ def main():
         config=config,
         strict=False,
     )
-    # Zero out type_embeddings so randomly-initialised weights don't corrupt
-    # target_tokens for checkpoints trained without type embeddings.
-    lightning_model.model.type_embeddings.weight.data.zero_()
+    # Zero out typed-query embeddings so randomly-initialised weights do not
+    # corrupt legacy oracle comparisons for checkpoints trained without them.
+    type_embeddings = getattr(lightning_model.model, "type_embeddings", None)
+    if type_embeddings is not None:
+        type_embeddings.weight.data.zero_()
     lightning_model.eval()
     lightning_model.to(device)
     print(f"Loaded checkpoint: {args.ckpt}")

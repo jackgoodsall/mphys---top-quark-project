@@ -17,6 +17,9 @@ tasks:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
+    rank_weight: 0.0       # opt-in after decoding headroom is measured
+    rank_margin: 1.0
+    rank_temperature: 0.5
     null_mask_penalty: 0.2
     cost_bce_weight: 0.0       # E5: BCE term added to Hungarian matching cost (0 = Dice-only)
     mask_embed_head: false     # B1: learned MLP on queries before the mask einsum
@@ -28,6 +31,9 @@ tasks:
     cost_weight: 1.0
     dice_weight: 1.0
     bce_weight: 0.5
+    rank_weight: 0.0       # opt-in after decoding headroom is measured
+    rank_margin: 1.0
+    rank_temperature: 0.5
     null_mask_penalty: 0.2
     cost_bce_weight: 0.0       # falls back to mask.cost_bce_weight if omitted
     mask_embed_head: false     # falls back to mask.mask_embed_head if omitted
@@ -36,7 +42,7 @@ tasks:
     # layer_weights: {0: 0.3, 1: 0.5, 2: 1.0, 3: 0.2, 4: 0.2, 5: 1.0}
 
   objectness:
-    enabled: True             # conditional registration; old ckpts trained WITH objectness
+    enabled: False            # opt-in only; headline efficiency never gates on objectness
     cost_weight: 0
     loss_weight: 0
     head_norm: True
@@ -90,8 +96,10 @@ data_modules:
   train:
     batch_size: 1024          # per-GPU; effective = 1024 x 2 GPUs = 2048
     shuffle: True
-    num_workers: 4
+    num_workers: 3
     pin_memory: True
+    persistent_workers: True
+    prefetch_factor: 4
     # D3 train-only augmentation. eta_flip needs model_artefacts.target_transformers
     # and is incompatible with enable_leptonic (raises at construction).
     augment:
@@ -100,13 +108,17 @@ data_modules:
   test:
     batch_size: 2048
     shuffle: False
-    num_workers: 4
+    num_workers: 3
     pin_memory: False
+    persistent_workers: True
+    prefetch_factor: 2
   val:
     batch_size: 2048
     shuffle: False
-    num_workers: 4
+    num_workers: 3
     pin_memory: False
+    persistent_workers: True
+    prefetch_factor: 2
 
 model_parameters:
   particle_embedder:
@@ -114,6 +126,7 @@ model_parameters:
     hidden_sizes: [64]
     embedding_size: 128
     p_dropout: 0.0
+    debug_checks: false
 
   interaction_embedder:
     input_features: 4
@@ -134,6 +147,7 @@ model_parameters:
     hierarchy_order: "w_first"  # "top_first" | "w_first" — controls which decoder phase runs first
     mask_logit_scale: false     # B1: multiply mask logits by embedding_size**-0.5 (attention temperature)
     phase1_mask_overwrite: true # B1: baseline. Set false with mask_embed_head + B2 deep supervision
+    debug_checks: false          # enable expensive NaN/extreme-value checks for diagnostics
     masked_cross_attention: false     # C: queries attend only inside their predicted mask
     masked_attention_start_epoch: 0   # C: epoch to switch masking on (3 if early val divergence)
     use_hungarian_matching: True
@@ -148,15 +162,15 @@ model_parameters:
     n_gate_queries: 1
 
 model_training:
-  seed: null
+  seed: 0
   learning_rate: 2e-4
-  weight_decay: 0.05
+  weight_decay: 0.01
   use_lookahead: False
   gradient_clip_val: 2
   precision: "bf16-mixed"   # "32-true" | "16-mixed" | "bf16-mixed" [recommended] | "bf16-true" | "64-true"
   matmul_precision: "high"  # "highest" (FP32) | "high" (TF32, recommended) | "medium" (BF16)
   min_epochs: 15
-  max_epochs: 100
+  max_epochs: 60
   # DDP configuration
   num_nodes: 1              # number of SLURM nodes
   devices: 2                # GPUs per node
@@ -168,11 +182,11 @@ model_training:
     update_interval: "step"   # "step" (every batch) or "epoch" (once per epoch)
 
     # --- warmup_cosine ---
-    warmup_epochs: 5          # linear ramp 0 → lr
-    T_max: 100                # total epochs for cosine decay
-    eta_min: 5e-6             # floor LR at end of cosine decay
+    warmup_epochs: 1          # linear ramp 0 → lr
+    T_max: 60                 # total epochs for cosine decay
+    eta_min: 4e-6             # floor LR at end of cosine decay
     lr_rewarmup_epochs: 0     # re-warmup at phase transition; 0 = disabled
-    lr_rewarmup_fraction: 1.5 # start re-warmup at this fraction of base LR
+    lr_rewarmup_fraction: 0.3 # start re-warmup at this fraction of base LR
 
     # --- plateau ---
     factor: 0.5
@@ -189,18 +203,30 @@ training_callbacks:
     monitor: "val_loss"
     mode: "min"
     save_weights_only: False
-    filename: "epoch={epoch}-val_loss={val_loss:.4f}"
+    filename: "epoch{epoch:03d}-val_loss{val_loss:.4f}"
+    auto_insert_metric_name: false
     save_last: True
 
   early_stopping:
+    enabled: False            # fixed-budget ablations; compare early stopping separately
     monitor: "val_loss"
     patience: 20  # long enough to survive the pretraining→multi-task phase transition
     min_delta: 0.0001
     mode: "min"
 
+  efficiency_checkpoint:
+    enabled: True
+    save_top_k: 1
+    monitor: "val_ttbar_eff"
+    mode: "max"
+    save_weights_only: False
+    filename: "epoch{epoch:03d}-val_ttbar_eff{val_ttbar_eff:.4f}"
+    auto_insert_metric_name: false
+    save_last: False
+
 inference:
   mode: "train"              # "train" | "test" | "resume" | "lr_find"
-  checkpoint_path: "/mnt/iusers01/fse-ugpgt01/phy01/b58521jg/scratch/transformers/masked_reconstruction/lightning_logs/version_12489040/checkpoints/epoch=epoch=99-val_loss=val_loss=1.2272.ckpt"
+  checkpoint_path: null
 
 model_artefacts:
   log_dir: "masked_reconstruction"

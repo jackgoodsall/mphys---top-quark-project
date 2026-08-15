@@ -227,7 +227,7 @@ def binarise_predictions(scores, jet_valid, prior_k, use_probs, threshold=None):
 
 def decode_constrained(scores_top, scores_W, jet_valid, mode,
                        k_top=3, k_W=2, bg_threshold=None, use_probs=False,
-                       enforce_w_subset=False):
+                       enforce_w_subset=False, fixed_cardinality=True):
     """
     Cross-chain-constrained decoding of top / W masks.
 
@@ -236,12 +236,20 @@ def decode_constrained(scores_top, scores_W, jet_valid, mode,
       "exclusive"       – per particle, argmax over chains; assign iff the winning
                           score beats the background threshold (cross-chain exclusivity).
       "exclusive_prior" – as above, but each chain is expanded into k slots and a
-                          per-event Hungarian assignment (scipy.linear_sum_assignment
-                          on -score) caps cardinality (k_top per top, k_W per W).
+        per-event Hungarian assignment (scipy.linear_sum_assignment
+        on -score) caps cardinality (k_top per top, k_W per W).
+      "legal" / "projected" – joint two-chain decoding with W subset of its
+        top, disjoint chains, and optional fixed cardinalities.
     enforce_w_subset:   intersect each chain's W mask with its own top mask.
 
     Returns (top_bin, W_bin) boolean arrays [N, Q, P].
     """
+    if mode in ("legal", "projected"):
+        return decode_legal(
+            scores_top, scores_W, jet_valid, k_top=k_top, k_W=k_W,
+            bg_threshold=bg_threshold, use_probs=use_probs,
+            fixed_cardinality=fixed_cardinality,
+        )
     if bg_threshold is None:
         bg_threshold = 0.5 if use_probs else 0.0
 
@@ -291,6 +299,144 @@ def decode_constrained(scores_top, scores_W, jet_valid, mode,
         W_bin = W_bin & top_bin
 
     return top_bin, W_bin
+
+
+def _legal_threshold_candidate(scores_top, scores_W, valid, threshold):
+    """Make the ordinary threshold prediction legal by resolving chain ties."""
+    N, Q, P = scores_top.shape
+    top_bin = np.zeros((N, Q, P), dtype=bool)
+    W_bin = np.zeros((N, Q, P), dtype=bool)
+
+    top_selected = (scores_top > threshold) & valid[:, None, :]
+    W_selected = (scores_W > threshold) & valid[:, None, :]
+    # A threshold prediction can select both chains for one jet.  Resolve the
+    # tie using the joint top+W score; W is then only allowed on that chain.
+    top_gain = np.where(top_selected, scores_top - threshold, -np.inf)
+    W_gain = np.where(W_selected, scores_W - threshold, 0.0)
+    top_choice = np.argmax(top_gain + W_gain, axis=1)
+    has_top = top_selected.any(axis=1)
+    n_idx, p_idx = np.nonzero(has_top)
+    q_idx = top_choice[n_idx, p_idx]
+    top_bin[n_idx, q_idx, p_idx] = True
+    W_choice = W_selected[n_idx, q_idx, p_idx]
+    if np.any(W_choice):
+        top_n = n_idx[W_choice]
+        top_p = p_idx[W_choice]
+        top_q = q_idx[W_choice]
+        W_bin[top_n, top_q, top_p] = True
+    return top_bin, W_bin
+
+
+def decode_legal(scores_top, scores_W, jet_valid, k_top=3, k_W=2,
+                 bg_threshold=None, use_probs=False,
+                 fixed_cardinality=True):
+    """Decode two chain queries into a legal joint top/W assignment.
+
+    Every valid jet is assigned to at most one chain, and a W assignment is
+    only possible when that jet is assigned to the same chain's top.  The
+    ordinary threshold assignment is always a candidate.  When feasible, an
+    exact ``k_top``/``k_W`` candidate per chain is considered as well and the
+    candidate with the greatest centred score is returned.  Thus an event
+    with too few valid jets, or a model that prefers fewer objects, safely
+    falls back to the threshold candidate.
+    """
+    scores_top = np.asarray(scores_top)
+    scores_W = np.asarray(scores_W)
+    valid = np.asarray(jet_valid).astype(bool)
+    if scores_top.ndim != 3 or scores_W.shape != scores_top.shape:
+        raise ValueError("scores_top and scores_W must have the same [N, Q, P] shape")
+    if scores_top.shape[1] != 2:
+        raise ValueError("legal decoding requires exactly two chain queries")
+    if valid.shape != scores_top.shape[::2]:
+        raise ValueError("jet_valid must have shape [N, P]")
+    if bg_threshold is None:
+        bg_threshold = 0.5 if use_probs else 0.0
+    if k_top is None or k_W is None:
+        fixed_cardinality = False
+    if fixed_cardinality and (k_top < 0 or k_W < 0 or k_W > k_top):
+        raise ValueError("cardinalities must satisfy 0 <= k_W <= k_top")
+
+    threshold_candidate = _legal_threshold_candidate(
+        scores_top, scores_W, valid, bg_threshold
+    )
+    best_top, best_W = threshold_candidate
+
+    # Keep non-finite scores out of the optimisation without allowing them to
+    # win a comparison against the threshold candidate.
+    top_scores = np.nan_to_num(scores_top.astype(float), nan=-np.inf)
+    W_scores = np.nan_to_num(scores_W.astype(float), nan=-np.inf)
+    top_gain = top_scores - bg_threshold
+    W_gain = W_scores - bg_threshold
+    N, _, P = scores_top.shape
+
+    if fixed_cardinality:
+        for n in range(N):
+            valid_cols = np.flatnonzero(valid[n])
+            if valid_cols.size < 2 * k_top or k_W > k_top:
+                continue
+
+            target = (k_top, k_W, k_top, k_W)
+            # state = (top_0, W_0, top_1, W_1); each jet gets one state.
+            states = {(0, 0, 0, 0): (0.0, ())}
+            for p in valid_cols:
+                next_states = {}
+                for state, (value, decisions) in states.items():
+                    # Skipping a jet is always legal and keeps the decision
+                    # trace aligned with valid_cols for reconstruction.
+                    skip = (value, decisions + ((None, False),))
+                    previous = next_states.get(state)
+                    if previous is None or skip[0] > previous[0]:
+                        next_states[state] = skip
+                    for q in (0, 1):
+                        t_index = 0 if q == 0 else 2
+                        w_index = 1 if q == 0 else 3
+                        if state[t_index] >= k_top:
+                            continue
+                        top_state = list(state)
+                        top_state[t_index] += 1
+                        top_state = tuple(top_state)
+                        option_value = value + top_gain[n, q, p]
+                        option = (q, False)
+                        previous = next_states.get(top_state)
+                        if previous is None or option_value > previous[0]:
+                            next_states[top_state] = (
+                                option_value, decisions + (option,)
+                            )
+
+                        if state[w_index] >= k_W:
+                            continue
+                        both_state = list(top_state)
+                        both_state[w_index] += 1
+                        both_state = tuple(both_state)
+                        both_value = option_value + W_gain[n, q, p]
+                        option = (q, True)
+                        previous = next_states.get(both_state)
+                        if previous is None or both_value > previous[0]:
+                            next_states[both_state] = (
+                                both_value, decisions + (option,)
+                            )
+                states = next_states
+
+            result = states.get(target)
+            if result is None or not np.isfinite(result[0]):
+                continue
+            top_candidate = np.zeros((2, P), dtype=bool)
+            W_candidate = np.zeros((2, P), dtype=bool)
+            for p, (q, has_W) in zip(valid_cols, result[1]):
+                if q is None:
+                    continue
+                top_candidate[q, p] = True
+                if has_W:
+                    W_candidate[q, p] = True
+            threshold_score = float(
+                top_gain[n][best_top[n]].sum() +
+                W_gain[n][best_W[n]].sum()
+            )
+            if result[0] > threshold_score:
+                best_top[n] = top_candidate
+                best_W[n] = W_candidate
+
+    return best_top, best_W
 
 
 # ---------------------------------------------------------------------------
@@ -1050,12 +1196,13 @@ def main():
         help="Only count a W as real when its corresponding top is also real",
     )
     parser.add_argument(
-        "--decode", choices=["threshold", "topk", "exclusive", "exclusive_prior"],
+        "--decode", choices=["threshold", "topk", "exclusive", "exclusive_prior", "legal", "projected"],
         default="threshold",
         help=(
             "Decoding strategy. 'threshold'/'topk' use --threshold/--prior (default). "
             "'exclusive' = per-particle argmax over chains (cross-chain exclusivity). "
-            "'exclusive_prior' = exclusive + per-chain cardinality via Hungarian."
+            "'exclusive_prior' = exclusive + per-chain cardinality via Hungarian. "
+            "'legal'/'projected' = joint legal projection (W subset, disjoint chains, cardinality)."
         ),
     )
     parser.add_argument(
@@ -1118,8 +1265,10 @@ def main():
         else:
             top_bin, W_bin = decode_constrained(
                 pred_scores_top, pred_scores_W, jet_valid, mode=decode,
-                k_top=(prior_top or 3), k_W=(prior_W or 2),
-                use_probs=args.use_probs, enforce_w_subset=args.enforce_w_subset,
+                k_top=(prior_top if prior_top is not None else 3),
+                k_W=(prior_W if prior_W is not None else 2),
+                bg_threshold=args.threshold, use_probs=args.use_probs,
+                enforce_w_subset=args.enforce_w_subset,
             )
             # Feed binarised masks back through the standard pipeline as {0,1}
             # pseudo-probabilities at threshold 0.5 (recovers the exact masks).
@@ -1134,7 +1283,7 @@ def main():
         return res
 
     if args.compare_decodings:
-        modes = ["threshold", "exclusive", "exclusive_prior"]
+        modes = ["threshold", "exclusive", "exclusive_prior", "legal"]
         all_res = {m: _run_decode(m) for m in modes}
         print(f"\n=== Decoding comparison: {run_dir} ===")
         hdr = f"  {'decode':<16}{'top_eff':>9}{'W_eff':>9}{'ttbar_eff':>11}{'exact_match':>13}"

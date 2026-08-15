@@ -1,5 +1,4 @@
 /.transformer_env
-/src/data_utils
 /data/
 /lightning_logs/
 /checkpoints/
@@ -13,7 +12,6 @@ submit.sh
 /slurm_outputs/
 /masked_reconstruction/
 /MaskedFormerSlurmOutputs/  
-/src/models/components/matcher.py
 
 __pycache__/
 *.py[cod]

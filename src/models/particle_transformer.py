@@ -12,8 +12,10 @@ class ParticleEmbedder(nn.Module):
                  n_input,
                  hidden_sizes,
                  embedding_size,
-                 p_dropout):
+                 p_dropout,
+                 debug_checks: bool = False):
         super().__init__()
+        self.debug_checks = debug_checks
 
         self.layer_sizes = [n_input] + hidden_sizes 
         self.layers = nn.ModuleList()
@@ -26,15 +28,16 @@ class ParticleEmbedder(nn.Module):
         # Clip input to prevent extreme values from causing NaNs in Linear layers
         X = torch.clamp(X, min=-100.0, max=100.0)
         
-        # Check for NaNs in INPUT to embedder
-        if torch.isnan(X).any():
+        # Optional diagnostics: these reductions synchronize the GPU with the
+        # host, so keep them off in normal training.
+        if self.debug_checks and torch.isnan(X).any():
             nan_count = torch.isnan(X).sum().item()
             raise RuntimeError(f"NaN in ParticleEmbedder INPUT (after clipping)! {nan_count} NaNs out of {X.numel()}")
         
         for i, layer in enumerate(self.layers):
             X = layer(X)
             # Debug: check for NaN after each layer
-            if torch.isnan(X).any():
+            if self.debug_checks and torch.isnan(X).any():
                 nan_count = torch.isnan(X).sum().item()
                 layer_name = layer.__class__.__name__
                 raise RuntimeError(f"NaN after ParticleEmbedder layer {i} ({layer_name})! {nan_count} NaNs out of {X.numel()}")
@@ -154,6 +157,7 @@ class MaskedReconstructionPart(nn.Module):
                  phase1_mask_overwrite: bool = True,
                  masked_cross_attention: bool = False,
                  masked_attention_start_epoch: int = 0,
+                 debug_checks: bool = False,
                  **kwargs
                  ):
         super().__init__()
@@ -167,6 +171,7 @@ class MaskedReconstructionPart(nn.Module):
         self.use_mia_encoder = use_mia_encoder
         self.use_vanilla_attention = use_vanilla_attention
         self.enable_leptonic = enable_leptonic
+        self.debug_checks = debug_checks
 
         # Mask-logit √d scaling (B1) — attention-style temperature on the query·memory
         # dot product. Independent of the mask-embed MLP; recommended together.
@@ -291,6 +296,7 @@ class MaskedReconstructionPart(nn.Module):
 
         # Build prediction heads from task registry
         self.prediction_heads = self._build_prediction_heads(embedding_size)
+        self._freeze_inactive_heads()
 
         # Pre-compute which output names are needed per decoder layer.
         # Layers where a task's layer_weight == 0 skip that task's heads,
@@ -304,6 +310,20 @@ class MaskedReconstructionPart(nn.Module):
                 num_queries=num_query_tokens,
                 max_targets=max_targets,
             )
+
+    def _freeze_inactive_heads(self) -> None:
+        """Keep zero-weight task heads loadable without creating DDP dead params."""
+        live_outputs = set()
+        for task in self.task_registry.tasks.values():
+            has_loss = any(float(weight) != 0.0 for weight in task.config.loss_weights.values())
+            has_cost = any(float(weight) != 0.0 for weight in task.config.cost_weights.values())
+            if has_loss or has_cost:
+                live_outputs.update(task.config.output_names)
+
+        for output_name, head in self.prediction_heads.items():
+            if output_name not in live_outputs:
+                for parameter in head.parameters():
+                    parameter.requires_grad_(False)
     
     def _build_layer_output_map(self, n_decoder_layers: int) -> Dict[int, set]:
         """
@@ -393,26 +413,28 @@ class MaskedReconstructionPart(nn.Module):
         src_mask = X["src_mask"]
         targets = X.get("targets", None)
         
-        # Input validation: check for NaNs in raw inputs (exclude infs which might be intentional padding)
-        if torch.isnan(jet).any():
+        # Optional input validation. NaN reductions are intentionally disabled
+        # during normal training because they force a GPU→CPU synchronization.
+        if self.debug_checks and torch.isnan(jet).any():
             nan_count = torch.isnan(jet).sum().item()
             nan_pct = 100.0 * nan_count / jet.numel()
             raise RuntimeError(f"NaN in input jet features! {nan_count} NaNs ({nan_pct:.2f}% of {jet.numel()} total values)")
-        if torch.isnan(interactions).any():
+        if self.debug_checks and torch.isnan(interactions).any():
             nan_count = torch.isnan(interactions).sum().item()
             nan_pct = 100.0 * nan_count / interactions.numel()
             raise RuntimeError(f"NaN in input interactions! {nan_count} NaNs ({nan_pct:.2f}% of {interactions.numel()} total values)")
         
         # Check for extreme values that might cause overflow
-        jet_max = jet.abs().max().item()
-        if jet_max > 1e6:
-            raise RuntimeError(f" Extreme value in jet features: max={jet_max:.2e}, this will cause NaN in embedder")
+        if self.debug_checks:
+            jet_max = jet.abs().max().item()
+            if jet_max > 1e6:
+                raise RuntimeError(f" Extreme value in jet features: max={jet_max:.2e}, this will cause NaN in embedder")
         
         # Embed
         jet = self.particle_embedder(jet, src_mask=~src_mask)
 
         # NaN detection after embeddings (-inf is allowed for attention masking)
-        if torch.isnan(jet).any():
+        if self.debug_checks and torch.isnan(jet).any():
             raise RuntimeError(f"NaN after particle embedder!")
 
         # Leptonic-extension: add per-particle type embedding (jet=0, lepton=1)
@@ -424,7 +446,7 @@ class MaskedReconstructionPart(nn.Module):
             interactions = None
         else:
             interactions = self.interaction_embedder(interactions, src_mask=~src_mask)
-            if torch.isnan(interactions).any():
+            if self.debug_checks and torch.isnan(interactions).any():
                 nan_mask = torch.isnan(interactions)
                 raise RuntimeError(f"NaN after interaction embedder! Found {nan_mask.sum()} NaN values")
 
@@ -452,11 +474,15 @@ class MaskedReconstructionPart(nn.Module):
         for layer in self.encoder_stack:
             memory = layer(memory, interactions)
 
+        # Particle gating: scale encoder memory by learned per-particle relevance
+        gate_relevance = None
+        if self.particle_gating is not None:
+            gate_relevance, memory = self.particle_gating(memory, src_key_padding_mask=~src_mask)
+
         # Leptonic-extension: prepend global token to decoder cross-attention memory.
-        # The encoder sees particles only (interactions matrix is [B,C,N,N]).
-        # After encoding, we prepend the global token so decoder queries can attend to it.
-        # The mask einsum (query × memory) uses particle-only memory to stay aligned with
-        # target masks; global token is silently excluded from that computation.
+        # Build this after optional particle gating so the decoder actually sees
+        # the gated representation. The mask einsum below still uses particle-only
+        # memory, keeping target-mask columns aligned.
         if self.global_embedder is not None and 'globals' in X:
             global_tok = self.global_embedder(X['globals'])          # [B, 1, D]
             _global_valid = src_mask.new_ones(B, 1)
@@ -465,11 +491,6 @@ class MaskedReconstructionPart(nn.Module):
         else:
             dec_memory   = memory
             dec_src_mask = src_mask
-        
-        # Particle gating: scale encoder memory by learned per-particle relevance
-        gate_relevance = None
-        if self.particle_gating is not None:
-            gate_relevance, memory = self.particle_gating(memory, src_key_padding_mask=~src_mask)
 
         # Initialize queries
         if self.chain_queries:
@@ -823,6 +844,11 @@ class MaskedReconstructionPart(nn.Module):
         # and the W mask task can access 'jet_mask_true_W' in targets.
         if self.chain_queries:
             T_merged = targets_batched['jet_mask_true'].shape[1]
+            if T_merged % 2:
+                raise ValueError(
+                    "chain_queries expects merged top/W targets with an even "
+                    f"object dimension, got {T_merged}"
+                )
             T_chains = T_merged // 2
 
             targets_batched = dict(targets_batched)  # shallow copy to avoid mutating input
@@ -830,14 +856,51 @@ class MaskedReconstructionPart(nn.Module):
             targets_batched['jet_mask_true'] = jmt[:, :T_chains, :]    # top masks
             targets_batched['jet_mask_true_W'] = jmt[:, T_chains:, :]  # W masks
 
-            # Per-type validity (before the AND) — saved for per-type efficiency eval.
+            # Per-type validity (before the chain-level reduction) — saved for
+            # per-type efficiency evaluation.
             top_valid = target_valid_mask[:, :T_chains]
             w_valid_tgt = target_valid_mask[:, T_chains:]
             targets_batched['top_valid'] = top_valid          # [B, T_chains]
             targets_batched['w_valid'] = w_valid_tgt          # [B, T_chains]
 
-            # Chain j is valid only when both top_j and W_j are present.
-            target_valid_mask = top_valid & w_valid_tgt  # [B, T_chains]
+            # A chain remains matchable when either type is present.  The
+            # per-type masks above keep the top/W losses and evaluation gates
+            # from supervising the missing half.
+            chain_valid = top_valid | w_valid_tgt
+
+            # The matchers use a compact target prefix, while data validity can
+            # be non-contiguous (for example [False, True]).  Compact each
+            # chain's top/W pair together before matching so a valid chain is
+            # never silently matched against an invalid target column.
+            compact_order = torch.argsort(chain_valid.to(torch.int8), dim=1, descending=True)
+
+            def _compact_slots(values):
+                index = compact_order
+                while index.ndim < values.ndim:
+                    index = index.unsqueeze(-1)
+                return values.gather(1, index.expand_as(values))
+
+            targets_batched['jet_mask_true'] = _compact_slots(targets_batched['jet_mask_true'])
+            targets_batched['jet_mask_true_W'] = _compact_slots(targets_batched['jet_mask_true_W'])
+            targets_batched['top_valid'] = _compact_slots(top_valid)
+            targets_batched['w_valid'] = _compact_slots(w_valid_tgt)
+
+            # Kinematics are stored as tops followed by Ws; keep the same
+            # chain permutation for both halves when optional tasks are used.
+            for kin_key in ('target_kinematics', 'kinematics'):
+                kin = targets_batched.get(kin_key)
+                if kin is not None and kin.ndim >= 3 and kin.shape[1] >= 2 * T_chains:
+                    targets_batched[kin_key] = torch.cat(
+                        (_compact_slots(kin[:, :T_chains]),
+                         _compact_slots(kin[:, T_chains:2 * T_chains])),
+                        dim=1,
+                    )
+            for chain_key in ('chain_type', 'neutrino_truth'):
+                chain_values = targets_batched.get(chain_key)
+                if chain_values is not None and chain_values.ndim >= 2 and chain_values.shape[1] == T_chains:
+                    targets_batched[chain_key] = _compact_slots(chain_values)
+
+            target_valid_mask = _compact_slots(chain_valid)  # valid prefix + false padding
 
             # Remove the merged 'classes' field — no per-query type in chain mode.
             targets_batched.pop('classes', None)
@@ -845,6 +908,32 @@ class MaskedReconstructionPart(nn.Module):
             # Leptonic-extension: chain_type is already [B, T_chains] — no split needed.
             # neutrino_truth is also [B, T_chains, K] — pass through unchanged.
             # (Both keys are already in targets_batched if present, kept by dict copy.)
+
+        elif target_valid_mask.ndim == 2 and target_valid_mask.shape[1] > 0:
+            # The generic matcher also expects valid targets to occupy a prefix.
+            # Compact variable/non-contiguous object targets in legacy query mode
+            # while keeping every object-axis target tensor aligned.
+            targets_batched = dict(targets_batched)
+            target_order = torch.argsort(
+                target_valid_mask.to(torch.int8), dim=1, descending=True
+            )
+            if not torch.equal(target_order, torch.arange(
+                    target_order.shape[1], device=target_order.device
+            ).unsqueeze(0).expand_as(target_order)):
+                def _compact_objects(values):
+                    index = target_order
+                    while index.ndim < values.ndim:
+                        index = index.unsqueeze(-1)
+                    return values.gather(1, index.expand_as(values))
+
+                B_targets, T_targets = target_valid_mask.shape
+                for key, value in list(targets_batched.items()):
+                    if (key not in {'jet_valid_mask', 'jet_p4_raw', 'target_valid_mask'}
+                            and torch.is_tensor(value)
+                            and value.ndim >= 2
+                            and value.shape[:2] == (B_targets, T_targets)):
+                        targets_batched[key] = _compact_objects(value)
+                target_valid_mask = _compact_objects(target_valid_mask)
 
         # ---- 2. Compute matching indices (no gradients) ----
         with torch.no_grad():
@@ -871,10 +960,30 @@ class MaskedReconstructionPart(nn.Module):
                 # final layer, which deep-supervision layer weights (B2) provide.
                 final_output = decoder_outputs[final_layer]
 
+            # Matching is an argmin over accumulated costs.  Compute every
+            # floating-point cost input in fp32 so autocast/bf16 cannot change
+            # assignments before the matcher gets its own fp32 boundary.
+            cost_predictions = {
+                key: value.float() if torch.is_tensor(value) and value.is_floating_point() else value
+                for key, value in final_output.items()
+            }
+            cost_targets = {
+                key: value.float() if torch.is_tensor(value) and value.is_floating_point() else value
+                for key, value in targets_batched.items()
+            }
             cost_matrix = self.task_registry.compute_total_cost(
-                predictions=final_output,
-                targets=targets_batched
-            )  # [B, Q, T_chains]  (or T_max in non-chain mode)
+                predictions=cost_predictions,
+                targets=cost_targets,
+            ).float()  # [B, Q, T_chains] (or T_max in non-chain mode)
+
+            if cost_matrix.ndim != 3 or cost_matrix.shape[:2] != (
+                final_output['mask_predictions'].shape[0],
+                final_output['mask_predictions'].shape[1],
+            ):
+                raise RuntimeError(
+                    "Matcher cost must have shape [B, Q, T], got "
+                    f"{tuple(cost_matrix.shape)}"
+                )
 
             # Type-partitioned matching: add large penalty for cross-type
             # assignments so top queries can only match top targets and

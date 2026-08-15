@@ -4,6 +4,7 @@ import lightning
 from lightning.pytorch.loggers import TensorBoardLogger
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from pathlib import Path
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -98,6 +99,7 @@ class ReconstructionTrainer(lightning.LightningModule):
         self.val_loss_history = []
         self.lr_history = []
         self.test_metrics = {}
+        self._val_exact_counts = {}
 
         # Mask-only pretraining config
         pretrain_cfg = config.get("pretraining", {})
@@ -149,6 +151,7 @@ class ReconstructionTrainer(lightning.LightningModule):
 
         outputs = self(inputs)
         total_loss, task_losses = self._compute_loss(outputs, targets)
+        self._accumulate_validation_exact(outputs)
 
         self.log('val_loss', total_loss, on_step=False, on_epoch=True,
                 prog_bar=True, sync_dist=self._sync_dist)
@@ -157,7 +160,73 @@ class ReconstructionTrainer(lightning.LightningModule):
                      on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
 
         return total_loss
-    
+
+    def on_validation_epoch_start(self):
+        self._val_exact_counts = {}
+
+    def _accumulate_validation_exact(self, outputs):
+        """Accumulate exact set-match counts under per-type validity gates."""
+        final = outputs[max(outputs)]
+        matched = final.get('__targets__')
+        if matched is None or 'mask_predictions' not in final or 'mask_W' not in final:
+            return
+
+        jet_valid = matched.get('jet_valid_mask')
+        top_valid = matched.get('top_valid', matched.get('obj_valid_mask'))
+        w_valid = matched.get('w_valid', matched.get('obj_valid_mask'))
+        if jet_valid is None or top_valid is None or w_valid is None:
+            return
+
+        jet_valid = jet_valid.bool()
+        top_valid = top_valid.bool()
+        w_valid = w_valid.bool()
+
+        def aligned_target(target, prediction):
+            """Align legacy target tensors to the prediction [B, Q, P] shape."""
+            target = target.float()
+            target = target[:, :prediction.shape[1], :prediction.shape[2]]
+            if target.shape[1] < prediction.shape[1]:
+                target = F.pad(target, (0, 0, 0, prediction.shape[1] - target.shape[1]))
+            if target.shape[2] < prediction.shape[2]:
+                target = F.pad(target, (0, prediction.shape[2] - target.shape[2]))
+            return target
+
+        def exact_mask(prediction, target):
+            target = aligned_target(target, prediction)
+            mismatch = ((prediction > 0) != (target > 0.5)) & jet_valid[:, None, :prediction.shape[2]]
+            return ~mismatch.any(dim=-1)
+
+        def exact_counts(prediction, target, validity):
+            exact = exact_mask(prediction, target)
+            valid = validity[:, :prediction.shape[1]]
+            if valid.shape[1] < prediction.shape[1]:
+                valid = F.pad(valid, (0, prediction.shape[1] - valid.shape[1]))
+            return (exact & valid).sum().float(), valid.sum().float()
+
+        top_num, top_den = exact_counts(final['mask_predictions'], matched['jet_mask_true'], top_valid)
+        w_num, w_den = exact_counts(final['mask_W'], matched['jet_mask_true_W'], w_valid)
+        chain_valid = top_valid & w_valid
+        # Full-event efficiency needs an event-level conjunction; chain
+        # efficiency counts complete chain slots only.
+        top_exact = exact_mask(final['mask_predictions'], matched['jet_mask_true'])
+        w_exact = exact_mask(final['mask_W'], matched['jet_mask_true_W'])
+        chain_exact = top_exact & w_exact
+        event_valid = chain_valid.all(dim=1)
+        event_exact = (top_exact & w_exact & chain_valid).all(dim=1)
+
+        values = {
+            'top_eff': (top_num, top_den),
+            'W_eff': (w_num, w_den),
+            'chain_eff': ((chain_exact & chain_valid).sum().float(), chain_valid.sum().float()),
+            'ttbar_eff': (event_exact[event_valid].sum().float(), event_valid.sum().float()),
+        }
+        for name, (num, den) in values.items():
+            if name not in self._val_exact_counts:
+                self._val_exact_counts[name] = [num.detach(), den.detach()]
+            else:
+                self._val_exact_counts[name][0] += num.detach()
+                self._val_exact_counts[name][1] += den.detach()
+
     def test_step(self, batch, batch_idx):
         """Task-agnostic test step"""
         inputs, targets = batch
@@ -239,10 +308,33 @@ class ReconstructionTrainer(lightning.LightningModule):
     
     def configure_optimizers(self):
         """Optimizer configuration with config-driven scheduler selection"""
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            name_lower = name.lower()
+            is_query_token = any(
+                token_name in name_lower
+                for token_name in ("target_token", "query_token")
+            )
+            if (
+                param.ndim <= 1
+                or name_lower.endswith(".bias")
+                or "norm" in name_lower
+                or is_query_token
+            ):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            [
+                {"params": decay_params, "weight_decay": self.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
             lr=self.lr,
-            weight_decay=self.weight_decay
         )
 
         if self.use_lookahead:
@@ -303,10 +395,14 @@ class ReconstructionTrainer(lightning.LightningModule):
             # LR re-warmup at phase transition
             rewarmup_epochs = _as_int(sched_cfg.get("lr_rewarmup_epochs", 0), "model_training.scheduler.lr_rewarmup_epochs")
             rewarmup_frac = _as_float(sched_cfg.get("lr_rewarmup_fraction", 0.3), "model_training.scheduler.lr_rewarmup_fraction")
+            # Fractions above one make a "rewarmup" decay from above the base LR.
+            rewarmup_frac = min(1.0, max(0.0, rewarmup_frac))
             transition_epoch = self.mask_pretrain_epochs  # 0 if no pretraining
 
             if interval == "step":
-                steps_per_epoch = self.trainer.estimated_stepping_batches // self.trainer.max_epochs
+                estimated_steps = max(1, int(self.trainer.estimated_stepping_batches))
+                max_epochs = max(1, int(self.trainer.max_epochs))
+                steps_per_epoch = max(1, math.ceil(estimated_steps / max_epochs))
                 warmup_units = warmup_epochs * steps_per_epoch
                 total_units = T_max * steps_per_epoch
                 transition_unit = transition_epoch * steps_per_epoch
@@ -317,34 +413,53 @@ class ReconstructionTrainer(lightning.LightningModule):
                 transition_unit = transition_epoch
                 rewarmup_units = rewarmup_epochs
 
-            min_factor = eta_min / base_lr
+            total_units = max(1, total_units)
+            warmup_units = min(max(0, warmup_units), total_units)
+            transition_unit = max(0, transition_unit)
+            rewarmup_units = min(
+                max(0, rewarmup_units),
+                max(0, total_units - transition_unit),
+            )
+
+            min_factor = min(1.0, max(0.0, eta_min / base_lr))
+
+            def cosine_factor(progress):
+                progress = min(1.0, max(0.0, progress))
+                return min_factor + (1.0 - min_factor) * 0.5 * (
+                    1.0 + math.cos(math.pi * progress)
+                )
 
             def lr_lambda(t):
                 # Two-phase schedule when re-warmup is configured
-                if rewarmup_units > 0 and transition_unit > 0 and t >= transition_unit:
+                has_rewarmup = (
+                    rewarmup_units > 0
+                    and 0 < transition_unit < total_units
+                )
+                if has_rewarmup and t >= transition_unit:
                     t_post = t - transition_unit
-                    post_total = total_units - transition_unit
                     if t_post < rewarmup_units:
-                        # Re-warmup: ramp from rewarmup_frac → 1.0
-                        return rewarmup_frac + (1.0 - rewarmup_frac) * (t_post / rewarmup_units)
+                        # Re-warmup: ramp from rewarmup_frac → 1.0.
+                        return rewarmup_frac + (1.0 - rewarmup_frac) * (
+                            (t_post + 1) / rewarmup_units
+                        )
                     # Post re-warmup cosine decay
                     decay_start = rewarmup_units
-                    decay_total = max(1, post_total - rewarmup_units)
-                    progress = (t_post - decay_start) / decay_total
-                    cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-                    return min_factor + (1.0 - min_factor) * cosine
+                    decay_total = max(1, total_units - transition_unit - decay_start)
+                    return cosine_factor((t_post - decay_start) / decay_total)
 
                 # Pre-transition (or no re-warmup): original warmup + cosine
                 if t < warmup_units:
-                    return max(1e-8, t / max(1, warmup_units))
-                if transition_unit > 0 and rewarmup_units > 0:
+                    # LambdaLR evaluates t=0 before the first optimizer step;
+                    # use the first warmup fraction there instead of near-zero LR.
+                    return (t + 1) / max(1, warmup_units)
+                if has_rewarmup:
                     # Cosine scoped to pre-transition period
                     pre_decay_total = max(1, transition_unit - warmup_units)
-                    progress = (t - warmup_units) / pre_decay_total
+                    return cosine_factor((t - warmup_units) / pre_decay_total)
                 else:
-                    progress = (t - warmup_units) / max(1, total_units - warmup_units)
-                cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-                return min_factor + (1.0 - min_factor) * cosine
+                    return cosine_factor(
+                        (t - warmup_units) / max(1, total_units - warmup_units)
+                    )
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             return {
@@ -410,7 +525,19 @@ class ReconstructionTrainer(lightning.LightningModule):
                 task.reset_accuracy_stats()
 
     def on_validation_epoch_end(self):
-        """Track validation loss history and log task metrics"""
+        """Track validation metrics, exact-match rates, and task metrics."""
+        for name, (num, den) in self._val_exact_counts.items():
+            pair = torch.stack([num, den])
+            if self._sync_dist:
+                pair = self.all_gather(pair).reshape(-1, 2).sum(dim=0)
+            rate = pair[0] / pair[1].clamp(min=1.0)
+            # This hook runs once per validation epoch, so Lightning can expose
+            # the value to ModelCheckpoint/EarlyStopping without re-averaging
+            # batch-local rates.
+            self.log(f'val_{name}', rate, on_step=False, on_epoch=True,
+                     prog_bar=name == 'ttbar_eff', sync_dist=False)
+        self._val_exact_counts = {}
+
         cm = self.trainer.callback_metrics
         val_loss = self._grab_metric(cm, ["val_loss", "val_loss_epoch"])
         if val_loss is not None:
@@ -443,19 +570,45 @@ class ReconstructionTrainer(lightning.LightningModule):
         return None
     
     def on_test_start(self):
-        """Initialize HDF5 files for test predictions (rank 0 only)"""
+        """Initialize HDF5 files for single-device test predictions."""
         super().on_test_start()
         self._test_h5_files: Dict[str, h5py.File] = {}
+        self._test_output_enabled = getattr(self.trainer, "world_size", 1) == 1
+
+        if not self._test_output_enabled:
+            if self.global_rank == 0:
+                print(
+                    "[Test outputs] HDF5 prediction writing disabled for distributed "
+                    "test: batches do not carry original event indices."
+                )
+            self.test_start_idx = 0
+            return
 
         if self.global_rank == 0:
             out_dir = Path(self.trainer.logger.log_dir)
             test_loaders = self.trainer.test_dataloaders
-            number_events = len(test_loaders.dataset)
+            test_loader = test_loaders[0] if isinstance(test_loaders, (list, tuple)) else test_loaders
+            dataset = test_loader.dataset
+            number_events = len(dataset)
+            particle_count = None
+            for attr in ("jet", "_jet"):
+                jet_array = getattr(dataset, attr, None)
+                if jet_array is not None:
+                    particle_count = int(jet_array.shape[1])
+                    break
+            if particle_count is None:
+                if number_events == 0:
+                    raise ValueError("Cannot create test outputs for an empty dataset")
+                particle_count = int(dataset[0][0]["jet"].shape[0])
 
             for task_name, task in self.task_registry.tasks.items():
                 h5_filename = f"test_outputs_{task_name}.h5"
                 fh = h5py.File(out_dir / h5_filename, "w")
-                task.create_test_datasets(fh, number_events)
+                if isinstance(task, MaskReconstructionTask):
+                    task.create_test_datasets(fh, number_events, particle_count)
+                else:
+                    task.create_test_datasets(fh, number_events)
+                fh.create_dataset("event_index", shape=(number_events,), dtype="i8")
                 self._test_h5_files[task_name] = fh
 
         self.test_start_idx = 0
@@ -472,7 +625,7 @@ class ReconstructionTrainer(lightning.LightningModule):
         targets,
     ):
         """Save test predictions to HDF5 (rank 0 only)"""
-        if self.global_rank != 0:
+        if not getattr(self, "_test_output_enabled", False) or self.global_rank != 0:
             return
 
         final_layer = max(outputs.keys())
@@ -497,6 +650,13 @@ class ReconstructionTrainer(lightning.LightningModule):
                 start_idx=self.test_start_idx,
                 batch_size=batch_size
             )
+            self._test_h5_files[task_name]["event_index"][
+                self.test_start_idx:self.test_start_idx + batch_size
+            ] = torch.arange(
+                self.test_start_idx,
+                self.test_start_idx + batch_size,
+                dtype=torch.int64,
+            ).numpy()
 
         self.test_start_idx += batch_size
     
@@ -540,14 +700,17 @@ class ReconstructionTrainer(lightning.LightningModule):
         # Mask-only pretraining phase transitions
         if self._pretrain_phase_active:
             epoch = self.trainer.current_epoch
-            mask_task = self.task_registry.tasks['mask'] if 'mask' in self.task_registry.tasks else None
+            mask_tasks = [
+                task for task in self.task_registry.tasks.values()
+                if hasattr(task, 'null_penalty_scale')
+            ]
             pretrain_set = set(self.mask_pretrain_tasks)
             ramp = self.transition_ramp_epochs
 
             if epoch < self.mask_pretrain_epochs:
                 # Phase 1: mask only — no objectness/type cost or loss, no null penalty
                 self.task_registry.set_active_tasks(self.mask_pretrain_tasks)
-                if mask_task is not None:
+                for mask_task in mask_tasks:
                     mask_task.null_penalty_scale = 0.0
                 if epoch == 0 and self.global_rank == 0:
                     print(f"\n[Pretraining] Phase 1: mask-only "
@@ -567,8 +730,9 @@ class ReconstructionTrainer(lightning.LightningModule):
                     if task_name not in pretrain_set:
                         self.task_registry.set_loss_scale(task_name, alpha)
 
-                # Ramp null penalty scale on the mask task
-                if mask_task is not None:
+                # Ramp null penalty scale on every registered mask task.  W-only
+                # pretraining must not accidentally receive the null target.
+                for mask_task in mask_tasks:
                     mask_task.null_penalty_scale = alpha
 
                 if epoch == self.mask_pretrain_epochs and self.global_rank == 0:
@@ -583,11 +747,11 @@ class ReconstructionTrainer(lightning.LightningModule):
         """Log gradient norm before optimizer step (after clipping)"""
         grads = [p.grad for p in self.parameters() if p.grad is not None]
         if grads:
-            total_norm = torch.norm(
-                torch.stack([g.detach().norm(2) for g in grads])
-            ).item()
+            total_norm = torch.linalg.vector_norm(torch.stack([
+                g.detach().float().norm(2) for g in grads
+            ]))
         else:
-            total_norm = 0.0
+            total_norm = next(self.parameters()).new_zeros(())
         self.log('grad_norm', total_norm, on_step=True, on_epoch=False,
                  prog_bar=False, sync_dist=False)
 
@@ -653,13 +817,14 @@ def train_reconstruction_model(
     # Early stopping — skip checks during pretraining phase
     es_cfg = cb_cfg.get("early_stopping", {})
     pretrain_warmup = config.get("pretraining", {}).get("mask_pretrain_epochs", 0)
-    callbacks.append(WarmupEarlyStopping(
-        warmup_epochs=pretrain_warmup,
-        monitor=es_cfg.get("monitor", "val_loss"),
-        patience=es_cfg.get("patience", 10),
-        min_delta=es_cfg.get("min_delta", 0.0001),
-        mode=es_cfg.get("mode", "min"),
-    ))
+    if es_cfg.get("enabled", True):
+        callbacks.append(WarmupEarlyStopping(
+            warmup_epochs=pretrain_warmup,
+            monitor=es_cfg.get("monitor", "val_loss"),
+            patience=es_cfg.get("patience", 10),
+            min_delta=es_cfg.get("min_delta", 0.0001),
+            mode=es_cfg.get("mode", "min"),
+        ))
 
     # Model checkpoint (no dirpath — Lightning places it in default_root_dir/version_N/checkpoints/)
     ckpt_cfg = cb_cfg.get("checkpoint", {})
@@ -669,8 +834,26 @@ def train_reconstruction_model(
         mode=ckpt_cfg.get("mode", "min"),
         save_weights_only=ckpt_cfg.get("save_weights_only", False),
         filename=ckpt_cfg.get("filename", "epoch={epoch}-val_loss={val_loss:.4f}"),
+        auto_insert_metric_name=ckpt_cfg.get("auto_insert_metric_name", False),
         save_last=ckpt_cfg.get("save_last", True),
     ))
+
+    # Keep loss-selected checkpoints for backward comparisons while also
+    # retaining the checkpoint selected by the primary exact-efficiency metric.
+    # This is opt-in because older tasks/configurations may not expose it.
+    eff_ckpt_cfg = cb_cfg.get("efficiency_checkpoint", {})
+    if eff_ckpt_cfg.get("enabled", False):
+        callbacks.append(ModelCheckpoint(
+            save_top_k=eff_ckpt_cfg.get("save_top_k", 1),
+            monitor=eff_ckpt_cfg.get("monitor", "val_ttbar_eff"),
+            mode=eff_ckpt_cfg.get("mode", "max"),
+            save_weights_only=eff_ckpt_cfg.get("save_weights_only", False),
+            filename=eff_ckpt_cfg.get(
+                "filename", "epoch{epoch:03d}-val_ttbar_eff{val_ttbar_eff:.4f}"
+            ),
+            auto_insert_metric_name=eff_ckpt_cfg.get("auto_insert_metric_name", False),
+            save_last=eff_ckpt_cfg.get("save_last", False),
+        ))
 
     # Log directory — checkpoints co-located with Lightning logs
     log_dir = config.get("model_artefacts", {}).get("log_dir", "lightning_logs")
@@ -700,9 +883,3 @@ def train_reconstruction_model(
     lightning_model = ReconstructionTrainer(model, task_registry, config)
     lightning_trainer.fit(lightning_model, datamodule=data_module, ckpt_path=ckpt_path)
     return lightning_trainer, lightning_model
-
-
-
-
-
-

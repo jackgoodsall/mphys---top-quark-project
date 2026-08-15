@@ -23,8 +23,12 @@ from pathlib import Path
 
 import numpy as np
 
-import evaluate_chain
-import evaluate as evaluate_std
+if __package__:
+    from . import evaluate_chain
+    from . import evaluate as evaluate_std
+else:
+    import evaluate_chain
+    import evaluate as evaluate_std
 
 
 def _agg_bin(br: dict, mult_keys):
@@ -68,20 +72,46 @@ def _parse_runs(run_args):
 
 def _load_and_evaluate_chain(run_dir, data_file, use_probs, threshold,
                               prior_top, prior_W, strict, joint,
-                              require_top_for_w=False):
+                              require_top_for_w=False, decode="threshold",
+                              enforce_w_subset=False):
     """Load and evaluate a chain_queries run."""
     (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
      jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
-     original_mult) = evaluate_chain.load_run_data(run_dir, data_file, use_probs=use_probs)
+     original_mult, valid_tops_truth, valid_Ws_truth,
+     slot_valid_top, slot_valid_W) = evaluate_chain.load_run_data(
+         run_dir, data_file, use_probs=use_probs
+     )
+
+    common = dict(
+        target_obj_W=target_obj_W, pred_obj_top=pred_obj_top,
+        pred_obj_W=pred_obj_W, use_probs=use_probs, threshold=threshold,
+        strict=strict, joint=joint, original_mult=original_mult,
+        valid_tops_truth=valid_tops_truth, valid_Ws_truth=valid_Ws_truth,
+        slot_valid_top=slot_valid_top, slot_valid_W=slot_valid_W,
+        require_top_for_w=require_top_for_w,
+    )
+    if decode not in ("threshold", "topk"):
+        top_bin, W_bin = evaluate_chain.decode_constrained(
+            pred_scores_top, pred_scores_W, jet_valid, mode=decode,
+            k_top=(prior_top if prior_top is not None else 3),
+            k_W=(prior_W if prior_W is not None else 2),
+            bg_threshold=threshold,
+            use_probs=use_probs, enforce_w_subset=enforce_w_subset,
+        )
+        return evaluate_chain.compute_efficiencies(
+            top_bin.astype(np.float32), target_masks_top,
+            W_bin.astype(np.float32), target_masks_W, jet_valid,
+            target_obj_top, prior_top=None, prior_W=None,
+            use_probs=True, threshold=0.5, **{
+                key: value for key, value in common.items()
+                if key not in ("use_probs", "threshold")
+            },
+        )
 
     return evaluate_chain.compute_efficiencies(
         pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
         jet_valid, target_obj_top,
-        pred_obj_top=pred_obj_top, target_obj_W=target_obj_W,
-        pred_obj_W=pred_obj_W, prior_top=prior_top, prior_W=prior_W,
-        use_probs=use_probs, threshold=threshold,
-        strict=strict, joint=joint, original_mult=original_mult,
-        require_top_for_w=require_top_for_w,
+        prior_top=prior_top, prior_W=prior_W, **common,
     )
 
 
@@ -377,6 +407,15 @@ def main():
         help="Binarisation threshold (overrides default)"
     )
     parser.add_argument(
+        "--decode", choices=["threshold", "topk", "legal", "projected"],
+        default="threshold",
+        help="Chain decoder (default: threshold; legal enforces joint constraints).",
+    )
+    parser.add_argument(
+        "--enforce_w_subset", action="store_true",
+        help="For legacy constrained decoders, intersect each W mask with its top mask.",
+    )
+    parser.add_argument(
         "--prior", nargs="+", metavar="TYPE=K", default=[],
         help="Per-type top-k prior, e.g. --prior top=3 W=2"
     )
@@ -438,7 +477,8 @@ def main():
             results = _load_and_evaluate_chain(
                 run_dir, args.data_file, args.use_probs, args.threshold,
                 prior_top, prior_W, args.strict, args.joint,
-                require_top_for_w=args.require_top_for_w,
+                require_top_for_w=args.require_top_for_w, decode=args.decode,
+                enforce_w_subset=args.enforce_w_subset,
             )
         else:
             results = _load_and_evaluate_std(
@@ -455,6 +495,8 @@ def main():
     if prior_W is not None:
         prior_parts.append(f"W={prior_W}")
     binarisation = ", ".join(prior_parts) if prior_parts else f"threshold={args.threshold if args.threshold is not None else ('0.5' if args.use_probs else '0.0')}"
+    if args.decode not in ("threshold", "topk"):
+        binarisation = args.decode
 
     print(f"\n=== Model Comparison ===")
     print(f"Binarisation: {binarisation}")

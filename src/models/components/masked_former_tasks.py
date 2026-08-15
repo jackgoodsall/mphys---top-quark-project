@@ -24,6 +24,11 @@ class TaskConfig:
     layer_weights: Optional[Dict[int, float]] = None
     head_norm: bool = False  # LayerNorm before prediction head MLP
     mask_embed_head: bool = False  # mask outputs: learned MLP on queries before the einsum
+    validity_key: Optional[str] = None  # Per-task object validity, e.g. top_valid or w_valid
+    bce_reference_particles: Optional[float] = None  # Fixed BCE normalization reference
+    rank_weight: float = 0.0  # Boundary-ranking surrogate for exact fixed-cardinality match
+    rank_margin: float = 1.0
+    rank_temperature: float = 0.5
     
     def get_layer_weight(self, layer_id: int) -> float:
         """Get weight for a specific layer"""
@@ -237,6 +242,11 @@ class MaskReconstructionTask(BaseTask):
         target_key: str = 'jet_mask_true',
         bce_pos_weight: bool = False,
         cost_bce_weight: float = 0.0,
+        validity_key: Optional[str] = None,
+        bce_reference_particles: Optional[float] = None,
+        rank_weight: Optional[float] = None,
+        rank_margin: Optional[float] = None,
+        rank_temperature: Optional[float] = None,
     ):
         super().__init__(config)
         self.pred_key = pred_key
@@ -248,6 +258,35 @@ class MaskReconstructionTask(BaseTask):
         # bitwise-identical to previous behaviour). Complements the Dice cost with a
         # per-particle assignment signal so matching is less degenerate on small masks.
         self.cost_bce_weight = cost_bce_weight
+        # Chain mode supplies separate validity for top and W slots.  Infer the
+        # conventional key for the two built-in mask targets, while allowing
+        # callers to provide another per-task validity field.
+        self.validity_key = validity_key or config.validity_key
+        if self.validity_key is None:
+            self.validity_key = {
+                'jet_mask_true': 'top_valid',
+                'jet_mask_true_W': 'w_valid',
+            }.get(target_key)
+        bce_reference_particles = (
+            bce_reference_particles
+            if bce_reference_particles is not None
+            else config.bce_reference_particles
+        )
+        if bce_reference_particles is not None and bce_reference_particles <= 0:
+            raise ValueError("bce_reference_particles must be positive when set")
+        # None preserves the historical mean over valid particles.  A fixed
+        # reference makes BCE scale comparable when batches have different
+        # amounts of padding or different particle multiplicities.
+        self.bce_reference_particles = bce_reference_particles
+        self.rank_weight = config.rank_weight if rank_weight is None else float(rank_weight)
+        self.rank_margin = config.rank_margin if rank_margin is None else float(rank_margin)
+        self.rank_temperature = (
+            config.rank_temperature if rank_temperature is None else float(rank_temperature)
+        )
+        if self.rank_weight < 0:
+            raise ValueError("rank_weight must be non-negative")
+        if self.rank_temperature <= 0:
+            raise ValueError("rank_temperature must be positive")
         # 0.0 = suppressed (during mask-only pretraining), 1.0 = full penalty.
         # Ramped from 0→1 during phase transition to avoid "predict nothing" snap-on.
         self.null_penalty_scale = 1.0
@@ -257,6 +296,128 @@ class MaskReconstructionTask(BaseTask):
         self.register_buffer('_top_dice_count', torch.zeros(1, dtype=torch.long), persistent=False)
         self.register_buffer('_w_dice_sum', torch.zeros(1), persistent=False)
         self.register_buffer('_w_dice_count', torch.zeros(1, dtype=torch.long), persistent=False)
+
+    def _particle_validity(
+        self,
+        targets: Dict[str, torch.Tensor],
+        batch_size: int,
+        num_particles: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Return [B, N] particle validity, or None for legacy callers."""
+        valid = targets.get('jet_valid_mask')
+        if valid is None:
+            return None
+        if valid.ndim != 2 or valid.shape != (batch_size, num_particles):
+            raise ValueError(
+                f"jet_valid_mask must have shape {(batch_size, num_particles)}, "
+                f"got {tuple(valid.shape)}"
+            )
+        return valid.to(device=device).bool()
+
+    def _object_validity(
+        self,
+        targets: Dict[str, torch.Tensor],
+        batch_size: int,
+        num_queries: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Return this task's [B, Q] real-slot mask, including null padding."""
+        valid = None
+        if self.validity_key is not None:
+            valid = targets.get(self.validity_key)
+        if valid is None:
+            valid = targets.get('obj_valid_mask')
+        if valid is None:
+            return None
+        if valid.ndim != 2 or valid.shape[0] != batch_size:
+            raise ValueError(
+                f"{self.validity_key or 'obj_valid_mask'} must be a [B, Q] mask, "
+                f"got {tuple(valid.shape)}"
+            )
+        valid = valid.to(device=device).bool()
+        if valid.shape[1] < num_queries:
+            valid = F.pad(valid, (0, num_queries - valid.shape[1]), value=False)
+        return valid[:, :num_queries]
+
+    def _bce_loss(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+        pos_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Stable fp32 BCE with optional particle masking/reference denominator."""
+        logits_f = logits.float()
+        target_f = target.float()
+        bce = F.binary_cross_entropy_with_logits(
+            logits_f,
+            target_f,
+            pos_weight=None if pos_weight is None else pos_weight.float(),
+            reduction='none',
+        )
+        if valid is None:
+            if self.bce_reference_particles is None:
+                return bce.mean()
+            return (
+                bce.sum(dim=-1) / logits_f.new_tensor(self.bce_reference_particles)
+            ).mean()
+
+        valid_f = valid.float()
+        bce = bce * valid_f
+        if self.bce_reference_particles is None:
+            denom = valid_f.sum(dim=-1).clamp(min=1.0)
+        else:
+            denom = logits_f.new_tensor(self.bce_reference_particles)
+        # Normalize each mask independently, then average masks. This avoids
+        # large events dominating solely because they contain more valid slots.
+        return (bce.sum(dim=-1) / denom).mean()
+
+    def _ranking_loss(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        particle_valid: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Smoothly enforce min-positive score > max-negative score.
+
+        This is an exact-match-aligned surrogate for fixed-cardinality decoding.
+        It treats positive jets as an unordered set: only the lowest positive
+        and highest negative scores determine the boundary.
+        """
+        if self.rank_weight == 0.0:
+            return logits.sum() * 0.0
+        if particle_valid is None:
+            particle_valid = torch.ones_like(target, dtype=torch.bool)
+        else:
+            particle_valid = particle_valid.bool()
+
+        target = target > 0.5
+        has_pos = (target & particle_valid).any(dim=-1)
+        has_neg = ((~target) & particle_valid).any(dim=-1)
+        active = has_pos & has_neg
+        if not active.any().item():
+            return logits.sum() * 0.0
+
+        tau = logits.new_tensor(self.rank_temperature)
+        pos_scores = (-logits).masked_fill(~(target & particle_valid), float('-inf'))
+        neg_scores = logits.masked_fill(~((~target) & particle_valid), float('-inf'))
+        smooth_min_pos = -tau * torch.logsumexp(pos_scores / tau, dim=-1)
+        smooth_max_neg = tau * torch.logsumexp(neg_scores / tau, dim=-1)
+        losses = F.softplus(
+            logits.new_tensor(self.rank_margin) + smooth_max_neg - smooth_min_pos
+        )
+        return losses[active].mean()
+
+    @staticmethod
+    def _align_target_slots(
+        target_masks: torch.Tensor,
+        num_queries: int,
+    ) -> torch.Tensor:
+        """Pad legacy [B, T, N] targets to Q without changing their values."""
+        if target_masks.shape[1] < num_queries:
+            return F.pad(target_masks, (0, 0, 0, num_queries - target_masks.shape[1]))
+        return target_masks[:, :num_queries]
     
     def compute_cost(
         self,
@@ -273,15 +434,24 @@ class MaskReconstructionTask(BaseTask):
             target_masks = target_masks.unsqueeze(1)
 
         B, num_queries, N = pred_masks.shape
-        num_targets = target_masks.shape[1]
+        if target_masks.shape[0] != B or target_masks.shape[-1] != N:
+            raise ValueError(
+                f"{self.target_key} must have shape [B, T, {N}], "
+                f"got {tuple(target_masks.shape)}"
+            )
+        particle_valid = self._particle_validity(targets, B, N, logits.device)
+        if particle_valid is not None:
+            particle_valid_f = particle_valid[:, None, None, :].float()
+        else:
+            particle_valid_f = 1.0
 
         # Compute pairwise Dice
         pred_expanded = pred_masks.unsqueeze(2)
         target_expanded = target_masks.unsqueeze(1)
 
-        intersection = (pred_expanded * target_expanded).sum(dim=-1)
-        pred_sizes = pred_masks.sum(dim=-1, keepdim=True)
-        target_sizes = target_masks.sum(dim=-1).unsqueeze(1)
+        intersection = (pred_expanded * target_expanded * particle_valid_f).sum(dim=-1)
+        pred_sizes = (pred_masks * particle_valid_f.squeeze(2)).sum(dim=-1, keepdim=True)
+        target_sizes = (target_masks * particle_valid_f.squeeze(1)).sum(dim=-1).unsqueeze(1)
 
         dice = (2 * intersection) / (pred_sizes + target_sizes + self.eps)
         w_dice = self.config.cost_weights['mask']
@@ -292,18 +462,38 @@ class MaskReconstructionTask(BaseTask):
         # number of valid particles so it scales O(1) like the Dice term.
         if self.cost_bce_weight > 0:
             logits_f = logits.float()
-            valid = targets.get('jet_valid_mask')
-            if valid is None:
-                valid = logits_f.new_ones(B, N)
-            else:
-                valid = valid.float()
+            valid = (particle_valid if particle_valid is not None
+                     else logits_f.new_ones(B, N))
+            valid = valid.float()
             tgt = target_masks                                  # [B, T, N]
             pos = -F.logsigmoid(logits_f) * valid[:, None, :]   # [B, Q, N]
             neg = -F.logsigmoid(-logits_f) * valid[:, None, :]  # [B, Q, N]
             bce_cost = (torch.einsum('bqn,btn->bqt', pos, tgt)
                         + torch.einsum('bqn,btn->bqt', neg, (1 - tgt) * valid[:, None, :]))
-            bce_cost = bce_cost / valid.sum(-1).clamp(min=1)[:, None, None]
+            if self.bce_reference_particles is None:
+                bce_denom = valid.sum(-1).clamp(min=1)
+            else:
+                bce_denom = logits_f.new_tensor(self.bce_reference_particles).expand(B)
+            bce_cost = bce_cost / bce_denom[:, None, None]
             cost = cost + self.cost_bce_weight * bce_cost
+
+        # A chain can be matchable because only the other half is present.
+        # Keep a missing top/W half neutral in the shared permutation cost;
+        # treating its zero mask as a real target would prefer empty queries.
+        task_valid = targets.get(self.validity_key) if self.validity_key else None
+        if task_valid is None:
+            task_valid = targets.get('obj_valid_mask')
+        if task_valid is not None:
+            task_valid = task_valid.to(device=cost.device).bool()
+            num_targets = target_masks.shape[1]
+            if task_valid.ndim != 2 or task_valid.shape[0] != B:
+                raise ValueError(
+                    f"{self.validity_key or 'obj_valid_mask'} must have shape [B, T], "
+                    f"got {tuple(task_valid.shape)}"
+                )
+            if task_valid.shape[1] < num_targets:
+                task_valid = F.pad(task_valid, (0, num_targets - task_valid.shape[1]), value=False)
+            cost = cost * task_valid[:, None, :num_targets].float()
 
         return cost
     
@@ -321,24 +511,33 @@ class MaskReconstructionTask(BaseTask):
             target_masks = target_masks.unsqueeze(1)
 
         B, num_queries, N = pred_masks.shape
-        obj_valid = targets.get('obj_valid_mask')
+        particle_valid = self._particle_validity(targets, B, N, pred_masks.device)
+        if particle_valid is None and valid_mask is not None:
+            if valid_mask.ndim != 2 or valid_mask.shape != (B, N):
+                raise ValueError(
+                    f"valid_mask must have shape {(B, N)}, got {tuple(valid_mask.shape)}"
+                )
+            particle_valid = valid_mask.to(device=pred_masks.device).bool()
+        obj_valid = self._object_validity(targets, B, num_queries, pred_masks.device)
 
         if obj_valid is not None:
-            # --- New path: use obj_valid_mask for variable T ---
+            # --- Variable-T path: use this task's validity key for real slots ---
             total_loss = pred_masks.new_tensor(0.0)
+            target_masks = self._align_target_slots(target_masks, num_queries)
 
-            if obj_valid.any():
+            if obj_valid.any().item():
                 real_pred_logits = pred_masks[obj_valid]       # [N_real, N]
                 real_tgt = target_masks[obj_valid]             # [N_real, N]
 
                 real_pred_probs = real_pred_logits.sigmoid()
                 real_tgt_float = real_tgt.float()
 
-                if valid_mask is not None:
-                    vm_expanded = valid_mask.unsqueeze(1).expand(B, num_queries, N)
-                    real_vm = vm_expanded[obj_valid]            # [N_real, N]
+                if particle_valid is not None:
+                    real_vm = particle_valid.unsqueeze(1).expand(B, num_queries, N)[obj_valid]
                     real_pred_probs = real_pred_probs * real_vm
                     real_tgt_float = real_tgt_float * real_vm
+                else:
+                    real_vm = None
 
                 # Dice loss
                 intersection = (real_pred_probs * real_tgt_float).sum(dim=-1)
@@ -353,32 +552,32 @@ class MaskReconstructionTask(BaseTask):
                 # background particles contribute equally to the gradient.
                 if self.bce_pos_weight:
                     n_pos = real_tgt_float.sum(dim=-1, keepdim=True).clamp(min=1)  # [N_real, 1]
-                    if valid_mask is not None:
+                    if real_vm is not None:
                         n_total = real_vm.sum(dim=-1, keepdim=True).clamp(min=1)
                     else:
-                        n_total = torch.tensor(N, device=real_tgt_float.device, dtype=real_tgt_float.dtype)
+                        n_total = real_tgt_float.new_tensor(N)
                     pw = ((n_total - n_pos) / n_pos).expand_as(real_tgt_float)     # [N_real, N]
-                    bce = F.binary_cross_entropy_with_logits(
-                        real_pred_logits, real_tgt_float, pos_weight=pw, reduction='none'
-                    )
+                    bce_loss = self._bce_loss(real_pred_logits, real_tgt_float, real_vm, pw)
                 else:
-                    bce = F.binary_cross_entropy_with_logits(
-                        real_pred_logits, real_tgt_float, reduction='none'
-                    )
-                if valid_mask is not None:
-                    bce = bce * real_vm
-                    num_valid = real_vm.sum(dim=-1).clamp(min=1)
-                    bce_loss = (bce.sum(dim=-1) / num_valid).mean()
-                else:
-                    bce_loss = bce.mean()
+                    bce_loss = self._bce_loss(real_pred_logits, real_tgt_float, real_vm)
 
                 dice_weight = self.config.get_loss_weight('dice')
                 bce_weight = self.config.get_loss_weight('bce')
                 total_loss = dice_weight * dice_loss + bce_weight * bce_loss
+                total_loss = total_loss + self.rank_weight * self._ranking_loss(
+                    real_pred_logits, real_tgt_float, real_vm
+                )
 
                 # Track per-class Dice (top vs W) for monitoring
                 if getattr(self, '_stats_enabled', True) and 'classes' in targets:
-                    classes_real = targets['classes'][obj_valid]  # [N_real]
+                    classes = targets['classes']
+                    if classes.ndim != 2 or classes.shape[0] != B:
+                        raise ValueError(
+                            f"classes must have shape [B, Q], got {tuple(classes.shape)}"
+                        )
+                    if classes.shape[1] < num_queries:
+                        classes = F.pad(classes, (0, num_queries - classes.shape[1]), value=CLASS_NULL)
+                    classes_real = classes[:, :num_queries][obj_valid]  # [N_real]
                     with torch.no_grad():
                         top_mask_cls = (classes_real == CLASS_TOP)
                         w_mask_cls = (classes_real == CLASS_W)
@@ -388,17 +587,31 @@ class MaskReconstructionTask(BaseTask):
                         if w_mask_cls.any():
                             self._w_dice_sum += dice[w_mask_cls].sum()
                             self._w_dice_count += w_mask_cls.sum()
+                elif getattr(self, '_stats_enabled', True):
+                    # Chain mode removes ``classes`` after splitting the
+                    # targets; the task's validity key still identifies which
+                    # per-task Dice accumulator should receive this batch.
+                    with torch.no_grad():
+                        if self.validity_key == 'top_valid':
+                            self._top_dice_sum += dice.sum()
+                            self._top_dice_count += dice.numel()
+                        elif self.validity_key == 'w_valid':
+                            self._w_dice_sum += dice.sum()
+                            self._w_dice_count += dice.numel()
 
             # Null mask penalty: encourage unmatched queries to predict empty masks.
             # Adaptive scaling: reduce penalty when most queries are null so the
             # "predict empty" signal doesn't overwhelm real-object learning.
             # Suppressed during mask-only pretraining to eliminate "predict nothing" signal.
-            if self.null_mask_penalty > 0 and self.null_penalty_scale > 0 and (~obj_valid).any():
+            if (self.null_mask_penalty > 0 and self.null_penalty_scale > 0
+                    and (~obj_valid).any().item()):
                 null_logits = pred_masks[~obj_valid]           # [N_null, N]
                 null_targets = torch.zeros_like(null_logits)
-                null_loss = F.binary_cross_entropy_with_logits(
-                    null_logits, null_targets, reduction='mean'
-                )
+                if particle_valid is not None:
+                    null_valid = particle_valid.unsqueeze(1).expand(B, num_queries, N)[~obj_valid]
+                else:
+                    null_valid = None
+                null_loss = self._bce_loss(null_logits, null_targets, null_valid)
                 n_real = obj_valid.sum().float()
                 n_total = obj_valid.numel()
                 adaptive_scale = (n_real / n_total).clamp(min=0.01)
@@ -413,14 +626,18 @@ class MaskReconstructionTask(BaseTask):
             pred_probs = pred_masks.sigmoid()
             target_float = target_masks.float()
 
-            if valid_mask is not None:
-                valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(pred_probs)
+            if particle_valid is not None:
+                valid_mask_expanded = particle_valid.unsqueeze(1).expand_as(pred_probs)
                 pred_probs = pred_probs * valid_mask_expanded
                 target_float = target_float * valid_mask_expanded
 
             pred_probs_flat = pred_probs.reshape(-1, N)
             target_float_flat = target_float.reshape(-1, N)
             pred_masks_flat = pred_masks.reshape(-1, N)
+            valid_mask_flat = (
+                particle_valid.unsqueeze(1).expand(-1, num_targets, -1).reshape(-1, N)
+                if particle_valid is not None else None
+            )
 
             # Dice loss
             intersection = (pred_probs_flat * target_float_flat).sum(dim=-1)
@@ -432,29 +649,23 @@ class MaskReconstructionTask(BaseTask):
             # BCE loss
             if self.bce_pos_weight:
                 n_pos = target_float_flat.sum(dim=-1, keepdim=True).clamp(min=1)
-                n_total_flat = torch.tensor(N, device=target_float_flat.device, dtype=target_float_flat.dtype)
+                n_total_flat = target_float_flat.new_tensor(N)
                 pw = ((n_total_flat - n_pos) / n_pos).expand_as(target_float_flat)
-                bce_per_particle = F.binary_cross_entropy_with_logits(
-                    pred_masks_flat, target_float_flat, pos_weight=pw, reduction='none'
+                bce_loss = self._bce_loss(
+                    pred_masks_flat, target_float_flat, valid_mask_flat, pw
                 )
             else:
-                bce_per_particle = F.binary_cross_entropy_with_logits(
-                    pred_masks_flat, target_float_flat, reduction='none'
+                bce_loss = self._bce_loss(
+                    pred_masks_flat, target_float_flat, valid_mask_flat
                 )
-
-            if valid_mask is not None:
-                valid_mask_flat = valid_mask.unsqueeze(1).expand(-1, num_targets, -1).reshape(-1, N)
-                bce_per_particle = bce_per_particle * valid_mask_flat
-                num_valid_per_sample = valid_mask_flat.sum(dim=-1)
-                num_valid_per_sample = torch.clamp(num_valid_per_sample, min=1)
-                bce_loss = bce_per_particle.sum(dim=-1) / num_valid_per_sample
-            else:
-                bce_loss = bce_per_particle.mean(dim=-1)
 
             dice_weight = self.config.get_loss_weight('dice')
             bce_weight = self.config.get_loss_weight('bce')
 
-            total_loss = dice_weight * dice_loss.mean() + bce_weight * bce_loss.mean()
+            total_loss = dice_weight * dice_loss.mean() + bce_weight * bce_loss
+            total_loss = total_loss + self.rank_weight * self._ranking_loss(
+                pred_masks_flat, target_float_flat, valid_mask_flat
+            )
             return total_loss
     
     def get_detection_stats(self) -> Dict[str, float]:
@@ -479,9 +690,16 @@ class MaskReconstructionTask(BaseTask):
         self._w_dice_sum.zero_()
         self._w_dice_count.zero_()
 
-    def create_test_datasets(self, file: h5py.File, number_events: int):
+    def create_test_datasets(
+        self, file: h5py.File, number_events: int, num_particles: Optional[int] = None
+    ):
         """Create HDF5 datasets for mask predictions"""
-        N_particles = 20  # Adjust to your actual particle count if needed
+        if num_particles is None or int(num_particles) <= 0:
+            raise ValueError(
+                "Mask test output shape requires the runtime particle count; "
+                "pass num_particles from the test dataset."
+            )
+        N_particles = int(num_particles)
         M = self.config.max_objects
 
         file.create_dataset(
@@ -1122,6 +1340,19 @@ class ObjectnessTask(BaseTask):
 
         # Broadcast: [B, Q] -> [B, Q, T]
         cost = neg_log_prob.unsqueeze(-1).expand(-1, -1, T)
+
+        # Do not let padded/null target columns influence query permutation.
+        # In chain mode this is the union validity mask after target compaction.
+        obj_valid = targets.get('obj_valid_mask')
+        if obj_valid is not None:
+            obj_valid = obj_valid.to(device=cost.device).bool()
+            if obj_valid.ndim != 2 or obj_valid.shape[0] != cost.shape[0]:
+                raise ValueError(
+                    f"obj_valid_mask must have shape [B, T], got {tuple(obj_valid.shape)}"
+                )
+            if obj_valid.shape[1] < T:
+                obj_valid = F.pad(obj_valid, (0, T - obj_valid.shape[1]), value=False)
+            cost = cost * obj_valid[:, None, :T].float()
 
         return self.config.cost_weights.get('objectness', 1.0) * cost
 

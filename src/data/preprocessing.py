@@ -60,57 +60,46 @@ try:
     print("[OK] Scalers imported", flush=True)
 except Exception as e:
     print(f"[FAIL] Scalers import: {e}", flush=True)
-    print("[WARN] Proceeding with dummy scalers", flush=True)
-    
-    class DummyScaler:
-        def partial_fit(self, X):
-            pass
-        def transform(self, X):
-            return X
-    
-    LogMinMaxScaler = DummyScaler
-    StandardScaler = DummyScaler
-    PhiTransformer = DummyScaler
+    raise ImportError(
+        "Required preprocessing scalers are unavailable. Install or restore "
+        "src/data_utils/scalers.py; refusing to run with untransformed inputs."
+    ) from e
 
 try:
     from src.utils.utils import load_any_config
     print("[OK] load_any_config imported", flush=True)
 except Exception as e:
     print(f"[FAIL] load_any_config import: {e}", flush=True)
-    print("[WARN] Proceeding without config loader", flush=True)
-    
-    def load_any_config(path):
-        return {}
+    raise ImportError(
+        "Required config loader is unavailable; refusing to preprocess with "
+        "an empty configuration."
+    ) from e
 
 try:
-    from kinematics import (
-        apply_mask,
-        calculate_energy_value,
-        convert_polar_to_cartesian,
-        create_interaction_matrix,
-        px_py_pz_from_pt_eta_phi,
-    )
+    try:
+        from .kinematics import (
+            apply_mask,
+            calculate_energy_value,
+            convert_polar_to_cartesian,
+            create_interaction_matrix,
+            px_py_pz_from_pt_eta_phi,
+        )
+    except ImportError:
+        # Preserve direct ``python src/data/preprocessing.py`` execution.
+        from kinematics import (
+            apply_mask,
+            calculate_energy_value,
+            convert_polar_to_cartesian,
+            create_interaction_matrix,
+            px_py_pz_from_pt_eta_phi,
+        )
     print("[OK] kinematics functions imported", flush=True)
 except Exception as e:
     print(f"[FAIL] kinematics import: {e}", flush=True)
-    print("[WARN] Proceeding with dummy utils", flush=True)
-
-    def apply_mask(arrays, mask):
-        return tuple(a[mask] for a in arrays)
-
-    def calculate_energy_value(x):
-        return x[..., 3]
-
-    def convert_polar_to_cartesian(x):
-        return x[..., :4]
-
-    def create_interaction_matrix(jet_chunk):
-        B, P, F = jet_chunk.shape
-        return np.zeros((B, P, P, 1))
-
-    def px_py_pz_from_pt_eta_phi(X):
-        pt, eta, phi = X[..., 0], X[..., 1], X[..., 2]
-        return pt * np.cos(phi), pt * np.sin(phi), pt * np.sinh(eta)
+    raise ImportError(
+        "Required kinematics helpers are unavailable; refusing to preprocess "
+        "with placeholder physics functions."
+    ) from e
 
 print("\n[SUCCESS] All imports completed\n", flush=True)
 

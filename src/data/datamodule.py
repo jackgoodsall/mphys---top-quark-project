@@ -11,6 +11,18 @@ CLASS_TOP = 1
 CLASS_W = 2
 
 
+def _dataloader_worker_kwargs(loader_config):
+    """Return worker-only DataLoader kwargs when workers are enabled."""
+    num_workers = loader_config["num_workers"]
+    kwargs = {"num_workers": num_workers}
+    if num_workers > 0:
+        if "persistent_workers" in loader_config:
+            kwargs["persistent_workers"] = loader_config["persistent_workers"]
+        if "prefetch_factor" in loader_config:
+            kwargs["prefetch_factor"] = loader_config["prefetch_factor"]
+    return kwargs
+
+
 def _load_eta_constants(joblib_path):
     """
     Load (mean, scale) of the η StandardScaler for the jet input and the two
@@ -371,6 +383,14 @@ class LazyHDF5Dataset(Dataset):
             self._tops_kin_key = tops_kin_key if tops_kin_key in f else None
             self._ws_mask_key = ws_mask_key if ws_mask_key in f else None
             self._ws_kin_key = ws_kin_key if ws_kin_key in f else None
+            self._tops_count = (
+                f[self._tops_mask_key].shape[1]
+                if self._tops_mask_key is not None else 0
+            )
+            self._ws_count = (
+                f[self._ws_mask_key].shape[1]
+                if self._ws_mask_key is not None else 0
+            )
 
             # Load small validity arrays into RAM (~38 MB each for 19M events)
             valid_tops = f["valid_tops"][()] if "valid_tops" in f else None
@@ -391,15 +411,13 @@ class LazyHDF5Dataset(Dataset):
         valid_parts = []
 
         if self._tops_mask_key is not None:
-            T_top = 2  # always 2 tops
-            classes_parts.append(np.full((N, T_top), CLASS_TOP, dtype=np.int64))
-            vt = valid_tops if valid_tops is not None else np.ones((N, T_top), dtype=bool)
+            classes_parts.append(np.full((N, self._tops_count), CLASS_TOP, dtype=np.int64))
+            vt = valid_tops if valid_tops is not None else np.ones((N, self._tops_count), dtype=bool)
             valid_parts.append(vt.astype(bool))
 
         if self._ws_mask_key is not None:
-            T_w = 2  # always 2 Ws
-            classes_parts.append(np.full((N, T_w), CLASS_W, dtype=np.int64))
-            vw = valid_Ws if valid_Ws is not None else np.ones((N, T_w), dtype=bool)
+            classes_parts.append(np.full((N, self._ws_count), CLASS_W, dtype=np.int64))
+            vw = valid_Ws if valid_Ws is not None else np.ones((N, self._ws_count), dtype=bool)
             valid_parts.append(vw.astype(bool))
 
         self.classes = np.concatenate(classes_parts, axis=1)        # [N, n_obj]
@@ -781,10 +799,10 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             self.train_dataset,
             batch_size=self.train_config["batch_size"],
             shuffle=self.train_config["shuffle"],
-            num_workers=self.train_config["num_workers"],
             pin_memory=self.train_config["pin_memory"],
             drop_last=True,
             collate_fn=masked_former_collate_fn,
+            **_dataloader_worker_kwargs(self.train_config),
         )
 
     def val_dataloader(self):
@@ -793,9 +811,9 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             self.val_dataset,
             batch_size=self.val_config["batch_size"],
             shuffle=self.val_config["shuffle"],
-            num_workers=self.val_config["num_workers"],
             pin_memory=self.val_config["pin_memory"],
             collate_fn=masked_former_collate_fn,
+            **_dataloader_worker_kwargs(self.val_config),
         )
 
     def test_dataloader(self):
@@ -804,7 +822,7 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             self.test_dataset,
             batch_size=self.test_config["batch_size"],
             shuffle=self.test_config["shuffle"],
-            num_workers=self.test_config["num_workers"],
             pin_memory=self.test_config["pin_memory"],
             collate_fn=masked_former_collate_fn,
+            **_dataloader_worker_kwargs(self.test_config),
         )

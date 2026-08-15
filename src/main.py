@@ -4,22 +4,41 @@ import lightning as pl
 from pathlib import Path
 from typing import Dict, Optional
 from lightning.pytorch.loggers import TensorBoardLogger
-from models.particle_transformer import (
-    ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
-)
-from data.datamodule import MaskedFormerTopsWsDataModule
-from trainers.top_reconstruction_trainers import (
-    ReconstructionTrainer, train_reconstruction_model,
-)
-from models.components.masked_former_tasks import (
-    TaskRegistry, TaskConfig,
-    MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
-    BackgroundSuppressionTask, ParticleGatingTask,
-    ChainTypeTask, NeutrinoRegressionTask,
-    ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
-    InvariantMassTask,
-)
-from utils.utils import load_and_split_config, load_any_config
+if __package__:
+    from .models.particle_transformer import (
+        ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
+    )
+    from .data.datamodule import MaskedFormerTopsWsDataModule
+    from .trainers.top_reconstruction_trainers import (
+        ReconstructionTrainer, train_reconstruction_model,
+    )
+    from .models.components.masked_former_tasks import (
+        TaskRegistry, TaskConfig,
+        MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
+        BackgroundSuppressionTask, ParticleGatingTask,
+        ChainTypeTask, NeutrinoRegressionTask,
+        ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
+        InvariantMassTask,
+    )
+    from .utils.utils import load_and_split_config, load_any_config
+else:
+    # Direct ``python src/main.py`` remains supported by the SLURM entrypoint.
+    from models.particle_transformer import (
+        ParticleEmbedder, InteractionEmbedder, MaskedReconstructionPart,
+    )
+    from data.datamodule import MaskedFormerTopsWsDataModule
+    from trainers.top_reconstruction_trainers import (
+        ReconstructionTrainer, train_reconstruction_model,
+    )
+    from models.components.masked_former_tasks import (
+        TaskRegistry, TaskConfig,
+        MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
+        BackgroundSuppressionTask, ParticleGatingTask,
+        ChainTypeTask, NeutrinoRegressionTask,
+        ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
+        InvariantMassTask,
+    )
+    from utils.utils import load_and_split_config, load_any_config
 
 
 
@@ -88,6 +107,11 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             layer_weights=mask_layer_weights,
             head_norm=mask_config.get('head_norm', False),
             mask_embed_head=mask_config.get('mask_embed_head', False),
+            validity_key=mask_config.get('validity_key', 'top_valid' if chain_queries else None),
+            bce_reference_particles=mask_config.get('bce_reference_particles'),
+            rank_weight=mask_config.get('rank_weight', 0.0),
+            rank_margin=mask_config.get('rank_margin', 1.0),
+            rank_temperature=mask_config.get('rank_temperature', 0.5),
         ),
         null_mask_penalty=mask_config.get('null_mask_penalty', 0.1),
         bce_pos_weight=mask_config.get('bce_pos_weight', False),
@@ -123,6 +147,15 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
                 layer_weights=mask_W_layer_weights,
                 head_norm=mask_W_config.get('head_norm', False),
                 mask_embed_head=mask_W_config.get('mask_embed_head', mask_config.get('mask_embed_head', False)),
+                validity_key=mask_W_config.get('validity_key', 'w_valid'),
+                bce_reference_particles=mask_W_config.get(
+                    'bce_reference_particles', mask_config.get('bce_reference_particles')
+                ),
+                rank_weight=mask_W_config.get('rank_weight', mask_config.get('rank_weight', 0.0)),
+                rank_margin=mask_W_config.get('rank_margin', mask_config.get('rank_margin', 1.0)),
+                rank_temperature=mask_W_config.get(
+                    'rank_temperature', mask_config.get('rank_temperature', 0.5)
+                ),
             ),
             null_mask_penalty=mask_W_config.get('null_mask_penalty', mask_config.get('null_mask_penalty', 0.1)),
             bce_pos_weight=mask_W_config.get('bce_pos_weight', mask_config.get('bce_pos_weight', False)),
@@ -139,10 +172,11 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
     # ========================================
     obj_config = task_configs.get("objectness", {})
 
-    # Conditional registration (DDP-safe on/off): default enabled = baseline.
+    # Conditional registration (DDP-safe on/off): opt in for legacy checkpoints
+    # or a separately trained purity study.
     # NOTE: old checkpoints were trained WITH objectness — set enabled: true to
     # load / test such a run.
-    if obj_config.get('enabled', True):
+    if obj_config.get('enabled', False):
         obj_layer_weights = _build_layer_weights(
             layer_config=obj_config.get('layer_weights'),
             strategy=obj_config.get('layer_weight_strategy'),
@@ -494,6 +528,20 @@ if __name__ == "__main__":
     ckpt_path = inf_cfg.get("checkpoint_path", None)
     log_dir = config.get("model_artefacts", {}).get("log_dir", "lightning_logs")
 
+    def _test_after_fit(trainer, model):
+        # Test output writing is intentionally single-device until event IDs are
+        # carried through the sampler.  Distributed rank shards are strided, so
+        # appending them into one HDF5 file would silently misalign truth rows.
+        if getattr(trainer, "world_size", 1) != 1:
+            if trainer.is_global_zero:
+                print(
+                    "Skipping automatic distributed test output. Run with "
+                    "inference.mode=test (which uses one device) to write "
+                    "aligned HDF5 predictions."
+                )
+            return
+        trainer.test(model, datamodule=topantitopquark)
+
     if mode == "train":
         trainer, model = train_reconstruction_model(
             model=transformer_model,
@@ -501,7 +549,7 @@ if __name__ == "__main__":
             data_module=topantitopquark,
             config=config,
         )
-        trainer.test(model, datamodule=topantitopquark)
+        _test_after_fit(trainer, model)
 
     elif mode == "test":
         assert ckpt_path is not None, (
@@ -544,7 +592,7 @@ if __name__ == "__main__":
             config=config,
             ckpt_path=ckpt_path,
         )
-        trainer.test(model, datamodule=topantitopquark)
+        _test_after_fit(trainer, model)
 
     elif mode == "lr_find":
         from lightning.pytorch.tuner import Tuner
@@ -585,5 +633,3 @@ if __name__ == "__main__":
 
     else:
         raise ValueError(f"Unknown inference mode: {mode}. Use 'train', 'test', 'resume', or 'lr_find'.")
-
-
