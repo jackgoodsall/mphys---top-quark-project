@@ -2,15 +2,22 @@
 #SBATCH -p gpuL
 #SBATCH --gres=gpu:2
 #SBATCH --time=3-00:00:00
-#SBATCH --ntasks=1
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
+#SBATCH --job-name=model_improvement_ddp
 #SBATCH --output=slurm_outputs/model_improvement_%x_%j.out
 #SBATCH --chdir=/net/scratch/b58521jg/transformers
 
 set -euo pipefail
 
-CONFIG=${1:?"usage: sbatch scripts/submit_model_improvement.sbatch config/model_improvement/E_arch01_similarity.yaml"}
+CONFIG=${1:?"usage: sbatch scripts/submit_model_improvement.sbatch CONFIG [CHECKPOINT]"}
+RESUME_FROM=${2:-}
 [[ -f "$CONFIG" ]] || { echo "Missing config: $CONFIG" >&2; exit 2; }
+if [[ -n "$RESUME_FROM" && ! -f "$RESUME_FROM" ]]; then
+    echo "Missing checkpoint: $RESUME_FROM" >&2
+    exit 2
+fi
 
 module purge
 module load libs/cuda
@@ -27,5 +34,16 @@ source .transformer_env/bin/activate
 echo "Job ID: ${SLURM_JOB_ID:-local}  Node: ${SLURM_NODELIST:-local}"
 echo "Config: $CONFIG"
 echo "Start: $(date)"
-uv run src/main.py --config "$CONFIG"
+
+if [[ "${SLURM_NTASKS:-1}" -ne 2 ]]; then
+    echo "Expected two DDP tasks, got ${SLURM_NTASKS:-unset}" >&2
+    exit 3
+fi
+
+RUN=(uv run src/main.py --config "$CONFIG")
+if [[ -n "$RESUME_FROM" ]]; then
+    RUN+=(--resume-from "$RESUME_FROM")
+fi
+
+srun --ntasks=2 --gpus-per-task=1 --gpu-bind=single:1 "${RUN[@]}"
 echo "Completed: $(date)"

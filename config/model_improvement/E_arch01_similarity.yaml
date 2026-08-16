@@ -12,5 +12,9 @@ model_parameters:
   transformer:
     mask_logit_scale: true
 
+data_modules:
+  train:
+    batch_size: 2048  # per DDP GPU; global batch = 4096 with two ranks
+
 model_artefacts:
   log_dir: model_improvement/E_arch01_similarity

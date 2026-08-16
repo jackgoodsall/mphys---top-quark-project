@@ -490,8 +490,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/top_reconstruction_config.yaml")
+    parser.add_argument("--resume-from", default=None)
     args, _ = parser.parse_known_args()
     config = load_any_config(args.config)
+    if args.resume_from:
+        config.setdefault("inference", {})
+        config["inference"]["mode"] = "resume"
+        config["inference"]["checkpoint_path"] = args.resume_from
 
     # FP32 matmul precision (TF32 on Ampere+ GPUs)
     matmul_precision = config.get("model_training", {}).get("matmul_precision", "highest")
