@@ -1,0 +1,44 @@
+root_dataset_prepper:
+  save_path: data/topquarkreconstruction/contract_v3/raw_splits
+  save_file_prefix: ttbar_contract_raw_
+
+preprocessing:
+  required_splits: [train, val, calibration, test]
+  stream_size: 100000
+  save_path: data/topquarkreconstruction/contract_v3/processed
+  save_file_prefix: ttbar_contract_processed_
+  # Preserve every selected event, including the explicit zero-match stratum.
+  min_objects: 0
+  interaction_scaling: per_feature
+  metadata_keys:
+    - event_id
+    - source_file_id
+    - source_entry
+    - source_event_number
+    - generator_group
+    - generator_weight
+    - weight_sign
+    - truth_decay_channel
+    - raw_njets
+    - pt_accepted_njets
+    - accepted_njets
+    - selected_njets
+    - accepted_nbtags
+    - truncated_at_max_particles
+    - selected_parton_jet
+    - selected_parton_distance
+    - second_closest_local_raw_jet
+    - second_closest_local_distance
+    - pre_acceptance_matchable
+    - post_acceptance_matchable
+    - post_truncation_matchable
+    - parton_ambiguous
+    - parton_collision
+    - selection_truth_decay
+    - selection_reco_lepton_veto
+    - selection_pt
+    - selection_eta
+    - selection_min_jets
+    - selection_min_btags
+    - selection_truncation
+    - selection_pass

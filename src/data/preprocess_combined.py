@@ -84,23 +84,51 @@ class CombinedScalers:
         self.mass_scaler = LogMinMaxScaler()          # jet mass (col 5, >= 0)
         self.interaction_scaler = PerFeatureScaler()  # [ΔR, kT, z, m²] per-feature
 
+    @staticmethod
+    def _partial_fit_phase(transformer, values: np.ndarray, phase: str):
+        if phase == "bounds":
+            if hasattr(transformer, "partial_fit_bounds"):
+                transformer.partial_fit_bounds(values)
+        elif phase == "moments":
+            if hasattr(transformer, "partial_fit_standardization"):
+                transformer.partial_fit_standardization(values)
+            else:
+                transformer.partial_fit(values)
+        else:
+            raise ValueError(f"unknown scaler fit phase: {phase}")
+
+    def freeze_bounds(self):
+        for transformer in (
+            self.pt_scaler,
+            self.E_scaler,
+            self.met_scaler,
+            self.mass_scaler,
+            self.interaction_scaler,
+        ):
+            if hasattr(transformer, "freeze_bounds"):
+                transformer.freeze_bounds()
+
     def partial_fit_particles(self, pt: np.ndarray, eta: np.ndarray, E: np.ndarray,
-                              m: Optional[np.ndarray] = None):
+                              m: Optional[np.ndarray] = None, phase: str = "moments"):
         """Partial-fit on valid (non-NaN) particle values."""
         valid = ~np.isnan(pt)
         if valid.any():
-            self.pt_scaler.partial_fit(pt[valid].reshape(-1, 1))
-            self.eta_scaler.partial_fit(eta[valid].reshape(-1, 1))
-            self.E_scaler.partial_fit(E[valid].reshape(-1, 1))
+            self._partial_fit_phase(self.pt_scaler, pt[valid].reshape(-1, 1), phase)
+            self._partial_fit_phase(self.eta_scaler, eta[valid].reshape(-1, 1), phase)
+            self._partial_fit_phase(self.E_scaler, E[valid].reshape(-1, 1), phase)
             if m is not None:
-                self.mass_scaler.partial_fit(m[valid].reshape(-1, 1))
+                self._partial_fit_phase(self.mass_scaler, m[valid].reshape(-1, 1), phase)
 
-    def partial_fit_met(self, met: np.ndarray):
-        self.met_scaler.partial_fit(met.reshape(-1, 1))
+    def partial_fit_met(self, met: np.ndarray, phase: str = "moments"):
+        self._partial_fit_phase(self.met_scaler, met.reshape(-1, 1), phase)
 
-    def partial_fit_interactions(self, interactions: np.ndarray):
+    def partial_fit_interactions(self, interactions: np.ndarray, phase: str = "moments"):
         """interactions: [B, P, P, 4] raw-built. Fits the per-feature scaler."""
-        self.interaction_scaler.partial_fit(interactions.reshape(-1, interactions.shape[-1]))
+        self._partial_fit_phase(
+            self.interaction_scaler,
+            interactions.reshape(-1, interactions.shape[-1]),
+            phase,
+        )
 
     def transform_interactions(self, interactions: np.ndarray) -> np.ndarray:
         B, P, P2, F = interactions.shape
@@ -307,19 +335,19 @@ def reco_kin_from_raw(pt_raw, eta_raw, sin_phi_raw, cos_phi_raw, E_raw,
 
 # ── Hadronic reader ───────────────────────────────────────────────────────────
 
-def had_fit_chunk(jet_raw: np.ndarray, scalers: CombinedScalers):
+def had_fit_chunk(jet_raw: np.ndarray, scalers: CombinedScalers, phase: str):
     """Fit scalers on one hadronic chunk."""
     pt   = jet_raw[:, :, 0]
     eta  = jet_raw[:, :, 1]
     phi  = jet_raw[:, :, 2]
     E    = jet_raw[:, :, 3]
     m    = jet_raw[:, :, 4]
-    scalers.partial_fit_particles(pt, eta, E, m)
+    scalers.partial_fit_particles(pt, eta, E, m, phase)
     # Fit the interaction scaler on RAW-built interactions (physical distribution).
     ptz, etaz, phiz, Ez = (np.nan_to_num(pt), np.nan_to_num(eta),
                            np.nan_to_num(phi), np.nan_to_num(E))
     inter = build_interaction_matrix_raw(ptz, etaz, np.sin(phiz), np.cos(phiz), Ez)
-    scalers.partial_fit_interactions(inter)
+    scalers.partial_fit_interactions(inter, phase)
     # MET not available in hadronic data — skip met_scaler for this source
 
 
@@ -467,7 +495,7 @@ def had_process_chunk(jet_raw: np.ndarray, event_raw: np.ndarray,
 
 # ── Semi-leptonic reader ──────────────────────────────────────────────────────
 
-def slep_fit_chunk(f: h5py.File, start: int, stop: int, scalers: CombinedScalers):
+def slep_fit_chunk(f: h5py.File, start: int, stop: int, scalers: CombinedScalers, phase: str):
     """Fit scalers on one semi-leptonic chunk."""
     pt   = f['INPUTS/Momenta/pt'][start:stop]
     eta  = f['INPUTS/Momenta/eta'][start:stop]
@@ -482,8 +510,8 @@ def slep_fit_chunk(f: h5py.File, start: int, stop: int, scalers: CombinedScalers
     m_v   = np.where(mask, m, np.nan)
     E_v   = np.where(mask, compute_E(pt, eta, m), np.nan)
 
-    scalers.partial_fit_particles(pt_v, eta_v, E_v, m_v)
-    scalers.partial_fit_met(f['INPUTS/Met/met'][start:stop])
+    scalers.partial_fit_particles(pt_v, eta_v, E_v, m_v, phase)
+    scalers.partial_fit_met(f['INPUTS/Met/met'][start:stop], phase)
 
     # Fit interaction scaler on RAW-built interactions (padding zeroed).
     E_raw = compute_E(pt, eta, m)
@@ -491,7 +519,7 @@ def slep_fit_chunk(f: h5py.File, start: int, stop: int, scalers: CombinedScalers
                      np.where(mask, E_raw, 0.0))
     sinz, cosz = np.where(mask, sin_phi, 0.0), np.where(mask, cos_phi, 0.0)
     inter = build_interaction_matrix_raw(ptz, etaz, sinz, cosz, Ez)
-    scalers.partial_fit_interactions(inter)
+    scalers.partial_fit_interactions(inter, phase)
 
 
 def slep_process_chunk(f: h5py.File, start: int, stop: int,
@@ -713,18 +741,22 @@ def fit_scalers(had_train: Optional[Path], slep_train: Optional[Path]) -> Combin
     scalers = CombinedScalers()
     print("[FIT] Fitting scalers on training data ...", flush=True)
 
-    if had_train and had_train.exists():
-        with h5py.File(had_train, 'r') as f:
-            N = f['jet'].shape[0]
-            for start in tqdm(range(0, N, CHUNK_SIZE), desc='Fit hadronic'):
-                jet_raw = f['jet'][start:start+CHUNK_SIZE]
-                had_fit_chunk(jet_raw, scalers)
+    for phase in ("bounds", "moments"):
+        if phase == "moments":
+            scalers.freeze_bounds()
 
-    if slep_train and slep_train.exists():
-        with h5py.File(slep_train, 'r') as f:
-            N = f['INPUTS/Momenta/pt'].shape[0]
-            for start in tqdm(range(0, N, CHUNK_SIZE), desc='Fit semi-leptonic'):
-                slep_fit_chunk(f, start, min(start+CHUNK_SIZE, N), scalers)
+        if had_train and had_train.exists():
+            with h5py.File(had_train, 'r') as f:
+                N = f['jet'].shape[0]
+                for start in tqdm(range(0, N, CHUNK_SIZE), desc=f'Fit hadronic {phase}'):
+                    jet_raw = f['jet'][start:start+CHUNK_SIZE]
+                    had_fit_chunk(jet_raw, scalers, phase)
+
+        if slep_train and slep_train.exists():
+            with h5py.File(slep_train, 'r') as f:
+                N = f['INPUTS/Momenta/pt'].shape[0]
+                for start in tqdm(range(0, N, CHUNK_SIZE), desc=f'Fit semi-leptonic {phase}'):
+                    slep_fit_chunk(f, start, min(start+CHUNK_SIZE, N), scalers, phase)
 
     return scalers
 

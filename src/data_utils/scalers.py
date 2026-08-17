@@ -109,6 +109,7 @@ class LogMinMaxScaler(BaseEstimator, TransformerMixin):
         self.scale_ = None
         self.min_offset_ = None
         self.scalar = StandardScaler()
+        self._bounds_frozen = False
 
     def _log_transform(self, X):
         # elementwise log1p, preserves NaN
@@ -118,18 +119,33 @@ class LogMinMaxScaler(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         self.log_min_ = None
         self.log_max_ = None
-        return self.partial_fit(X, y)
+        self.scalar = StandardScaler()
+        self._bounds_frozen = False
+        self.partial_fit_bounds(X)
+        self.freeze_bounds()
+        return self.partial_fit_standardization(X)
 
     def partial_fit(self, X, y=None):
+        """Fit a complete single batch.
+
+        Streaming callers must use ``partial_fit_bounds`` over every batch,
+        freeze, then ``partial_fit_standardization`` over every batch.  Refuse
+        the old order-dependent update instead of silently reproducing it.
+        """
+        if self.log_min_ is not None or hasattr(self.scalar, "n_samples_seen_"):
+            raise RuntimeError(
+                "streaming LogMinMaxScaler fitting requires the two-pass API: "
+                "partial_fit_bounds -> freeze_bounds -> partial_fit_standardization"
+            )
+        return self.fit(X, y)
+
+    def partial_fit_bounds(self, X, y=None):
+        if self._bounds_frozen:
+            raise RuntimeError("log-space bounds are already frozen")
         X = np.asarray(X, dtype=np.float64)
-
         X_log = self._log_transform(X)
-
-
-        # compute batch min/max ignoring NaNs
         batch_min = np.nanmin(X_log, axis=0)
         batch_max = np.nanmax(X_log, axis=0)
-
         if self.log_min_ is None:
             self.log_min_ = batch_min
             self.log_max_ = batch_max
@@ -145,7 +161,19 @@ class LogMinMaxScaler(BaseEstimator, TransformerMixin):
 
         self.scale_ = scale
         self.min_offset_ = min_offset
+        return self
 
+    def freeze_bounds(self):
+        if self.log_min_ is None:
+            raise RuntimeError("cannot freeze bounds before fitting them")
+        self._bounds_frozen = True
+        return self
+
+    def partial_fit_standardization(self, X, y=None):
+        if not self._bounds_frozen:
+            raise RuntimeError("freeze log-space bounds before fitting moments")
+        X = np.asarray(X, dtype=np.float64)
+        X_log = self._log_transform(X)
         X_scaled = X_log * self.scale_ + self.min_offset_
         self.scalar.partial_fit(X_scaled)
         return self
@@ -205,6 +233,29 @@ class PerFeatureScaler(BaseEstimator, TransformerMixin):
         X = np.asarray(X, dtype=np.float64)
         for i, t in enumerate(self.transformers):
             t.partial_fit(X[:, i:i + 1])
+        return self
+
+    def partial_fit_bounds(self, X, y=None):
+        X = np.asarray(X, dtype=np.float64)
+        for i, transformer in enumerate(self.transformers):
+            if hasattr(transformer, "partial_fit_bounds"):
+                transformer.partial_fit_bounds(X[:, i:i + 1])
+        return self
+
+    def freeze_bounds(self):
+        for transformer in self.transformers:
+            if hasattr(transformer, "freeze_bounds"):
+                transformer.freeze_bounds()
+        return self
+
+    def partial_fit_standardization(self, X, y=None):
+        X = np.asarray(X, dtype=np.float64)
+        for i, transformer in enumerate(self.transformers):
+            column = X[:, i:i + 1]
+            if hasattr(transformer, "partial_fit_standardization"):
+                transformer.partial_fit_standardization(column)
+            else:
+                transformer.partial_fit(column)
         return self
 
     def fit(self, X, y=None):

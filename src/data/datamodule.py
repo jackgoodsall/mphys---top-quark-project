@@ -298,7 +298,8 @@ class MaskedFormerDataSet(Dataset):
     """In-memory dataset. Used by analysis scripts and as a fallback."""
 
     def __init__(self, jet, interactions, src_mask, targets, target_kinematics,
-                 classes=None, object_valid=None, augmenter=None, jet_p4_raw=None):
+                 classes=None, object_valid=None, augmenter=None, jet_p4_raw=None,
+                 event_id=None):
         self.augmenter = augmenter
         self.jet_p4_raw = np.asarray(jet_p4_raw) if jet_p4_raw is not None else None
         self.jet = np.asarray(jet)
@@ -309,6 +310,7 @@ class MaskedFormerDataSet(Dataset):
         self.target_kinematics = np.asarray(target_kinematics)
         self.classes = np.asarray(classes) if classes is not None else None
         self.object_valid = np.asarray(object_valid, dtype=bool) if object_valid is not None else None
+        self.event_id = np.asarray(event_id, dtype=np.uint64) if event_id is not None else None
 
     def __len__(self):
         return int(self.jet.shape[0])
@@ -327,6 +329,8 @@ class MaskedFormerDataSet(Dataset):
             "src_mask": torch.from_numpy(self.src_mask[idx]).bool(),
             "interactions": torch.from_numpy(interactions).float(),
         }
+        if self.event_id is not None:
+            sample["event_id"] = torch.tensor(int(self.event_id[idx]), dtype=torch.uint64)
 
         jet_mask = self.targets[idx]
         kin = self.target_kinematics[idx]
@@ -403,6 +407,7 @@ class LazyHDF5Dataset(Dataset):
             self._has_globals        = "globals"         in f
             self._has_neutrino_truth = "neutrino_truth"  in f
             self._has_jet_p4_raw     = "jet_p4_raw"      in f
+            self._event_id = f["event_id"][()] if "event_id" in f else None
 
         # Pre-compute per-event classes and object_valid (small arrays).
         # These stay in RAM; everything else is read lazily.
@@ -455,6 +460,8 @@ class LazyHDF5Dataset(Dataset):
             "src_mask": torch.from_numpy(src_mask).bool(),
             "interactions": torch.from_numpy(interactions).float(),
         }
+        if self._event_id is not None:
+            sample["event_id"] = torch.tensor(int(self._event_id[idx]), dtype=torch.uint64)
 
         # Leptonic-extension: optional per-particle type and event globals
         if self._has_particle_type:
@@ -536,7 +543,7 @@ class MemmapDataset(Dataset):
         """
         npy_dir = MemmapDataset.npy_dir(h5_path)
         npy_dir.mkdir(exist_ok=True)
-        keys_to_save = ["jet", "src_mask", "jet_p4_raw"]
+        keys_to_save = ["jet", "src_mask", "jet_p4_raw", "event_id"]
         if load_interactions:
             keys_to_save.append("interactions")
         for k in [tops_mask_key, tops_kin_key, ws_mask_key, ws_kin_key,
@@ -569,6 +576,7 @@ class MemmapDataset(Dataset):
         self._jet = _mmap("jet")
         self._src_mask = _mmap("src_mask")
         self._jet_p4_raw = _mmap("jet_p4_raw")
+        self._event_id = _mmap("event_id")
         self._interactions = _mmap("interactions") if load_interactions else None
 
         self._tops_masks = _mmap(tops_mask_key) if tops_mask_key else None
@@ -617,6 +625,8 @@ class MemmapDataset(Dataset):
             "src_mask": torch.from_numpy(src_mask).bool(),
             "interactions": torch.from_numpy(interactions).float(),
         }
+        if self._event_id is not None:
+            sample["event_id"] = torch.tensor(int(self._event_id[idx]), dtype=torch.uint64)
 
         masks_parts, kins_parts = [], []
         if self._tops_masks is not None:
@@ -746,6 +756,7 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         with h5py.File(path, "r") as f:
             jet = f["jet"][()]
             src_mask = f["src_mask"][()]
+            event_id = f["event_id"][()] if "event_id" in f else None
 
             if self.load_interactions and "interactions" in f:
                 interactions = f["interactions"][()].astype(np.float16)
@@ -780,6 +791,7 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             object_valid=object_valid if has_partial else None,
             augmenter=augmenter,
             jet_p4_raw=jet_p4_raw,
+            event_id=event_id,
         )
         return ds
 
@@ -792,6 +804,9 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
         if stage in (None, "test"):
             self.test_dataset = self._load_split("test")
             print(f"[DM TopsWs] test  len={len(self.test_dataset)}")
+        if stage in (None, "calibrate"):
+            self.calibration_dataset = self._load_split("calibration")
+            print(f"[DM TopsWs] calibration len={len(self.calibration_dataset)}")
 
     def train_dataloader(self):
         assert self.train_dataset is not None
@@ -825,4 +840,16 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
             pin_memory=self.test_config["pin_memory"],
             collate_fn=masked_former_collate_fn,
             **_dataloader_worker_kwargs(self.test_config),
+        )
+
+    def calibration_dataloader(self):
+        """Explicit held-out loader for fitting decoder/calibration parameters."""
+        assert self.calibration_dataset is not None
+        return DataLoader(
+            self.calibration_dataset,
+            batch_size=self.val_config["batch_size"],
+            shuffle=False,
+            pin_memory=self.val_config["pin_memory"],
+            collate_fn=masked_former_collate_fn,
+            **_dataloader_worker_kwargs(self.val_config),
         )

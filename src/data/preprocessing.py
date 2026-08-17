@@ -1,5 +1,9 @@
 import sys
 import os
+import hashlib
+import json
+import shutil
+import tempfile
 
 print("[START] Script initializing...", flush=True)
 
@@ -67,6 +71,7 @@ except Exception as e:
 
 try:
     from src.utils.utils import load_any_config
+    from src.data.data_contract import content_hash, write_manifest
     print("[OK] load_any_config imported", flush=True)
 except Exception as e:
     print(f"[FAIL] load_any_config import: {e}", flush=True)
@@ -652,10 +657,12 @@ class TopReconstructionDatasetFromH5:
         # Default 4 = old behaviour (fully-reconstructable events only).
         # Set to 1 to include all events with at least one object.
         self.min_objects = self.preprocessing_config.get("min_objects", 4)
+        self.overwrite = bool(self.preprocessing_config.get("overwrite", False))
 
         # Extra raw-HDF5 keys to read and pass to extract_targets as extra_chunks.
         # For semi-leptonic data: ['particle_type', 'MET', 'neutrino_pz_truth']
         self.extra_read_keys: list = self.preprocessing_config.get("extra_read_keys", [])
+        self.metadata_keys: list = self.preprocessing_config.get("metadata_keys", [])
 
         # Keys from the extractor output that are stored as-is (no transformer scaling).
         # These are categorical/integer or pre-computed arrays.
@@ -674,9 +681,9 @@ class TopReconstructionDatasetFromH5:
         
         print("[INIT] Complete!", flush=True)
 
-    def _save_transformers(self):
+    def _save_transformers(self, output_dir: Path):
         """Save fitted transformers to disk."""
-        transform_save_path = self.save_dir / "target_transforms.joblib"
+        transform_save_path = output_dir / "target_transforms.joblib"
         
         print(f"[SAVE] Saving transformers to {transform_save_path}", flush=True)
         
@@ -685,8 +692,16 @@ class TopReconstructionDatasetFromH5:
             "target_transformers": self.target_transformers,
             "interaction_transformers": self.interaction_transformers,
         }
-        transform_save_path.parent.mkdir(parents = True, exist_ok= True)
+        transform_save_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(transformers_dict, transform_save_path)
+        digest = hashlib.sha256(transform_save_path.read_bytes()).hexdigest()
+        self.scaler_hash = digest
+        manifest = {
+            "scaler_hash": digest,
+            "scaler_path": str(self.save_dir / "target_transforms.joblib"),
+            "training_files": self._training_file_provenance,
+        }
+        write_manifest(output_dir / "preprocessing_manifest.json", manifest)
         print(f"[SAVE] Transformers saved successfully!", flush=True)
 
     def _construct_path(self, directory: str, prefix: str) -> Path:
@@ -707,38 +722,122 @@ class TopReconstructionDatasetFromH5:
         """Helper method to construct glob pattern."""
         return f"{prefix_path}*{suffix}.h5"
 
+    def _matching_raw_files(self):
+        prefix = self.raw_file_prefix_and_path
+        return sorted(prefix.parent.glob(f"{prefix.name}*.h5"))
+
     def _prepare_datasets(self):
         """Prepare datasets by fitting transformers on training data only."""
         print("\n[FIT] Starting transformer fitting...", flush=True)
-        
-        raw_file_pattern = self._get_file_pattern(self.raw_file_prefix_and_path, "")
-        raw_files = sorted(Path().glob(raw_file_pattern))
-        
-        if not raw_files:
-            print(f"[WARN] No raw files found matching: {raw_file_pattern}", flush=True)
-            return
 
-        # Separate train files from test/val files
-        train_files = [f for f in raw_files if "train" in f.name.lower()]
-        non_train_files = [f for f in raw_files if "train" not in f.name.lower()]
-        
-        if not train_files:
-            print(f"[ERROR] No training files found! Cannot fit transformers.", flush=True)
-            print(f"[ERROR] Looking for files with 'train' in filename.", flush=True)
-            return
+        required_splits = self.preprocessing_config.get("required_splits")
+        if required_splits:
+            raw_files = [Path(f"{self.raw_file_prefix_and_path}{split}.h5") for split in required_splits]
+            missing = [str(path) for path in raw_files if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(f"missing required raw split files: {missing}")
+            unexpected = sorted(set(self._matching_raw_files()) - set(raw_files))
+            if unexpected:
+                raise ValueError(f"unexpected raw files match the contract prefix: {unexpected}")
+            train_files = [raw_files[required_splits.index("train")]] if "train" in required_splits else []
+        else:
+            raw_file_pattern = self._get_file_pattern(self.raw_file_prefix_and_path, "")
+            raw_files = self._matching_raw_files()
+            if not raw_files:
+                raise FileNotFoundError(f"no raw files found matching: {raw_file_pattern}")
+            train_files = [f for f in raw_files if "train" in f.name.lower()]
+
+        if len(train_files) != 1:
+            raise ValueError(f"exactly one declared training split is required, got {train_files}")
+        non_train_files = [f for f in raw_files if f not in train_files]
+
+        if self.save_dir.exists():
+            raise FileExistsError(
+                f"refusing to replace existing processed dataset directory {self.save_dir}; "
+                "choose a new versioned save_path"
+            )
         
         print(f"[FIT] Found {len(train_files)} training files (will fit transformers)", flush=True)
         print(f"[FIT] Found {len(non_train_files)} test/val files (will only transform)", flush=True)
+        self._training_file_provenance = []
+        expected_contract = None
+        expected_schema = None
+        expected_selection = None
+        expected_matcher = None
+        for path in raw_files:
+            with h5py.File(path, "r") as handle:
+                attrs = {
+                    "contract_hash": str(handle.attrs.get("contract_hash", "missing")),
+                    "schema_version": str(handle.attrs.get("schema_version", "missing")),
+                    "selection_hash": str(handle.attrs.get("selection_hash", "missing")),
+                    "matcher_hash": str(handle.attrs.get("matcher_hash", "missing")),
+                    "source_hash": str(handle.attrs.get("source_hash", "missing")),
+                }
+                if "missing" in attrs.values():
+                    raise ValueError(f"raw split lacks required contract attributes: {path}: {attrs}")
+                values = tuple(attrs.values())
+                if expected_contract is None:
+                    expected_contract, expected_schema, expected_selection, expected_matcher, expected_source = values
+                elif values != (
+                    expected_contract, expected_schema, expected_selection, expected_matcher, expected_source
+                ):
+                    raise ValueError(f"raw split contract attributes disagree: {path}")
+                if required_splits:
+                    declared_split = required_splits[raw_files.index(path)]
+                    if str(handle.attrs.get("split", "missing")) != declared_split:
+                        raise ValueError(
+                            f"raw split attribute mismatch: {path} is not declared as {declared_split}"
+                        )
+                if path in train_files:
+                    self._training_file_provenance.append({
+                        "path": str(path),
+                        "rows": int(handle["jet"].shape[0]),
+                        **attrs,
+                    })
         
-        # Only fit on training files
+        # Pass 1: establish final log-space bounds from training groups only.
         for raw_file in train_files:
-            print(f"[FIT] Fitting on {raw_file.name}...", flush=True)
-            self._fit_file(raw_file)
+            print(f"[FIT] Bounds pass on {raw_file.name}...", flush=True)
+            self._fit_file(raw_file, phase="bounds")
+        self._freeze_log_bounds()
+
+        # Pass 2: fit moments in the now-fixed coordinate system.
+        for raw_file in train_files:
+            print(f"[FIT] Moments pass on {raw_file.name}...", flush=True)
+            self._fit_file(raw_file, phase="moments")
         
         print("[FIT] Transformer fitting complete!", flush=True)
-        self._save_transformers()
-        print("[FIT] Fitted transformers will be applied to all files during transformation.", flush=True)
-        self._transform_all()
+        self.save_dir.parent.mkdir(parents=True, exist_ok=True)
+        stage_dir = Path(tempfile.mkdtemp(prefix=f".{self.save_dir.name}.stage-", dir=self.save_dir.parent))
+        try:
+            self._save_transformers(stage_dir)
+            print("[FIT] Fitted transformers will be applied to all files during transformation.", flush=True)
+            self._transform_all(raw_files, stage_dir)
+            manifest_path = stage_dir / "preprocessing_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("manifest_hash", None)
+            manifest["outputs"] = {}
+            for raw_file in raw_files:
+                name = raw_file.name.replace(
+                    self.raw_file_config.get("save_file_prefix", "raw_"),
+                    self.preprocessing_config.get("save_file_prefix", "processed_"),
+                )
+                with h5py.File(stage_dir / name, "r") as handle:
+                    manifest["outputs"][name] = {
+                        "rows": int(handle["jet"].shape[0]),
+                        "contract_hash": str(handle.attrs["contract_hash"]),
+                        "schema_version": str(handle.attrs["schema_version"]),
+                        "selection_hash": str(handle.attrs["selection_hash"]),
+                        "matcher_hash": str(handle.attrs["matcher_hash"]),
+                        "source_hash": str(handle.attrs["source_hash"]),
+                        "split": str(handle.attrs["split"]),
+                        "scaler_hash": str(handle.attrs["scaler_hash"]),
+                    }
+            write_manifest(manifest_path, manifest)
+            os.replace(stage_dir, self.save_dir)
+        except BaseException:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
 
     def _read_extra_chunks(self, f: "h5py.File", start: int, stop: int) -> Dict[str, np.ndarray]:
         """Read optional extra keys from an open raw HDF5 file."""
@@ -748,7 +847,39 @@ class TopReconstructionDatasetFromH5:
                 extra[key] = f[key][start:stop].copy()
         return extra
 
-    def _fit_file(self, raw_path: Path):
+    def _read_metadata_chunks(self, f: "h5py.File", start: int, stop: int) -> Dict[str, np.ndarray]:
+        missing = [key for key in self.metadata_keys if key not in f]
+        if missing:
+            raise ValueError(f"raw input is missing required metadata keys: {missing}")
+        expected = f["jet"].shape[0]
+        malformed = [key for key in self.metadata_keys if f[key].shape[0] != expected]
+        if malformed:
+            raise ValueError(
+                f"metadata first dimension must match jet rows ({expected}): {malformed}"
+            )
+        return {key: f[key][start:stop] for key in self.metadata_keys}
+
+    def _freeze_log_bounds(self):
+        transformers = list(self.jet_transformers)
+        transformers.extend(self.target_processor.top_transformers)
+        transformers.extend(self.target_processor.W_transformers)
+        if self.interaction_transformers is not None:
+            transformers.append(self.interaction_transformers)
+        for transformer in transformers:
+            if hasattr(transformer, "freeze_bounds"):
+                transformer.freeze_bounds()
+
+    @staticmethod
+    def _partial_fit_phase(transformer, values, phase):
+        if phase == "bounds":
+            if hasattr(transformer, "partial_fit_bounds"):
+                transformer.partial_fit_bounds(values)
+        elif hasattr(transformer, "partial_fit_standardization"):
+            transformer.partial_fit_standardization(values)
+        else:
+            transformer.partial_fit(values)
+
+    def _fit_file(self, raw_path: Path, phase: str):
         """Fit transformers on a single file."""
         with h5py.File(raw_path, "r") as f:
             file_len = f["jet"].shape[0]
@@ -783,81 +914,94 @@ class TopReconstructionDatasetFromH5:
                     continue
 
                 # Fit jet transformers
-                self._fit_jet_transformers(jet_chunk)
+                self._fit_jet_transformers(jet_chunk, phase)
 
                 # Fit target transformers
-                self._fit_target_transformers(targets_dict)
+                self._fit_target_transformers(targets_dict, phase)
 
                 # Fit interaction transformer on every chunk in sub-batches
                 # to avoid OOM (full chunk would be 500k×20×20×4 ≈ 3 GB).
                 if self.interaction_processor.needs_interaction():
-                    try:
-                        FIT_BATCH = 50_000
-                        for b_start in range(0, jet_chunk.shape[0], FIT_BATCH):
-                            b_end = min(b_start + FIT_BATCH, jet_chunk.shape[0])
-                            int_batch = create_interaction_matrix(jet_chunk[b_start:b_end])
-                            self._fit_interaction_transformers(int_batch)
-                            del int_batch
-                    except Exception as e:
-                        print(f"[WARN] Interaction fit failed: {e}", flush=True)
+                    FIT_BATCH = 50_000
+                    for b_start in range(0, jet_chunk.shape[0], FIT_BATCH):
+                        b_end = min(b_start + FIT_BATCH, jet_chunk.shape[0])
+                        int_batch = create_interaction_matrix(jet_chunk[b_start:b_end])
+                        self._fit_interaction_transformers(int_batch, phase)
+                        del int_batch
 
-    def _fit_jet_transformers(self, jet_chunk: np.ndarray):
+    def _fit_jet_transformers(self, jet_chunk: np.ndarray, phase: str):
         """Fit jet transformers on jet data."""
         N, P, F = jet_chunk.shape
         
         for i, transformer in enumerate(self.jet_transformers):
             var = jet_chunk[..., i]
             var_flat = var.reshape(-1, 1)
-            transformer.partial_fit(var_flat)
+            self._partial_fit_phase(transformer, var_flat, phase)
 
-    def _fit_target_transformers(self, targets_dict: Dict[str, np.ndarray]):
+    def _fit_target_transformers(self, targets_dict: Dict[str, np.ndarray], phase: str):
         """Fit target transformers on target kinematics data."""
         if isinstance(self.target_processor, IndividualParticleMaskAndKinematicsProcessor):
             # Fit top transformers (skip placeholder column at index 4)
             if "kinematics_tops" in targets_dict:
                 tops_chunk = targets_dict["kinematics_tops"]
+                top_valid = targets_dict.get("valid_tops")
+                if top_valid is None:
+                    raise ValueError("top kinematics require valid_tops for scaler fitting")
+                top_valid = top_valid.astype(bool)
                 N, M, F = tops_chunk.shape
                 
                 for i, transformer in enumerate(self.target_processor.top_transformers):
                     if i < F - 1:  # Skip placeholder
-                        var = tops_chunk[..., i]
-                        var_flat = var.reshape(-1, 1)
-                        transformer.partial_fit(var_flat)
+                        var = tops_chunk[..., i][top_valid]
+                        if var.size:
+                            self._partial_fit_phase(transformer, var.reshape(-1, 1), phase)
             
             # Fit W transformers (skip placeholder column at index 4)
             if "kinematics_Ws" in targets_dict:
                 Ws_chunk = targets_dict["kinematics_Ws"]
+                w_valid = targets_dict.get("valid_Ws")
+                if w_valid is None:
+                    raise ValueError("W kinematics require valid_Ws for scaler fitting")
+                w_valid = w_valid.astype(bool)
                 N, M, F = Ws_chunk.shape
                 
                 for i, transformer in enumerate(self.target_processor.W_transformers):
                     if i < F - 1:  # Skip placeholder
-                        var = Ws_chunk[..., i]
-                        var_flat = var.reshape(-1, 1)
-                        transformer.partial_fit(var_flat)
+                        var = Ws_chunk[..., i][w_valid]
+                        if var.size:
+                            self._partial_fit_phase(transformer, var.reshape(-1, 1), phase)
 
-    def _fit_interaction_transformers(self, interaction_chunk: np.ndarray):
+    def _fit_interaction_transformers(self, interaction_chunk: np.ndarray, phase: str):
         """Fit interaction transformers."""
         if interaction_chunk is not None:
             N, P, P2, F = interaction_chunk.shape
             interaction_flat = interaction_chunk.reshape(-1, F)
-            self.interaction_transformers.partial_fit(interaction_flat)
+            self._partial_fit_phase(self.interaction_transformers, interaction_flat, phase)
 
-    def _transform_all(self):
+    def _transform_all(self, raw_files, output_dir: Path):
         """Transform all raw files and save processed versions."""
         print("\n[TRANSFORM] Starting transformation...", flush=True)
-        
-        raw_file_pattern = self._get_file_pattern(self.raw_file_prefix_and_path, "")
-        raw_files = sorted(Path().glob(raw_file_pattern))
 
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         for raw_file in raw_files:
-            save_file = self.save_dir / raw_file.name.replace(
+            save_file = output_dir / raw_file.name.replace(
                 self.raw_file_config.get("save_file_prefix", "raw_"),
                 self.preprocessing_config.get("save_file_prefix", "processed_"),
             )
             print(f"[TRANSFORM] {raw_file.name} -> {save_file.name}", flush=True)
-            self._transform_file(raw_file, save_file)
+            if save_file.exists():
+                raise FileExistsError(f"staging output unexpectedly exists: {save_file}")
+            temp_file = save_file.with_name(save_file.name + f".tmp-{os.getpid()}")
+            if temp_file.exists():
+                raise FileExistsError(f"temporary preprocessing output exists: {temp_file}")
+            try:
+                self._transform_file(raw_file, temp_file)
+                os.replace(temp_file, save_file)
+            except BaseException:
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise
 
     def _create_and_transform_interactions_batched(
         self, jet_chunk: np.ndarray, batch_size: int = 50_000
@@ -889,6 +1033,9 @@ class TopReconstructionDatasetFromH5:
         INTERACTION_BATCH = 50_000
 
         with h5py.File(raw_path, "r") as read_f, h5py.File(save_path, "w") as write_f:
+            for key, value in read_f.attrs.items():
+                write_f.attrs[key] = value
+            write_f.attrs["scaler_hash"] = self.scaler_hash
             file_len = read_f["jet"].shape[0]
             print(f"[TRANSFORM] Total events: {file_len}", flush=True)
 
@@ -901,6 +1048,7 @@ class TopReconstructionDatasetFromH5:
                 jet_chunk = read_f["jet"][i : i + self.stream_size].copy()
                 event_chunk = read_f["event"][i : i + self.stream_size].copy()
                 extra_chunks = self._read_extra_chunks(read_f, i, i + self.stream_size)
+                metadata = self._read_metadata_chunks(read_f, i, i + self.stream_size)
 
                 # Extract targets first (validity needed to compute the event filter)
                 targets_dict = self.target_extractor.extract_targets(jet_chunk, extra_chunks if extra_chunks else None)
@@ -932,6 +1080,7 @@ class TopReconstructionDatasetFromH5:
                 jet_chunk = jet_chunk[event_filter]
                 event_chunk = event_chunk[event_filter]
                 targets_dict = {k: v[event_filter] for k, v in targets_dict.items()}
+                metadata = {k: v[event_filter] for k, v in metadata.items()}
 
                 if jet_chunk.shape[0] == 0:
                     continue
@@ -949,12 +1098,9 @@ class TopReconstructionDatasetFromH5:
                 # Must happen BEFORE jet transformation (interactions use raw kinematics).
                 interaction_chunk = None
                 if self.interaction_processor.needs_interaction():
-                    try:
-                        interaction_chunk = self._create_and_transform_interactions_batched(
-                            jet_chunk, batch_size=INTERACTION_BATCH
-                        )
-                    except Exception as e:
-                        print(f"[WARN] Interaction matrix creation failed: {e}", flush=True)
+                    interaction_chunk = self._create_and_transform_interactions_batched(
+                        jet_chunk, batch_size=INTERACTION_BATCH
+                    )
 
                 # Transform jet features (interaction already handled above)
                 jet_chunk, _ = self._transform_data(jet_chunk, None)
@@ -974,6 +1120,7 @@ class TopReconstructionDatasetFromH5:
                         targets_dict,
                         interaction_chunk.shape if interaction_chunk is not None else None,
                         jet_p4_raw_shape=jet_p4_raw.shape,
+                        metadata=metadata,
                     )
                     datasets_created = True
 
@@ -985,6 +1132,7 @@ class TopReconstructionDatasetFromH5:
                     targets_dict,
                     interaction_chunk,
                     jet_p4_raw=jet_p4_raw,
+                    metadata=metadata,
                 )
         
         print(f"[TRANSFORM] Saved to {save_path}", flush=True)
@@ -1067,6 +1215,7 @@ class TopReconstructionDatasetFromH5:
         targets_dict: Dict[str, np.ndarray],
         interaction_shape: Optional[Tuple] = None,
         jet_p4_raw_shape: Optional[Tuple] = None,
+        metadata: Optional[Dict[str, np.ndarray]] = None,
     ):
         """Create HDF5 dataset groups."""
         _, N_jets, jet_features = jet_shape
@@ -1149,6 +1298,16 @@ class TopReconstructionDatasetFromH5:
                 dtype="float32",
             )
 
+        for key, values in (metadata or {}).items():
+            file.create_dataset(
+                key,
+                shape=(0,) + values.shape[1:],
+                maxshape=(None,) + values.shape[1:],
+                compression="gzip",
+                compression_opts=4,
+                dtype=values.dtype,
+            )
+
         # Leptonic-extension pass-through keys
         for key in self._pass_through_keys:
             if key in targets_dict:
@@ -1178,6 +1337,7 @@ class TopReconstructionDatasetFromH5:
         targets_dict: Dict[str, np.ndarray],
         interaction_chunk: Optional[np.ndarray] = None,
         jet_p4_raw: Optional[np.ndarray] = None,
+        metadata: Optional[Dict[str, np.ndarray]] = None,
     ):
         """Save data chunks to HDF5."""
         cur_len = file["jet"].shape[0]
@@ -1206,6 +1366,10 @@ class TopReconstructionDatasetFromH5:
         if jet_p4_raw is not None and "jet_p4_raw" in file:
             file["jet_p4_raw"].resize((n1,) + file["jet_p4_raw"].shape[1:])
             file["jet_p4_raw"][n0:n1] = jet_p4_raw.astype("float32")
+
+        for key, values in (metadata or {}).items():
+            file[key].resize((n1,) + file[key].shape[1:])
+            file[key][n0:n1] = values
 
         # Leptonic-extension pass-through keys (no transformer scaling)
         for key in self._pass_through_keys:
@@ -1285,3 +1449,4 @@ if __name__ == "__main__":
         print(f"\n[FATAL ERROR] {e}", flush=True)
         import traceback
         traceback.print_exc()
+        raise
