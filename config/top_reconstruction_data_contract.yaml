@@ -1,0 +1,69 @@
+schema_version: top-reconstruction-v3
+
+source:
+  path: data/topquarkreconstruction/root_data/ttbarLO_inclusive_mostof20M.root
+  source_file_id: 1
+  reco_tree: reco
+  truth_tree: truth
+  event_number_branch: EventNumber
+  generator_weight_branch: null
+  btag_provenance: unknown
+  truth_branches:
+    top_id: top_id
+    w_id: W_id
+    b_id: b_id
+    b_eta: b_eta
+    b_phi: b_phi
+    w_decay_eta: W_decay_eta
+    w_decay_phi: W_decay_phi
+    w_decay_id: W_decay_id
+
+output:
+  raw_path: data/topquarkreconstruction/contract_v3/ttbar_contract_raw.h5
+  split_dir: data/topquarkreconstruction/contract_v3/raw_splits
+  split_prefix: ttbar_contract_raw_
+  manifest_path: data/topquarkreconstruction/contract_v3/manifest.json
+
+population:
+  # Keep both bits in every output row; the selected benchmark requires both.
+  truth_decay: all_hadronic
+  reco_lepton_veto: true
+
+selection:
+  jet_pt_min_gev: 25.0
+  jet_abs_eta_max: 2.5
+  min_jets: 6
+  min_btags: 2
+  btag_threshold: 0.0
+
+matching:
+  version: delta-r-exclusive-v1
+  delta_r_max: 0.4
+  objective: max-cardinality-then-min-total-delta-r
+  tie_break: lowest-jet-index
+  exact_cardinality: true
+
+truncation:
+  max_particles: 20
+  policy: retain_and_report
+  order: source_order
+
+split:
+  seed: 42
+  generator_group_size: 10000
+  # The source exposes no verified run/file group yet. This placeholder is
+  # audit-only and is a deliberate blocker for production training.
+  group_provenance: unverified_entry_block
+  fractions:
+    train: 0.80
+    val: 0.10
+    calibration: 0.05
+    test: 0.05
+
+conversion:
+  chunk_size: 500000
+  compression: gzip
+  compression_level: 4
+
+weights:
+  missing_policy: unit
