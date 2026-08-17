@@ -357,21 +357,11 @@ def main():
             targets = {k: v.to(device) if torch.is_tensor(v) else v
                        for k, v in targets.items()}
 
-            # Inject targets for Hungarian matching (mirrors training_step)
-            inputs["targets"] = targets
-
             outputs = lightning_model.model(inputs, last_output_only=True)
-
+            matched = lightning_model.model.match_for_loss(outputs, targets)
             final_layer = max(outputs.keys())
-            layer_dict  = outputs[final_layer]
-
-            if "__targets__" in layer_dict:
-                save_targets = layer_dict["__targets__"]
-                predictions  = {k: v for k, v in layer_dict.items()
-                                if k != "__targets__"}
-            else:
-                save_targets = targets
-                predictions  = layer_dict
+            predictions = outputs[final_layer]
+            save_targets = matched[final_layer].get("__targets__", targets)
 
             write_batch(mask_f, obj_f, type_f, predictions, save_targets,
                         start_idx, Q, P)

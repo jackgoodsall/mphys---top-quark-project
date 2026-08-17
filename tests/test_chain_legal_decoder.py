@@ -1,4 +1,5 @@
 import numpy as np
+import unittest
 
 from src.analysis.evaluate_chain import decode_legal
 
@@ -62,3 +63,12 @@ def test_threshold_candidate_wins_when_fixed_cardinality_would_add_bad_jets():
     assert pred_W.sum() == 2
     assert pred_top[0, 0, 0] and pred_top[0, 1, 1]
     assert np.all(~pred_W | pred_top)
+
+
+def load_tests(loader, tests, pattern):
+    """Expose the historical pytest-style functions to stdlib discovery."""
+    suite = unittest.TestSuite()
+    for name, value in sorted(globals().items()):
+        if name.startswith("test_") and callable(value):
+            suite.addTest(unittest.FunctionTestCase(value, description=name))
+    return suite

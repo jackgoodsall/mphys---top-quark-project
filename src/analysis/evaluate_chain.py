@@ -38,6 +38,10 @@ import h5py
 import numpy as np
 import yaml
 
+from src.analysis.evaluation_contract import (
+    assert_aligned_event_ids, score_s2, stratified_scorecard,
+)
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -56,7 +60,10 @@ def _load_objectness(path: Path, use_probs: bool, task_name: str = "objectness")
         target = f[target_key][:]                          # [N, Q]
         pred_key = f"predicted_{task_name}_prob" if use_probs else f"predicted_{task_name}_logit"
         pred = f[pred_key][:] if pred_key in f else None
-    return target, pred
+        if "event_id" not in f:
+            sys.exit(f"ERROR: stable 'event_id' not found in {path}")
+        event_id = f["event_id"][:]
+    return target, pred, event_id
 
 
 def _infer_data_file_from_hparams(run_dir: Path):
@@ -110,6 +117,9 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
         target_masks_top = f["target_masks"][:]            # [N, Q, P]
         jet_valid = f["jet_valid_mask"][:] if "jet_valid_mask" in f else None
         slot_valid_top = f["slot_valid"][:] if "slot_valid" in f else None
+        if "event_id" not in f:
+            sys.exit(f"ERROR: stable 'event_id' not found in {mask_top_path}")
+        event_ids_top = f["event_id"][:]
 
     with h5py.File(mask_W_path, "r") as f:
         if scores_key not in f:
@@ -117,15 +127,22 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
         pred_scores_W = f[scores_key][:]                  # [N, Q, P]
         target_masks_W = f["target_masks"][:]              # [N, Q, P]
         slot_valid_W = f["slot_valid"][:] if "slot_valid" in f else None
+        if "event_id" not in f:
+            sys.exit(f"ERROR: stable 'event_id' not found in {mask_W_path}")
+        event_ids_W = f["event_id"][:]
+
+    artifact_ids = {"mask_top": event_ids_top, "mask_W": event_ids_W}
 
     # Load separate top / W objectness
     target_obj_top, pred_obj_top = None, None
     target_obj_W,   pred_obj_W   = None, None
 
     if obj_top_path.exists():
-        target_obj_top, pred_obj_top = _load_objectness(obj_top_path, use_probs, task_name="objectness")
+        target_obj_top, pred_obj_top, obj_top_ids = _load_objectness(obj_top_path, use_probs, task_name="objectness")
+        artifact_ids["objectness_top"] = obj_top_ids
     if obj_W_path.exists():
-        target_obj_W, pred_obj_W = _load_objectness(obj_W_path, use_probs, task_name="objectness_W")
+        target_obj_W, pred_obj_W, obj_w_ids = _load_objectness(obj_W_path, use_probs, task_name="objectness_W")
+        artifact_ids["objectness_W"] = obj_w_ids
 
     # If only one file exists, use it for both (backward compat)
     if target_obj_top is None:
@@ -160,6 +177,9 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
                     valid_tops_truth = f["valid_tops"][:].astype(bool)
                 if "valid_Ws" in f:
                     valid_Ws_truth = f["valid_Ws"][:].astype(bool)
+                if "event_id" not in f:
+                    sys.exit(f"ERROR: stable 'event_id' not found in {data_file}")
+                artifact_ids["data"] = f["event_id"][:]
         N_run = pred_scores_top.shape[0]
         N_data = jet_valid.shape[0]
         if N_data != N_run:
@@ -178,6 +198,8 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
                 f"data file has {valid_Ws_truth.shape[0]}."
             )
 
+    event_ids = assert_aligned_event_ids(**artifact_ids)
+
     # Load original (pre-signal-jet-filtering) multiplicities if available
     orig_mult_path = run_dir / "event_multiplicities.npz"
     original_mult = None
@@ -187,7 +209,7 @@ def load_run_data(run_dir: Path, data_file, use_probs: bool = False):
 
     return (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
             jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
-            original_mult, valid_tops_truth, valid_Ws_truth,
+            event_ids, original_mult, valid_tops_truth, valid_Ws_truth,
             slot_valid_top, slot_valid_W)
 
 
@@ -502,7 +524,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
                          slot_valid_top=None, slot_valid_W=None,
                          legacy_output_targets=False,
                          require_complete_truth=False,
-                         require_top_for_w=False):
+                         require_top_for_w=False, event_ids=None):
     """
     Returns a dict with scalar efficiencies and per-multiplicity breakdowns.
 
@@ -559,14 +581,17 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         pred_scores_W, jet_valid, prior_W, use_probs, threshold=threshold
     )
 
-    # Slot-level correctness
+    # Exact S2 scoring is external to the model and considers both chain
+    # permutations. Saved targets stay in canonical truth order; predictions
+    # stay in raw learned-query order.
     target_top_b = target_masks_top.astype(bool)
     target_W_b   = target_masks_W.astype(bool)
-
-    mismatch_top     = (pred_bin_top != target_top_b) & valid
-    mismatch_W       = (pred_bin_W   != target_W_b)   & valid
-    slot_perfect_top = mismatch_top.sum(axis=2) == 0       # [N, Q]
-    slot_perfect_W   = mismatch_W.sum(axis=2) == 0         # [N, Q]
+    s2 = score_s2(
+        pred_bin_top, pred_bin_W, target_top_b, target_W_b,
+        jet_valid, is_real_top, is_real_W,
+    )
+    slot_perfect_top = s2.top_exact
+    slot_perfect_W = s2.w_exact
 
     # In joint mode, top is only correct if its associated W is also correct.
     # W condition is vacuously satisfied for chains with no real W target.
@@ -578,12 +603,14 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     pred_real_top = None
     pred_real_W   = None
     if strict and pred_obj_top is not None:
-        pred_real_top = pred_obj_top > obj_thresh
+        permutation = np.array([[0, 1], [1, 0]])[s2.permutation]
+        pred_real_top = np.take_along_axis(pred_obj_top, permutation, axis=1) > obj_thresh
         detected_top = slot_perfect_top & pred_real_top
     else:
         detected_top = slot_perfect_top
     if strict and pred_obj_W is not None:
-        pred_real_W = pred_obj_W > obj_thresh
+        permutation = np.array([[0, 1], [1, 0]])[s2.permutation]
+        pred_real_W = np.take_along_axis(pred_obj_W, permutation, axis=1) > obj_thresh
         detected_W = slot_perfect_W & pred_real_W
     else:
         detected_W = slot_perfect_W
@@ -593,7 +620,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     all_Ws_perfect   = ((~is_real_W) | detected_W).all(axis=1)       # [N]
     perfect_all      = ((~is_real_top) | (detected_top & detected_W)).all(axis=1)
 
-    both_tops = n_real_top == 2
+    both_tops = s2.fully_matchable
 
     # Per-chain efficiencies use all real chains in the denominator.
     # Priors affect prediction binarisation only (numerator), not denominator.
@@ -615,7 +642,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
 
     # Headline: event-level exact-match — every real object (both tops AND their Ws)
     # perfectly reconstructed. Denominator = events with both chains real.
-    exact_match = (perfect_all & both_tops).sum() / max(both_tops.sum(), 1)
+    exact_match = s2.event_exact.sum() / max(both_tops.sum(), 1)
 
     # ── Purity (from objectness predictions) ──
     # Use top objectness for top purity, W objectness for W purity.
@@ -629,7 +656,8 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
     n_pred_both_tops = None
 
     if pred_obj_top is not None:
-        pred_real_top = pred_obj_top > obj_thresh              # [N, Q]
+        permutation = np.array([[0, 1], [1, 0]])[s2.permutation]
+        pred_real_top = np.take_along_axis(pred_obj_top, permutation, axis=1) > obj_thresh
         n_pred_real_top = int(pred_real_top.sum())
 
         # Of predicted-real-top chains, fraction that are actually real
@@ -647,7 +675,8 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
                              / max(n_pred_both_tops, 1))
 
     if pred_obj_W is not None:
-        pred_real_W = pred_obj_W > obj_thresh                  # [N, Q]
+        permutation = np.array([[0, 1], [1, 0]])[s2.permutation]
+        pred_real_W = np.take_along_axis(pred_obj_W, permutation, axis=1) > obj_thresh
         n_pred_real_W = int(pred_real_W.sum())
 
         # W purity: of predicted-real-W chains, fraction with perfect W mask
@@ -672,7 +701,7 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
             all_tops_perfect, all_Ws_perfect, pred_real_for_breakdown,
         )
 
-    return {
+    result = {
         "N": N,
         "Q": Q,
         "P": P,
@@ -700,6 +729,30 @@ def compute_efficiencies(pred_scores_top, target_masks_top, pred_scores_W, targe
         "strict":      strict,
         "joint":       joint,
     }
+    if event_ids is not None:
+        result["scorecard"] = stratified_scorecard(
+            s2, event_ids, jet_valid.astype(bool).sum(axis=1)
+        )
+    return result
+
+
+def write_scorecard(path: Path, rows):
+    """Atomically persist every numerator/denominator ID used by the scorecard."""
+    temp = path.with_name(path.name + ".tmp")
+    if temp.exists():
+        temp.unlink()
+    try:
+        with h5py.File(temp, "w") as handle:
+            for row in rows:
+                group = handle.create_group(f"{row['njets_bin']}/{row['metric']}")
+                for key in ("numerator", "denominator", "efficiency", "wilson_low", "wilson_high"):
+                    group.attrs[key] = row[key]
+                group.create_dataset("numerator_event_ids", data=row["numerator_event_ids"])
+                group.create_dataset("denominator_event_ids", data=row["denominator_event_ids"])
+        temp.replace(path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1174,8 +1227,7 @@ def main():
     parser.add_argument(
         "--fixed_slot_eval", action="store_true",
         help=(
-            "Compatibility flag. This evaluator already uses fixed slot index matching, "
-            "so enabling this does not change behaviour."
+            "Removed unsafe compatibility mode; fixed-slot evaluation is prohibited."
         ),
     )
     parser.add_argument(
@@ -1213,7 +1265,18 @@ def main():
         "--compare_decodings", action="store_true",
         help="Print top/W/ttbar efficiency + exact-match side-by-side for all decodings.",
     )
+    parser.add_argument(
+        "--scorecard_out", type=Path,
+        help="HDF5 output for frozen metric counts and exact numerator/denominator event IDs",
+    )
     args = parser.parse_args()
+    if args.fixed_slot_eval:
+        sys.exit("ERROR: fixed-slot evaluation is prohibited; all metrics use exact S2 scoring")
+    if args.threshold_sweep:
+        sys.exit(
+            "ERROR: threshold sweeps on test artifacts are prohibited. Fit and freeze "
+            "decoder parameters on the calibration split before test evaluation."
+        )
 
     # Parse --prior top=3 W=2
     prior_top = None
@@ -1239,7 +1302,7 @@ def main():
 
     (pred_scores_top, target_masks_top, pred_scores_W, target_masks_W,
      jet_valid, target_obj_top, pred_obj_top, target_obj_W, pred_obj_W,
-     original_mult, valid_tops_truth, valid_Ws_truth,
+     event_ids, original_mult, valid_tops_truth, valid_Ws_truth,
      slot_valid_top, slot_valid_W) = load_run_data(
         run_dir, args.data_file, use_probs=args.use_probs
     )
@@ -1252,6 +1315,7 @@ def main():
         require_complete_truth=args.require_complete_truth,
         require_top_for_w=args.require_top_for_w,
         strict=args.strict, joint=args.joint,
+        event_ids=event_ids,
     )
 
     def _run_decode(decode):
@@ -1297,6 +1361,9 @@ def main():
         results = _run_decode(args.decode)
 
     print_results(run_dir, results)
+    scorecard_out = args.scorecard_out or (run_dir / f"evaluation_scorecard_{args.decode}.h5")
+    write_scorecard(scorecard_out, results["scorecard"])
+    print(f"Scorecard artifact: {scorecard_out}")
 
     if args.plot:
         make_plots(run_dir, results)
