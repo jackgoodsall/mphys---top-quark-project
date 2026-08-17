@@ -1,16 +1,7 @@
 base_config: ../top_reconstruction_config.yaml
 
-# Soft decoder structure: cross-chain exclusivity and W-in-parent-top.
-# Hard legality remains in the inference decoder; this trains the same bias.
+# Mask losses plus soft W-in-parent-top consistency.
 tasks:
-  exclusive_ce:
-    loss_weight: 0.25
-    background: zero
-    layer_weights: {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.3, 4: 0.5, 5: 1.0}
-  exclusive_ce_W:
-    loss_weight: 0.25
-    background: zero
-    layer_weights: {0: 0.3, 1: 0.5, 2: 1.0, 3: 0.2, 4: 0.2, 5: 1.0}
   mask_consistency:
     loss_weight: 0.1
     margin: 0.0
