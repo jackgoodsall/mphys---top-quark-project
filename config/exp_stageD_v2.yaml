@@ -2,8 +2,8 @@ max_objects: 2
 
 # ============================================================================
 # EXPERIMENT: Full Stage-D run on v2 data (masked_targets_combined_v2).
-# Everything in the recommended bundle PLUS the invariant-mass loss (needs
-# jet_p4_raw) and phi-rotation augmentation. Requires scripts/preprocess_v2.sh first.
+# Historical Stage-D bundle with phi-rotation augmentation. The soft invariant-
+# mass objective was removed because it rewards fractional masks.
 #   uv run src/main.py --config config/exp_stageD_v2.yaml
 # ============================================================================
 tasks:
@@ -41,16 +41,6 @@ tasks:
     loss_weight: 0.1
     margin: 0.0
     layer_weight_strategy: final_only
-
-  # D4: soft invariant-mass loss (needs jet_p4_raw in the v2 data)
-  invariant_mass:
-    loss_weight: 0.05
-    layer_weight_strategy: final_only
-    m_w: 80.4
-    m_top: 172.5
-    width_w: 15.0
-    width_top: 25.0
-    huber_delta: 1.0
 
 pretraining:
   mask_pretrain_epochs: 0

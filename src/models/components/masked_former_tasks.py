@@ -522,7 +522,7 @@ class MaskReconstructionTask(BaseTask):
 
         if obj_valid is not None:
             # --- Variable-T path: use this task's validity key for real slots ---
-            total_loss = pred_masks.new_tensor(0.0)
+            total_loss = pred_masks.sum() * 0.0
             target_masks = self._align_target_slots(target_masks, num_queries)
 
             if obj_valid.any().item():
@@ -603,7 +603,7 @@ class MaskReconstructionTask(BaseTask):
             # Adaptive scaling: reduce penalty when most queries are null so the
             # "predict empty" signal doesn't overwhelm real-object learning.
             # Suppressed during mask-only pretraining to eliminate "predict nothing" signal.
-            if (self.null_mask_penalty > 0 and self.null_penalty_scale > 0
+            if (self.validity_key is None and self.null_mask_penalty > 0 and self.null_penalty_scale > 0
                     and (~obj_valid).any().item()):
                 null_logits = pred_masks[~obj_valid]           # [N_null, N]
                 null_targets = torch.zeros_like(null_logits)
@@ -1459,6 +1459,58 @@ class ObjectnessTask(BaseTask):
         file[f"target_{self.config.name}"][start_idx:end_idx] = target_obj[:, :M].float().cpu().numpy()
 
 
+class ChainStateTask(BaseTask):
+    """Three-state detection: absent, W-only, or full top chain."""
+
+    ABSENT, W_ONLY, FULL_TOP = 0, 1, 2
+
+    def __init__(self, config: TaskConfig):
+        super().__init__(config)
+        self.pred_key = config.output_names[0]
+
+    @staticmethod
+    def target_states(targets, width=None):
+        top = targets["top_valid"].bool()
+        w = targets["w_valid"].bool()
+        if top.shape != w.shape:
+            raise ValueError("top_valid and w_valid must have identical shape")
+        if (top & ~w).any().item():
+            raise ValueError("a full-top target cannot be valid when its W is invalid")
+        states = w.long() + top.long()
+        if width is not None:
+            states = F.pad(states, (0, max(0, width - states.shape[1])), value=0)[:, :width]
+        return states
+
+    def compute_cost(self, predictions, targets):
+        logits = predictions[self.pred_key]
+        states = self.target_states(targets)
+        log_probs = logits.log_softmax(dim=-1)
+        cost = -log_probs[:, :, None, :].expand(-1, -1, states.shape[1], -1).gather(
+            -1, states[:, None, :, None].expand(-1, logits.shape[1], -1, 1)
+        ).squeeze(-1)
+        valid = (targets["top_valid"] | targets["w_valid"]).to(cost.device)
+        return self.config.cost_weights.get("chain_state", 1.0) * cost * valid[:, None, :]
+
+    def compute_loss(self, predictions, targets, valid_mask=None):
+        logits = predictions[self.pred_key]
+        states = self.target_states(targets, logits.shape[1]).to(logits.device)
+        return self.config.get_loss_weight("chain_state") * F.cross_entropy(
+            logits.transpose(1, 2), states
+        )
+
+    def create_test_datasets(self, file, number_events):
+        q = self.config.max_objects
+        file.create_dataset("predicted_chain_state_logits", shape=(number_events, q, 3), dtype="f4")
+        file.create_dataset("target_chain_state", shape=(number_events, q), dtype="u1")
+
+    def save_test_predictions(self, file, predictions, targets, start_idx, batch_size):
+        logits = predictions[self.pred_key]
+        states = self.target_states(targets, logits.shape[1])
+        stop = start_idx + batch_size
+        file["predicted_chain_state_logits"][start_idx:stop] = logits.float().cpu().numpy()
+        file["target_chain_state"][start_idx:stop] = states.to(torch.uint8).cpu().numpy()
+
+
 class ObjectTypeTask(BaseTask):
     """
     Binary classification: is this real object a top (1) or a W (0)?
@@ -1838,12 +1890,14 @@ class ExclusiveAssignmentTask(BaseTask):
         target_key: str = 'jet_mask_true',
         loss_key: str = 'exclusive',
         background: str = 'zero',
+        validity_key: Optional[str] = None,
     ):
         super().__init__(config)
         self.pred_key = pred_key
         self.target_key = target_key
         self.loss_key = loss_key
         self.background = background
+        self.validity_key = validity_key
 
     def compute_cost(
         self,
@@ -1868,9 +1922,10 @@ class ExclusiveAssignmentTask(BaseTask):
 
         B, Q, N = logits.shape
 
-        obj_valid = targets.get('obj_valid_mask')  # [B, Q]
+        obj_valid = targets.get(self.validity_key) if self.validity_key else targets.get('obj_valid_mask')
         if obj_valid is not None:
             tgt = tgt * obj_valid.float().unsqueeze(-1)   # drop null-slot targets
+            logits = logits.masked_fill(~obj_valid.bool().unsqueeze(-1), -1e4)
 
         tgt_bool = tgt > 0.5
         has_sig = tgt_bool.any(dim=1)                             # [B, N]

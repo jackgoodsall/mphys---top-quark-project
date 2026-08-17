@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 from src.models.components.attention_layers import ParticleAttentionBlock, MIParticleAttentionBlock, InteractionDimReducer, ParticleGatingModule
 from src.models.components.masked_former_tasks import *
 from src.models.components.matcher import *
+from src.models.components.hierarchical_candidate_head import HierarchicalCandidateHead
 
 
 class ParticleEmbedder(nn.Module):
@@ -293,6 +294,12 @@ class MaskedReconstructionPart(nn.Module):
             if use_particle_gating else None
         )
         self._final_layer_id = n_decoder_layers - 1
+        candidate_cfg = kwargs.get("hierarchical_candidate_head", {}) or {}
+        self.hierarchical_candidate_head = (
+            HierarchicalCandidateHead(
+                embedding_size, int(candidate_cfg.get("hidden_size", 32))
+            ) if candidate_cfg.get("enabled", False) else None
+        )
 
         # Build prediction heads from task registry
         self.prediction_heads = self._build_prediction_heads(embedding_size)
@@ -411,7 +418,6 @@ class MaskedReconstructionPart(nn.Module):
         jet = X["jet"]
         interactions = X["interactions"]
         src_mask = X["src_mask"]
-        targets = X.get("targets", None)
         
         # Optional input validation. NaN reductions are intentionally disabled
         # during normal training because they force a GPU→CPU synchronization.
@@ -614,15 +620,21 @@ class MaskedReconstructionPart(nn.Module):
                 # Only compute heads needed at this layer (zero-weight layers are skipped)
                 layer_outputs[i] = self._compute_layer_outputs(tgt, memory, layer_id=i, gate_relevance=gate_relevance)
         
-        # Apply matching using task registry
-        if self.use_hungarian_matching and targets is not None:
-            layer_outputs = self._match_and_permute_outputs(layer_outputs, targets)
-        
         if last_output_only:
             final_layer = max(layer_outputs.keys())
             return {final_layer: layer_outputs[final_layer]}
         
         return layer_outputs
+
+    def match_for_loss(self, raw_outputs, targets):
+        """Apply truth matching explicitly for a loss/metric path.
+
+        ``forward`` is deliberately target-free and always returns learned-query
+        order.  This method must never be used to create prediction artifacts.
+        """
+        if not self.use_hungarian_matching:
+            return raw_outputs
+        return self._match_and_permute_outputs(raw_outputs, targets)
     
     def _build_cross_attn_mask(
         self,
@@ -691,6 +703,10 @@ class MaskedReconstructionPart(nn.Module):
 
         if gate_relevance is not None and layer_id == self._final_layer_id:
             outputs['gate_relevance'] = gate_relevance
+        if self.hierarchical_candidate_head is not None and layer_id == self._final_layer_id:
+            w_pair, b_extension = self.hierarchical_candidate_head(queries, memory)
+            outputs["w_pair_scores"] = w_pair
+            outputs["b_extension_scores"] = b_extension
 
         return outputs
     def _collate_targets(
@@ -1037,13 +1053,14 @@ class MaskedReconstructionPart(nn.Module):
                 continue
 
             stacked = torch.stack([decoder_outputs[lid][output_name] for lid in layers_with])
-            # stacked: [L, B, Q, D]
-            D = stacked.shape[-1]
-            idx = (pred_idxs
-                   .unsqueeze(0)          # [1, B, Q]
-                   .unsqueeze(-1)         # [1, B, Q, 1]
-                   .expand(len(layers_with), -1, -1, D))  # [L, B, Q, D]
-            gathered = torch.gather(stacked, 2, idx)      # [L, B, Q, D]
+            # Support ordinary [L,B,Q,D] outputs and structured candidate
+            # tensors [L,B,Q,N,N(,N)] with the same query permutation.
+            tail = stacked.shape[3:]
+            idx = pred_idxs.unsqueeze(0)
+            while idx.ndim < stacked.ndim:
+                idx = idx.unsqueeze(-1)
+            idx = idx.expand(len(layers_with), -1, -1, *tail)
+            gathered = torch.gather(stacked, 2, idx)
             for j, lid in enumerate(layers_with):
                 permuted_outputs[lid][output_name] = gathered[j]
 

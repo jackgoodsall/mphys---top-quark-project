@@ -201,6 +201,7 @@ class Matcher(nn.Module):
         self.n_jobs = n_jobs
         self.step = 0
         self.verbose = verbose
+        self.last_cost_margin = None
 
     def compute_matching(self, costs, object_valid_mask=None, query_valid_mask=None):
         if object_valid_mask is None:
@@ -251,6 +252,7 @@ class Matcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, costs, object_valid_mask=None, query_valid_mask=None):
+        self.last_cost_margin = None
         # Convert costs to numpy on CPU for solver compatibility
         costs = costs.detach().to(torch.float32).cpu().numpy()
 
@@ -315,11 +317,12 @@ class BruteForceGPUMatcher(nn.Module):
         self.num_queries = num_queries
         self.max_targets = max_targets
         self._logged_first_call = False
+        self.last_cost_margin = None
 
         # Pre-generate and register permutation tensors for each t in 1..max_targets.
         # Shape of perms_t: [P(Q, t), t]  (stored as non-persistent buffers)
         from itertools import permutations as _permutations
-        for t in range(1, max_targets + 1):
+        for t in range(1, min(max_targets, num_queries) + 1):
             perms = list(_permutations(range(num_queries), t))
             buf = torch.tensor(perms, dtype=torch.long)  # [P(Q,t), t]
             self.register_buffer(f"perms_{t}", buf, persistent=False)
@@ -387,6 +390,7 @@ class BruteForceGPUMatcher(nn.Module):
             First T_i entries per row are matched query indices (in target order).
             Remaining Q-T_i entries are unmatched query indices in ascending order.
         """
+        self.last_cost_margin = None
         # Cast to float32 for numerical stability (cost matrix may arrive as bf16
         # under mixed-precision training; bf16's ~3 decimal digits can cause wrong
         # argmin results when permutation costs are close).
@@ -406,11 +410,17 @@ class BruteForceGPUMatcher(nn.Module):
             costs = costs.masked_fill(~query_valid_mask.unsqueeze(-1), 1e9)
 
         if T_max == 0:
+            self.last_cost_margin = costs.new_full((B,), float("inf"))
             return torch.arange(Q, device=device).unsqueeze(0).expand(B, -1).contiguous()
 
         per_event_T = object_valid_mask.sum(dim=1)
+        if int(per_event_T.max().item()) > Q:
+            raise ValueError(
+                f"cannot match more valid targets than queries: max targets="
+                f"{int(per_event_T.max().item())}, queries={Q}"
+            )
 
-        if T_max > self.max_targets:
+        if T_max > min(self.max_targets, Q):
             warnings.warn(
                 f"BruteForceGPUMatcher: T_max={T_max} > max_targets={self.max_targets}. "
                 "Falling back to scipy for the whole batch.",
@@ -424,8 +434,12 @@ class BruteForceGPUMatcher(nn.Module):
             )
             max_valid = int(per_event_T.max().item())
             costs = costs[:, :, :max_valid]
+            costs_np = costs.cpu().numpy()
+            self.last_cost_margin = self._scipy_cost_margins(
+                costs_np, Q, per_event_T.cpu().numpy()
+            ).to(device)
             return self._scipy_fallback(
-                costs.cpu().numpy(), Q, per_event_T.cpu().numpy()
+                costs_np, Q, per_event_T.cpu().numpy()
             ).to(device)
 
         # Compact arbitrary valid target columns to the prefix consumed by the
@@ -450,6 +464,7 @@ class BruteForceGPUMatcher(nn.Module):
         costs_tq  = valid_costs.permute(0, 2, 1)                   # [B, T_max, Q]
         perms_exp = perms.T.unsqueeze(0).expand(B, -1, -1)         # [B, T_max, num_perms]
         total_cost = costs_tq.gather(2, perms_exp).sum(dim=1)      # [B, num_perms]
+        self.last_cost_margin = self._cost_margins(valid_costs, per_event_T)
 
         best_idx  = total_cost.argmin(dim=1)  # [B]
         best_perm = perms[best_idx]           # [B, T_max] — query assigned to each target slot
@@ -478,6 +493,50 @@ class BruteForceGPUMatcher(nn.Module):
 
         assert (pred_idxs >= 0).all(), "BruteForceGPUMatcher: negative index produced"
         return pred_idxs
+
+    def _cost_margins(
+        self, costs: torch.Tensor, lengths: torch.Tensor
+    ) -> torch.Tensor:
+        """Return best-to-second-best margins over distinct real assignments."""
+        margins = costs.new_full((len(costs),), float("inf"))
+        for length in range(1, costs.shape[2] + 1):
+            batch_mask = lengths == length
+            if not batch_mask.any():
+                continue
+            perms = self._get_perms(length).to(costs.device)
+            if len(perms) < 2:
+                continue
+            event_costs = costs[batch_mask, :, :length].permute(0, 2, 1)
+            perm_columns = perms.T.unsqueeze(0).expand(len(event_costs), -1, -1)
+            totals = event_costs.gather(2, perm_columns).sum(dim=1)
+            best_two = totals.topk(2, dim=1, largest=False).values
+            margins[batch_mask] = best_two[:, 1] - best_two[:, 0]
+        return margins.detach()
+
+    @staticmethod
+    def _scipy_cost_margins(
+        costs_np: np.ndarray, Q: int, lengths: np.ndarray
+    ) -> torch.Tensor:
+        """Return exact assignment margins for the scipy fallback path."""
+        margins = np.full(len(costs_np), np.inf, dtype=np.float32)
+        for batch_idx, length_value in enumerate(lengths):
+            length = int(length_value)
+            if length == 0 or (length == 1 and Q == 1):
+                continue
+            cost = costs_np[batch_idx, :, :length].T
+            rows, columns = scipy.optimize.linear_sum_assignment(cost)
+            best = float(cost[rows, columns].sum())
+            second = np.inf
+            for row, column in zip(rows, columns):
+                alternative = cost.copy()
+                alternative[row, column] = np.inf
+                try:
+                    alt_rows, alt_columns = scipy.optimize.linear_sum_assignment(alternative)
+                except ValueError:
+                    continue
+                second = min(second, float(alternative[alt_rows, alt_columns].sum()))
+            margins[batch_idx] = max(0.0, second - best)
+        return torch.from_numpy(margins)
 
     @staticmethod
     def _scipy_fallback(

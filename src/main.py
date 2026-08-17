@@ -16,7 +16,7 @@ if __package__:
         TaskRegistry, TaskConfig,
         MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
         BackgroundSuppressionTask, ParticleGatingTask,
-        ChainTypeTask, NeutrinoRegressionTask,
+        ChainTypeTask, ChainStateTask, NeutrinoRegressionTask,
         ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
         InvariantMassTask,
     )
@@ -34,7 +34,7 @@ else:
         TaskRegistry, TaskConfig,
         MaskReconstructionTask, ObjectnessTask, ObjectTypeTask,
         BackgroundSuppressionTask, ParticleGatingTask,
-        ChainTypeTask, NeutrinoRegressionTask,
+        ChainTypeTask, ChainStateTask, NeutrinoRegressionTask,
         ExclusiveAssignmentTask, MaskHierarchyConsistencyTask,
         InvariantMassTask,
     )
@@ -198,6 +198,24 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         )
         task_registry.register_task(objectness_task)
 
+    state_config = task_configs.get("chain_state", {})
+    if chain_queries and state_config.get("enabled", False):
+        task_registry.register_task(ChainStateTask(TaskConfig(
+            name="chain_state",
+            output_names=["chain_state_logits"],
+            output_dims={"chain_state_logits": 3},
+            cost_weights={"chain_state": state_config.get("cost_weight", 1.0)},
+            loss_weights={"chain_state": state_config.get("loss_weight", 1.0)},
+            max_objects=max_objects,
+            layer_weights=_build_layer_weights(
+                layer_config=state_config.get("layer_weights"),
+                strategy=state_config.get("layer_weight_strategy", "final_only"),
+                strategy_params=state_config.get("layer_weight_params", {}),
+                n_layers=n_decoder_layers,
+            ),
+            head_norm=state_config.get("head_norm", True),
+        )))
+
     # ========================================
     # Object Type Task (top vs W classification)
     # Not used in chain_queries mode — all queries are the same "chain" type.
@@ -282,6 +300,7 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
     # Exclusive-Assignment CE Tasks (per-particle cross-chain exclusivity)
     # Registered only when the config block is present (headless, no params).
     # ========================================
+    shared_exclusivity = task_configs.get("exclusivity", {}).get("loss_weight")
     for exc_name, exc_pred, exc_tgt in (
         ('exclusive_ce', 'mask_predictions', 'jet_mask_true'),
         ('exclusive_ce_W', 'mask_W', 'jet_mask_true_W'),
@@ -297,7 +316,11 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
                     output_names=[exc_pred],   # reuses existing mask head; no new params
                     output_dims={},
                     cost_weights={},
-                    loss_weights={'exclusive': exc_config.get('loss_weight', 0.25)},
+                    loss_weights={
+                        'exclusive': shared_exclusivity
+                        if shared_exclusivity is not None
+                        else exc_config.get('loss_weight', 0.25)
+                    },
                     max_objects=max_objects,
                     layer_weights=_build_layer_weights(
                         layer_config=exc_config.get('layer_weights'),
@@ -310,6 +333,7 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
                 target_key=exc_tgt,
                 loss_key='exclusive',
                 background=exc_config.get('background', 'zero'),
+                validity_key='top_valid' if exc_name == 'exclusive_ce' else 'w_valid',
             )
             task_registry.register_task(exc_task)
 

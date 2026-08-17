@@ -121,10 +121,13 @@ class ReconstructionTrainer(lightning.LightningModule):
     def training_step(self, batch, batch_idx):
         """Task-agnostic training step"""
         inputs, targets = batch
-        inputs['targets'] = targets
-
-        outputs = self(inputs)
+        raw_outputs = self(inputs)
+        outputs = self.model.match_for_loss(raw_outputs, targets)
         total_loss, task_losses = self._compute_loss(outputs, targets)
+        margin = getattr(getattr(self.model, "matcher", None), "last_cost_margin", None)
+        if margin is not None:
+            self.log('train_matching_cost_margin', margin.mean(), on_step=False,
+                     on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
 
         self.log('train_loss', total_loss, on_step=False, on_epoch=True,
                 prog_bar=True, sync_dist=self._sync_dist)
@@ -146,11 +149,11 @@ class ReconstructionTrainer(lightning.LightningModule):
     def validation_step(self, batch, batch_idx):
         """Task-agnostic validation step"""
         inputs, targets = batch
-        inputs['targets'] = targets
-
-        outputs = self(inputs)
+        raw_outputs = self(inputs)
+        outputs = self.model.match_for_loss(raw_outputs, targets)
         total_loss, task_losses = self._compute_loss(outputs, targets)
-        self._accumulate_validation_exact(outputs)
+        matched_targets = outputs[max(outputs)].get('__targets__')
+        self._accumulate_validation_exact(raw_outputs, matched_targets)
 
         self.log('val_loss', total_loss, on_step=False, on_epoch=True,
                 prog_bar=True, sync_dist=self._sync_dist)
@@ -163,10 +166,10 @@ class ReconstructionTrainer(lightning.LightningModule):
     def on_validation_epoch_start(self):
         self._val_exact_counts = {}
 
-    def _accumulate_validation_exact(self, outputs):
-        """Accumulate exact set-match counts under per-type validity gates."""
+    def _accumulate_validation_exact(self, outputs, matched_targets=None):
+        """Accumulate exact raw-query counts under both S2 permutations."""
         final = outputs[max(outputs)]
-        matched = final.get('__targets__')
+        matched = matched_targets if matched_targets is not None else final.get('__targets__')
         if matched is None or 'mask_predictions' not in final or 'mask_W' not in final:
             return
 
@@ -195,22 +198,50 @@ class ReconstructionTrainer(lightning.LightningModule):
             mismatch = ((prediction > 0) != (target > 0.5)) & jet_valid[:, None, :prediction.shape[2]]
             return ~mismatch.any(dim=-1)
 
-        def exact_counts(prediction, target, validity):
-            exact = exact_mask(prediction, target)
-            valid = validity[:, :prediction.shape[1]]
-            if valid.shape[1] < prediction.shape[1]:
-                valid = F.pad(valid, (0, prediction.shape[1] - valid.shape[1]))
-            return (exact & valid).sum().float(), valid.sum().float()
+        if final['mask_predictions'].shape[1] != 2:
+            raise ValueError("validation S2 scoring requires exactly two raw query slots")
+        top_target = aligned_target(matched['jet_mask_true'], final['mask_predictions'])
+        w_target = aligned_target(matched['jet_mask_true_W'], final['mask_W'])
+        permutations = torch.tensor([[0, 1], [1, 0]], device=jet_valid.device)
+        top_candidates, w_candidates = [], []
+        for permutation in permutations:
+            top_candidates.append(exact_mask(final['mask_predictions'][:, permutation], top_target))
+            w_candidates.append(exact_mask(final['mask_W'][:, permutation], w_target))
+        top_candidates = torch.stack(top_candidates, dim=1)
+        w_candidates = torch.stack(w_candidates, dim=1)
+        identifiable = top_valid | w_valid
+        chain_candidates = (
+            (~top_valid[:, None] | top_candidates)
+            & (~w_valid[:, None] | w_candidates)
+            & identifiable[:, None]
+        )
+        fully_matchable = (top_valid & w_valid).all(dim=1)
+        event_candidates = fully_matchable[:, None] & chain_candidates.all(dim=2)
+        partial_candidates = (~identifiable[:, None] | chain_candidates).all(dim=2)
+        component_errors = (
+            ((~top_candidates) & top_valid[:, None]).sum(dim=2)
+            + ((~w_candidates) & w_valid[:, None]).sum(dim=2)
+        )
+        rank = (
+            event_candidates.long() * 1_000_000
+            + partial_candidates.long() * 100_000
+            + chain_candidates.sum(dim=2) * 1_000
+            - component_errors
+        )
+        best = rank.argmax(dim=1)
+        rows = torch.arange(rank.shape[0], device=rank.device)
+        top_exact = top_candidates[rows, best]
+        w_exact = w_candidates[rows, best]
 
-        top_num, top_den = exact_counts(final['mask_predictions'], matched['jet_mask_true'], top_valid)
-        w_num, w_den = exact_counts(final['mask_W'], matched['jet_mask_true_W'], w_valid)
+        top_num = (top_exact & top_valid).sum().float()
+        top_den = top_valid.sum().float()
+        w_num = (w_exact & w_valid).sum().float()
+        w_den = w_valid.sum().float()
         chain_valid = top_valid & w_valid
         # Full-event efficiency needs an event-level conjunction; chain
         # efficiency counts complete chain slots only.
-        top_exact = exact_mask(final['mask_predictions'], matched['jet_mask_true'])
-        w_exact = exact_mask(final['mask_W'], matched['jet_mask_true_W'])
         chain_exact = top_exact & w_exact
-        event_valid = chain_valid.all(dim=1)
+        event_valid = fully_matchable
         event_exact = (top_exact & w_exact & chain_valid).all(dim=1)
 
         values = {
@@ -229,9 +260,8 @@ class ReconstructionTrainer(lightning.LightningModule):
     def test_step(self, batch, batch_idx):
         """Task-agnostic test step"""
         inputs, targets = batch
-        inputs['targets'] = targets
-
-        outputs = self(inputs, last_output_only=True)
+        raw_outputs = self(inputs, last_output_only=True)
+        outputs = self.model.match_for_loss(raw_outputs, targets)
         total_loss, task_losses = self._compute_loss(outputs, targets)
 
         self.log('test_loss', total_loss, on_step=False, on_epoch=True,
@@ -240,7 +270,12 @@ class ReconstructionTrainer(lightning.LightningModule):
             self.log(f'test_loss_{task_name}', task_loss, on_step=False,
                      on_epoch=True, prog_bar=False, sync_dist=self._sync_dist)
 
-        self._save_test_predictions(outputs, targets)
+        final = outputs[max(outputs)]
+        save_targets = final.get("__targets__", targets)
+        event_ids = inputs.get("event_id")
+        if event_ids is None:
+            raise ValueError("test artifacts require stable event_id values from the dataset")
+        self._save_test_predictions(raw_outputs, save_targets, event_ids)
 
         return total_loss
     
@@ -589,6 +624,8 @@ class ReconstructionTrainer(lightning.LightningModule):
             test_loader = test_loaders[0] if isinstance(test_loaders, (list, tuple)) else test_loaders
             dataset = test_loader.dataset
             number_events = len(dataset)
+            self._test_expected_events = number_events
+            self._test_output_paths = []
             particle_count = None
             for attr in ("jet", "_jet"):
                 jet_array = getattr(dataset, attr, None)
@@ -603,11 +640,12 @@ class ReconstructionTrainer(lightning.LightningModule):
             for task_name, task in self.task_registry.tasks.items():
                 h5_filename = f"test_outputs_{task_name}.h5"
                 fh = h5py.File(out_dir / h5_filename, "w")
+                self._test_output_paths.append(out_dir / h5_filename)
                 if isinstance(task, MaskReconstructionTask):
                     task.create_test_datasets(fh, number_events, particle_count)
                 else:
                     task.create_test_datasets(fh, number_events)
-                fh.create_dataset("event_index", shape=(number_events,), dtype="i8")
+                fh.create_dataset("event_id", shape=(number_events,), dtype="u8")
                 self._test_h5_files[task_name] = fh
 
         self.test_start_idx = 0
@@ -617,11 +655,20 @@ class ReconstructionTrainer(lightning.LightningModule):
         for fh in self._test_h5_files.values():
             fh.close()
         self._test_h5_files.clear()
+        expected = getattr(self, "_test_expected_events", self.test_start_idx)
+        if self._test_output_enabled and self.global_rank == 0 and self.test_start_idx != expected:
+            for path in getattr(self, "_test_output_paths", []):
+                path.unlink(missing_ok=True)
+            raise RuntimeError(
+                "refusing malformed partial test artifacts: wrote "
+                f"{self.test_start_idx} of {expected} events; run the complete test split"
+            )
     
     def _save_test_predictions(
         self,
         outputs: Dict[int, Dict[str, torch.Tensor]],
         targets,
+        event_ids,
     ):
         """Save test predictions to HDF5 (rank 0 only)"""
         if not getattr(self, "_test_output_enabled", False) or self.global_rank != 0:
@@ -630,14 +677,10 @@ class ReconstructionTrainer(lightning.LightningModule):
         final_layer = max(outputs.keys())
         layer_dict = outputs[final_layer]
 
-        # Use matched/padded targets if available, else original targets
-        if "__targets__" in layer_dict:
-            save_targets = layer_dict["__targets__"]
-            predictions = {k: v for k, v in layer_dict.items()
-                          if k != "__targets__"}
-        else:
-            save_targets = targets
-            predictions = layer_dict
+        # Predictions are always raw learned-query order. Targets retain their
+        # canonical truth-chain order; S2 alignment belongs in evaluation.
+        save_targets = targets
+        predictions = {k: v for k, v in layer_dict.items() if k != "__targets__"}
 
         batch_size = predictions[list(predictions.keys())[0]].shape[0]
 
@@ -649,13 +692,9 @@ class ReconstructionTrainer(lightning.LightningModule):
                 start_idx=self.test_start_idx,
                 batch_size=batch_size
             )
-            self._test_h5_files[task_name]["event_index"][
+            self._test_h5_files[task_name]["event_id"][
                 self.test_start_idx:self.test_start_idx + batch_size
-            ] = torch.arange(
-                self.test_start_idx,
-                self.test_start_idx + batch_size,
-                dtype=torch.int64,
-            ).numpy()
+            ] = event_ids.detach().to(dtype=torch.uint64, device="cpu").numpy()
 
         self.test_start_idx += batch_size
     

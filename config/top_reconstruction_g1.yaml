@@ -1,0 +1,29 @@
+base_config: top_reconstruction_config.yaml
+
+tasks:
+  mask:
+    null_mask_penalty: 0.0
+  mask_W:
+    null_mask_penalty: 0.0
+  chain_state:
+    enabled: true
+    cost_weight: 1.0
+    loss_weight: 1.0
+    head_norm: true
+    layer_weight_strategy: final_only
+  exclusivity:
+    loss_weight: 0.25
+  exclusive_ce:
+    background: zero
+    layer_weight_strategy: final_only
+  exclusive_ce_W:
+    background: zero
+    layer_weight_strategy: final_only
+
+data_modules:
+  input_path: data/topquarkreconstruction/contract_v3/processed
+  input_prefix: ttbar_contract_processed_
+
+model_artefacts:
+  log_dir: contract_v3/G1_repaired_mask
+  target_transformers: data/topquarkreconstruction/contract_v3/processed/target_transforms.joblib
