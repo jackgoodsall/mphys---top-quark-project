@@ -267,7 +267,8 @@ def convert(contract, max_events_per_source=None, skip_source_hash=False, output
     write_manifest(Path(output["manifest_path"]).with_suffix(".splits.json"), {
         "contract_hash": contract_hash, "source_hash": source_hash,
         "source_lineage": {key: manifest[key] for key in (
-            "source_entry_start", "source_entry_stop", "source_total_entries", "complete_source"
+            "source_hash", "source_entry_start", "source_entry_stop",
+            "source_total_entries", "complete_source",
         )}, "event_counts": {split: counts[f"{split}_selected"] for split in outputs},
         "fixed_source_partitions": True,
     })

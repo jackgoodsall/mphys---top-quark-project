@@ -123,7 +123,9 @@ def training_gate(contract_path, config_path):
         "source_hash", "source_entry_start", "source_entry_stop",
         "source_total_entries", "complete_source",
     ):
-        if str(source_lineage.get(key, "missing")) != str(manifest.get(key, "missing")):
+        # fixed-source manifests record source_hash at top level, not in source_lineage
+        declared = source_lineage.get(key, split_manifest.get(key, "missing"))
+        if str(declared) != str(manifest.get(key, "missing")):
             raise SystemExit(f"BLOCKED: raw/split source lineage mismatch for {key}")
 
     cfg = load_any_config(config_path)
