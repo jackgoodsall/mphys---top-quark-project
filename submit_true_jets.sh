@@ -6,6 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=true_jets_inference
 
+echo "BLOCKED: legacy true-jet artifacts have no stable event identity." >&2
+exit 2
 module purge
 module load libs/cuda
 

@@ -5,7 +5,11 @@
 #SBATCH --ntasks=1            # One task
 #SBATCH --cpus-per-task=8     # 16 CPU cores / 8 CPU cores
 
+echo "BLOCKED: legacy training entrypoint is not v3-gated." >&2
+exit 2
+
 # Load CUDA module
+.transformer_env/bin/python scripts/plan_gate.py training --config config/top_reconstruction_config.yaml
 module purge
 module load libs/cuda
 

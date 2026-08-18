@@ -10,10 +10,13 @@
 #SBATCH --chdir=/net/scratch/b58521jg/transformers
 
 set -euo pipefail
+echo "BLOCKED: G2 model/head/calibration gates are not yet complete." >&2
+exit 2
 
 CONFIG=${1:?"usage: sbatch scripts/submit_model_improvement.sbatch CONFIG [CHECKPOINT]"}
 RESUME_FROM=${2:-}
 [[ -f "$CONFIG" ]] || { echo "Missing config: $CONFIG" >&2; exit 2; }
+.transformer_env/bin/python scripts/plan_gate.py training --config "$CONFIG"
 if [[ -n "$RESUME_FROM" && ! -f "$RESUME_FROM" ]]; then
     echo "Missing checkpoint: $RESUME_FROM" >&2
     exit 2

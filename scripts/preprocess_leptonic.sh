@@ -22,6 +22,8 @@
 #SBATCH --output=slurm_outputs/preprocess_leptonic_%j.out
 
 set -euo pipefail
+echo "BLOCKED: legacy combined preprocessing is outside the v3 data contract." >&2
+exit 2
 cd "$(dirname "$0")/.."   # always run from repo root
 
 export UV_PROJECT_ENVIRONMENT=.transformer_env

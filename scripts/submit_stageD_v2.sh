@@ -10,6 +10,8 @@
 
 # Full Stage-D training on v2 data (config/exp_stageD_v2.yaml).
 # Requires scripts/preprocess_v2.sh to have produced masked_targets_combined_v2 first.
+echo "BLOCKED: Stage-D v2 predates the G-1/G0 contract." >&2
+exit 2
 module purge
 module load libs/cuda
 

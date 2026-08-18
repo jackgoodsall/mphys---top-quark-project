@@ -17,6 +17,9 @@
 
 set -euo pipefail
 
+echo "BLOCKED: v2 preprocessing is superseded by preprocessing_contract_v3.yaml." >&2
+exit 2
+
 export UV_PROJECT_ENVIRONMENT=.transformer_env
 # preprocessing.py imports both `from src.data_utils...` and `from kinematics...`.
 export PYTHONPATH="/net/scratch/b58521jg/transformers:/net/scratch/b58521jg/transformers/src:${PYTHONPATH:-}"

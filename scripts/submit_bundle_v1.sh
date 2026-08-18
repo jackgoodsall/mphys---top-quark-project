@@ -9,6 +9,8 @@
 #SBATCH --chdir=/net/scratch/b58521jg/transformers
 
 # Recommended-bundle training on existing v1 data (config/exp_bundle_v1.yaml).
+echo "BLOCKED: v1 data has no manifest or stable event IDs." >&2
+exit 2
 module purge
 module load libs/cuda
 

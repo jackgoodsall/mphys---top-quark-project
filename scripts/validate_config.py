@@ -20,6 +20,9 @@ import scripts.smoke_forward as sf  # noqa: E402
 
 
 def main():
+    # Tiny validation is latency-bound; large OpenMP pools can exhaust login-node
+    # memory and are slower for this batch.
+    torch.set_num_threads(1)
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else "config/exp_bundle_v1.yaml"
     cfg = load_any_config(cfg_path)
     # Force a CPU-friendly matcher for the check (GPU brute-force falls back anyway).
@@ -28,11 +31,9 @@ def main():
     model, tr = sf.build_model(cfg)
     model.train()
 
-    # Synthetic hadronic batch; include jet_p4_raw for the invariant-mass task.
+    # Synthetic batch includes full, W-only, and absent chain states.
     samples, targets = sf.build_batch(with_p4=True)
-    inp = dict(samples)
-    inp["targets"] = targets
-    out = model(inp)
+    out = model.match_for_loss(model(samples), targets)
     loss = sf.compute_loss(out, tr)
 
     ok = torch.isfinite(loss).item()

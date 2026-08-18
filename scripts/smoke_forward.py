@@ -6,7 +6,7 @@ Builds a tiny MaskedReconstructionPart from config/smoke_config.yaml, runs
 forward + loss + backward on a synthetic batch (B=4, N=20 with obj_valid
 patterns [T,T], [T,F], [F,F], [T,T]) across every new flag combination:
 mask_embed_head x mask_logit_scale x phase1_mask_overwrite x masked_cross_attention
-x new tasks (exclusive_ce / mask_consistency / invariant_mass) x leptonic global token.
+x new tasks (exclusive_ce / chain_state) x leptonic global token.
 
 Asserts every loss is finite and that every requires_grad parameter that should be
 trained receives a gradient (a cheap DDP-unused-parameter proxy).
@@ -31,7 +31,12 @@ from utils.utils import load_any_config  # noqa: E402
 import main as main_mod  # noqa: E402
 
 B, N, K_NU = 4, 20, 1
-CHAIN_PATTERNS = [(1, 1), (1, 0), (0, 0), (1, 1)]  # (top_valid, w_valid) per chain, per event
+CHAIN_PATTERNS = [
+    ((1, 1), (1, 1)),  # both full
+    ((0, 1), (0, 0)),  # W-only + absent
+    ((0, 0), (0, 0)),  # both absent
+    ((1, 1), (1, 1)),
+]
 
 
 def build_batch(leptonic=False, with_p4=False, all_negative=False):
@@ -43,13 +48,15 @@ def build_batch(leptonic=False, with_p4=False, all_negative=False):
     # Two chains: top0=particles[0:6] W0=[0:3]; top1=[6:12] W1=[6:9] (W subset of top).
     jmt = torch.zeros(B, 4, N)   # [top0, top1, w0, w1]
     tvm = torch.zeros(B, 4, dtype=torch.bool)
-    for b, (c0, c1) in enumerate(CHAIN_PATTERNS):
-        if c0:
-            jmt[b, 0, 0:6] = 1.0; jmt[b, 2, 0:3] = 1.0
-            tvm[b, 0] = True; tvm[b, 2] = True
-        if c1:
-            jmt[b, 1, 6:12] = 1.0; jmt[b, 3, 6:9] = 1.0
-            tvm[b, 1] = True; tvm[b, 3] = True
+    for b, chains in enumerate(CHAIN_PATTERNS):
+        for chain, (top_valid, w_valid) in enumerate(chains):
+            start = 6 * chain
+            if w_valid:
+                jmt[b, 2 + chain, start:start + 3] = 1.0
+                tvm[b, 2 + chain] = True
+            if top_valid:
+                jmt[b, chain, start:start + 6] = 1.0
+                tvm[b, chain] = True
 
     samples = {"jet": jet, "src_mask": src_mask, "interactions": interactions}
     targets = {
@@ -102,9 +109,7 @@ def run_case(name, cfg, batch):
     model, tr = build_model(cfg)
     model.train()
     samples, targets = batch
-    inp = dict(samples)
-    inp["targets"] = targets
-    out = model(inp)
+    out = model.match_for_loss(model(samples), targets)
     loss = compute_loss(out, tr)
     assert torch.isfinite(loss), f"[{name}] non-finite loss: {loss}"
     loss.backward()
@@ -136,12 +141,6 @@ def main():
     cfg["tasks"]["exclusive_ce_W"] = {"loss_weight": 0.25, "layer_weights": {0: 0.1, 1: 1.0, 2: 0.1}}
     cfg["tasks"]["mask_consistency"] = {"loss_weight": 0.1, "margin": 0.0, "layer_weight_strategy": "final_only"}
     run_case("new tasks: exclusive_ce + mask_consistency", cfg, build_batch())
-    cases += 1
-
-    # Invariant-mass task (needs jet_p4_raw)
-    cfg = copy.deepcopy(base)
-    cfg["tasks"]["invariant_mass"] = {"loss_weight": 0.05, "layer_weight_strategy": "final_only"}
-    run_case("invariant_mass (jet_p4_raw)", cfg, build_batch(with_p4=True))
     cases += 1
 
     # Masked cross-attention (normal + all-negative fallback)
