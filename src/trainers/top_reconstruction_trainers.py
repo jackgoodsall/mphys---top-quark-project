@@ -918,6 +918,9 @@ def train_reconstruction_model(
         callbacks=callbacks,
         gradient_clip_val=grad_clip,
         default_root_dir=log_dir,
+        # ponytail: pilot knobs only; default 1.0 keeps full-run behaviour identical.
+        limit_train_batches=train_cfg.get("limit_train_batches", 1.0),
+        limit_val_batches=train_cfg.get("limit_val_batches", 1.0),
     )
 
     lightning_model = ReconstructionTrainer(model, task_registry, config)

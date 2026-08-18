@@ -1,22 +1,41 @@
 schema_version: top-reconstruction-v3
 
 source:
-  path: data/topquarkreconstruction/root_data/ttbarLO_inclusive_mostof20M.root
-  source_file_id: 1
-  reco_tree: reco
-  truth_tree: truth
-  event_number_branch: EventNumber
-  generator_weight_branch: null
-  btag_provenance: unknown
-  truth_branches:
-    top_id: top_id
-    w_id: W_id
-    b_id: b_id
-    b_eta: b_eta
-    b_phi: b_phi
-    w_decay_eta: W_decay_eta
-    w_decay_phi: W_decay_phi
-    w_decay_id: W_decay_id
+  mode: fixed_sources
+  btag_provenance: simulated_binary_tag
+  truthmatch_provenance: upstream_dataset_truthmatch
+  # Fixed partitions are preserved; no row slicing or random re-splitting.
+  sources:
+    - name: hyper_train
+      path: data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_train.h5
+      format: legacy_raw_h5
+      source_file_id: 10
+      split: train
+    - name: inclusive_train
+      path: data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_inclusive_train.h5
+      format: legacy_raw_h5
+      source_file_id: 20
+      split: train
+    - name: hyper_val
+      path: data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_val.h5
+      format: legacy_raw_h5
+      source_file_id: 11
+      split: val
+    - name: inclusive_val
+      path: data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_inclusive_val.h5
+      format: legacy_raw_h5
+      source_file_id: 21
+      split: calibration
+    - name: hyper_test
+      path: data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_test.h5
+      format: legacy_raw_h5
+      source_file_id: 12
+      split: test
+    - name: inclusive_test
+      path: data/topquarkreconstruction/h5py_data/ttbar_h5py_raw_inclusive_test.h5
+      format: legacy_raw_h5
+      source_file_id: 22
+      split: stress
 
 output:
   raw_path: data/topquarkreconstruction/contract_v3/ttbar_contract_raw.h5
@@ -37,10 +56,10 @@ selection:
   btag_threshold: 0.0
 
 matching:
-  version: delta-r-exclusive-v1
+  version: upstream-jet-truthmatch-v1
   delta_r_max: 0.4
-  objective: max-cardinality-then-min-total-delta-r
-  tie_break: lowest-jet-index
+  objective: source-label-presence
+  tie_break: lowest-source-index
   exact_cardinality: true
 
 truncation:
@@ -49,16 +68,15 @@ truncation:
   order: source_order
 
 split:
-  seed: 42
+  mode: fixed_source_files
+  seed: 0
   generator_group_size: 10000
-  # The source exposes no verified run/file group yet. This placeholder is
-  # audit-only and is a deliberate blocker for production training.
-  group_provenance: unverified_entry_block
+  group_provenance: fixed_source_partition
   fractions:
-    train: 0.80
-    val: 0.10
-    calibration: 0.05
-    test: 0.05
+    train: 1.0
+    val: 0.0
+    calibration: 0.0
+    test: 0.0
 
 conversion:
   chunk_size: 500000

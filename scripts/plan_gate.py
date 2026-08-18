@@ -19,11 +19,18 @@ from src.utils.utils import load_any_config  # noqa: E402
 
 def audit_gate(contract_path):
     contract = load_contract(contract_path)
-    source = Path(contract["source"]["path"])
-    if not source.exists():
-        raise SystemExit(f"BLOCKED: source ROOT file does not exist: {source}")
-    if contract["matching"]["version"] != "delta-r-exclusive-v1":
-        raise SystemExit("BLOCKED: unreviewed truth matcher version")
+    if contract["source"].get("mode") == "fixed_sources":
+        missing = [item["path"] for item in contract["source"]["sources"] if not Path(item["path"]).exists()]
+        if missing:
+            raise SystemExit(f"BLOCKED: fixed source files do not exist: {missing}")
+        if contract["matching"]["version"] != "upstream-jet-truthmatch-v1":
+            raise SystemExit("BLOCKED: unreviewed fixed-source truth-match declaration")
+    else:
+        source = Path(contract["source"]["path"])
+        if not source.exists():
+            raise SystemExit(f"BLOCKED: source ROOT file does not exist: {source}")
+        if contract["matching"]["version"] != "delta-r-exclusive-v1":
+            raise SystemExit("BLOCKED: unreviewed truth matcher version")
     print(f"audit contract: {content_hash(contract)}")
 
 
@@ -85,12 +92,13 @@ def _verify_processed_split(processed_path, raw_path, split, contract, scaler_ha
                 raise SystemExit(f"BLOCKED: event IDs are not unique/increasing in {processed_path}")
             if not np.array_equal(ids, raw["event_id"][start:stop]):
                 raise SystemExit(f"BLOCKED: raw/processed event identity mismatch in {processed_path}")
-            expected_split = split_names(
-                processed["source_file_id"][start:stop],
-                processed["source_entry"][start:stop], contract["split"],
-            )
-            if np.any(expected_split != split):
-                raise SystemExit(f"BLOCKED: deterministic split assignment mismatch in {processed_path}")
+            if contract["split"].get("mode") != "fixed_source_files":
+                expected_split = split_names(
+                    processed["source_file_id"][start:stop],
+                    processed["source_entry"][start:stop], contract["split"],
+                )
+                if np.any(expected_split != split):
+                    raise SystemExit(f"BLOCKED: deterministic split assignment mismatch in {processed_path}")
             if ids.size:
                 last = ids[-1]
 

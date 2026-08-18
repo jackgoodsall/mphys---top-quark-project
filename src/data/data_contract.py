@@ -52,20 +52,46 @@ def validate_contract(config: Mapping) -> None:
         "top_id", "w_id", "b_id", "b_eta", "b_phi",
         "w_decay_eta", "w_decay_phi", "w_decay_id",
     }
-    if set(config["source"].get("truth_branches", {})) != required_truth:
-        raise ValueError(f"source.truth_branches must declare exactly {sorted(required_truth)}")
+    source_mode = config["source"].get("mode", "single_root")
+    if source_mode == "single_root":
+        if set(config["source"].get("truth_branches", {})) != required_truth:
+            raise ValueError(f"source.truth_branches must declare exactly {sorted(required_truth)}")
+    elif source_mode == "fixed_sources":
+        sources = config["source"].get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("fixed_sources requires a non-empty source.sources list")
+        ids = [int(item.get("source_file_id", -1)) for item in sources]
+        if len(ids) != len(set(ids)):
+            raise ValueError("fixed source_file_id values must be unique")
+        if any(not 0 <= value < 2**16 for value in ids):
+            raise ValueError("fixed source_file_id values must fit the stable event-ID layout")
+        if any(item.get("split") not in {*REQUIRED_SPLITS, "stress"} for item in sources):
+            raise ValueError("fixed sources must declare train/val/calibration/test/stress splits")
+    else:
+        raise ValueError(f"unsupported source.mode: {source_mode}")
     if float(config["matching"]["delta_r_max"]) <= 0:
         raise ValueError("matching.delta_r_max must be positive")
     supported = {
         "schema_version": (config["schema_version"], "top-reconstruction-v3"),
         "population.truth_decay": (config["population"].get("truth_decay"), "all_hadronic"),
-        "matching.version": (config["matching"].get("version"), "delta-r-exclusive-v1"),
-        "matching.objective": (
-            config["matching"].get("objective"), "max-cardinality-then-min-total-delta-r"
-        ),
-        "matching.tie_break": (config["matching"].get("tie_break"), "lowest-jet-index"),
         "truncation.order": (config["truncation"].get("order"), "source_order"),
     }
+    if source_mode == "fixed_sources":
+        supported.update({
+            "matching.version": (config["matching"].get("version"), "upstream-jet-truthmatch-v1"),
+            "matching.objective": (
+                config["matching"].get("objective"), "source-label-presence"
+            ),
+            "matching.tie_break": (config["matching"].get("tie_break"), "lowest-source-index"),
+        })
+    else:
+        supported.update({
+            "matching.version": (config["matching"].get("version"), "delta-r-exclusive-v1"),
+            "matching.objective": (
+                config["matching"].get("objective"), "max-cardinality-then-min-total-delta-r"
+            ),
+            "matching.tie_break": (config["matching"].get("tie_break"), "lowest-jet-index"),
+        })
     invalid = {name: value for name, (value, expected) in supported.items() if value != expected}
     if invalid:
         raise ValueError(f"unsupported contract declarations: {invalid}")
@@ -73,9 +99,10 @@ def validate_contract(config: Mapping) -> None:
         raise ValueError("matching.exact_cardinality must be true")
     if not isinstance(config["population"].get("reco_lepton_veto"), bool):
         raise ValueError("population.reco_lepton_veto must be boolean")
-    source_file_id = int(config["source"].get("source_file_id", -1))
-    if not 0 <= source_file_id < 2**16:
-        raise ValueError("source_file_id must fit the stable event-ID layout")
+    if source_mode == "single_root":
+        source_file_id = int(config["source"].get("source_file_id", -1))
+        if not 0 <= source_file_id < 2**16:
+            raise ValueError("source_file_id must fit the stable event-ID layout")
     selection = config["selection"]
     if float(selection["jet_pt_min_gev"]) < 0 or float(selection["jet_abs_eta_max"]) <= 0:
         raise ValueError("selection pT/eta thresholds are invalid")
@@ -92,9 +119,15 @@ def validate_contract(config: Mapping) -> None:
     if config["conversion"].get("compression") not in {None, "gzip"}:
         raise ValueError("only gzip or uncompressed HDF5 output is supported")
     if config["split"].get("group_provenance") not in {
-        "upstream_generator_group", "unverified_entry_block"
+        "upstream_generator_group", "unverified_entry_block", "fixed_source_partition"
     }:
         raise ValueError("split.group_provenance must declare verified or audit-only grouping")
+    if config["split"].get("mode", "random_generator_group") not in {
+        "random_generator_group", "fixed_source_files"
+    }:
+        raise ValueError("unsupported split.mode")
+    if source_mode == "fixed_sources" and config["split"].get("mode") != "fixed_source_files":
+        raise ValueError("fixed_sources requires split.mode=fixed_source_files")
 
 
 def stable_event_id(source_file_id, source_entry):
@@ -108,6 +141,8 @@ def stable_event_id(source_file_id, source_entry):
 
 def split_names(source_file_id, source_entry, split_config: Mapping) -> np.ndarray:
     """Assign complete generator groups, never individual rows, to data splits."""
+    if split_config.get("mode", "random_generator_group") == "fixed_source_files":
+        raise ValueError("fixed source partitions are assigned during conversion, not by split_names")
     source = np.asarray(source_file_id, dtype=np.uint64)
     entry = np.asarray(source_entry, dtype=np.uint64)
     source, entry = np.broadcast_arrays(source, entry)

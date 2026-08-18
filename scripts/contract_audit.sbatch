@@ -14,8 +14,9 @@ export PYTHONPATH=/net/scratch/b58521jg/transformers
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/top-contract-mpl-${SLURM_JOB_ID}"
 mkdir -p "$MPLCONFIGDIR" slurm_outputs
 
-.transformer_env/bin/python src/data/root_to_h5.py \
+.transformer_env/bin/python src/data/convert_fixed_sources.py \
   --config config/top_reconstruction_data_contract.yaml \
-  --max-events 200000 \
-  --output data/topquarkreconstruction/contract_v3/audit/ttbar_contract_audit.h5 \
+  --max-events-per-source 1000 \
+  --skip-source-hash \
+  --output-dir data/topquarkreconstruction/contract_v3/audit/splits \
   --manifest data/topquarkreconstruction/contract_v3/audit/manifest.json

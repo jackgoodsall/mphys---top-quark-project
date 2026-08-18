@@ -1,0 +1,13 @@
+# Short G1 GPU pilot: same G1 recipe, a fraction of an epoch, separate log dir.
+# Used only to confirm CUDA visibility, DDP layout, loss decrease, checkpointing
+# and partial top/W validity before the full run is submitted.
+base_config: top_reconstruction_g1.yaml
+
+model_training:
+  min_epochs: 1
+  max_epochs: 2
+  limit_train_batches: 200
+  limit_val_batches: 40
+
+model_artefacts:
+  log_dir: contract_v3/G1_pilot
