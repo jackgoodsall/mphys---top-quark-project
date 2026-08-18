@@ -693,13 +693,20 @@ class TopReconstructionDatasetFromH5:
             "interaction_transformers": self.interaction_transformers,
         }
         transform_save_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(transformers_dict, transform_save_path)
+        reuse_scalers = self.preprocessing_config.get("reuse_scalers")
+        if reuse_scalers:
+            # copy the bytes rather than re-dumping: the scaler_hash must match the
+            # source dataset exactly, and joblib.dump is not byte-reproducible.
+            shutil.copy2(reuse_scalers, transform_save_path)
+        else:
+            joblib.dump(transformers_dict, transform_save_path)
         digest = hashlib.sha256(transform_save_path.read_bytes()).hexdigest()
         self.scaler_hash = digest
         manifest = {
             "scaler_hash": digest,
             "scaler_path": str(self.save_dir / "target_transforms.joblib"),
             "training_files": self._training_file_provenance,
+            "reused_scalers": str(reuse_scalers) if reuse_scalers else None,
         }
         write_manifest(output_dir / "preprocessing_manifest.json", manifest)
         print(f"[SAVE] Transformers saved successfully!", flush=True)
@@ -747,7 +754,22 @@ class TopReconstructionDatasetFromH5:
                 raise FileNotFoundError(f"no raw files found matching: {raw_file_pattern}")
             train_files = [f for f in raw_files if "train" in f.name.lower()]
 
-        if len(train_files) != 1:
+        # Reuse a frozen scaler (e.g. the stress split, transformed with the G1 train scaler).
+        reuse_scalers = self.preprocessing_config.get("reuse_scalers")
+        if reuse_scalers:
+            reuse_scalers = Path(reuse_scalers)
+            if not reuse_scalers.is_file():
+                raise FileNotFoundError(f"reuse_scalers artifact does not exist: {reuse_scalers}")
+            if train_files:
+                raise ValueError("reuse_scalers forbids a train split; nothing may be refitted")
+            frozen = joblib.load(reuse_scalers)
+            self.jet_transformers = frozen["jet_transformers"]
+            self.target_transformers = frozen["target_transformers"]
+            self.interaction_transformers = frozen["interaction_transformers"]
+            # the transform path reads these off the processor, not off self
+            (self.target_processor.top_transformers,
+             self.target_processor.W_transformers) = self.target_transformers
+        elif len(train_files) != 1:
             raise ValueError(f"exactly one declared training split is required, got {train_files}")
         non_train_files = [f for f in raw_files if f not in train_files]
 
