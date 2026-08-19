@@ -4,6 +4,7 @@ import torch
 
 from g2_scaffold.decoder import FULL_TOP, W_ONLY, decode_event
 from g2_scaffold.losses import hierarchical_loss
+from g2_scaffold.metrics import rates, score_event
 from g2_scaffold.model import G2CandidateScorer
 from g2_scaffold.targets import targets_to_g2
 
@@ -109,6 +110,27 @@ class G2ScaffoldTest(unittest.TestCase):
         torch.testing.assert_close(converted["state_targets"], torch.tensor([[FULL_TOP, W_ONLY]]))
         torch.testing.assert_close(converted["w_targets"], torch.tensor([[[1, 2], [3, 4]]]))
         torch.testing.assert_close(converted["b_targets"], torch.tensor([[0, -1]]))
+
+    def test_metrics_choose_the_better_chain_permutation(self):
+        state = torch.tensor([[W_ONLY, FULL_TOP]])
+        w_targets = torch.tensor([[[0, 1], [2, 3]]])
+        b_targets = torch.tensor([[-1, 4]])
+        event_targets = {
+            "state_targets": state,
+            "w_targets": w_targets,
+            "b_targets": b_targets,
+        }
+        from g2_scaffold.decoder import Hypothesis, DecodedEvent
+        decoded = DecodedEvent(
+            (
+                Hypothesis(FULL_TOP, (2, 3), 4, 1.0),
+                Hypothesis(W_ONLY, (0, 1), None, 1.0),
+            ),
+            2.0,
+        )
+        counts = score_event(decoded, event_targets, 0)
+        self.assertEqual(counts["event_exact"], 1)
+        self.assertEqual(rates({**{key: 0 for key in ("state_correct", "w_exact", "full_top_exact", "event_exact", "events", "w_events", "full_events")}, **counts})["event_exact"], 1.0)
 
 
 if __name__ == "__main__":

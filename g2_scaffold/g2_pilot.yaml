@@ -4,6 +4,7 @@ base_config: ../config/top_reconstruction_config.yaml
 g2:
   loss_mode: hard_min
   loss_temperature: 1.0
+  validation_metric_batches: 2
 
 tasks:
   chain_state:

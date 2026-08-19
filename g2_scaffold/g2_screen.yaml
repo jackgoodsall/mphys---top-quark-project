@@ -1,0 +1,11 @@
+base_config: g2_pilot.yaml
+
+# Use only after the two-epoch pilot has finite/decreasing loss and legal
+# validation metrics. Fifteen epochs fits the three-day allocation much better
+# than the 60-epoch G1 budget, while remaining a screening run.
+model_training:
+  min_epochs: 15
+  max_epochs: 15
+
+model_artefacts:
+  log_dir: g2_scaffold/runs/G2_screen

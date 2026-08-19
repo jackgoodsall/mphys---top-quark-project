@@ -29,6 +29,8 @@ from models.particle_transformer import (  # noqa: E402
 from utils.utils import load_any_config  # noqa: E402
 
 from g2_scaffold.losses import hierarchical_loss  # noqa: E402
+from g2_scaffold.decoder import decode_batch  # noqa: E402
+from g2_scaffold.metrics import METRIC_KEYS, merge_counts, rates, score_batch  # noqa: E402
 from g2_scaffold.targets import targets_to_g2  # noqa: E402
 
 
@@ -49,6 +51,8 @@ class G2Trainer(pl.LightningModule):
         g2_cfg = config.get("g2", {})
         self.loss_mode = g2_cfg.get("loss_mode", "hard_min")
         self.loss_temperature = float(g2_cfg.get("loss_temperature", 1.0))
+        self.validation_metric_batches = int(g2_cfg.get("validation_metric_batches", 2))
+        self._val_counts = {key: 0 for key in METRIC_KEYS}
         train_cfg = config["model_training"]
         self.learning_rate = float(train_cfg.get("learning_rate", 2e-4))
         self.weight_decay = float(train_cfg.get("weight_decay", 0.01))
@@ -78,9 +82,29 @@ class G2Trainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, _ = self._loss(batch)
+        loss, outputs = self._loss(batch)
+        if batch_idx < self.validation_metric_batches:
+            targets = targets_to_g2(batch[1])
+            decoded = decode_batch(outputs, targets["valid_particles"])
+            merge_counts(self._val_counts, score_batch(decoded, targets))
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
+
+    def on_validation_epoch_start(self):
+        self._val_counts = {key: 0 for key in METRIC_KEYS}
+
+    def on_validation_epoch_end(self):
+        counts = torch.tensor(
+            [self._val_counts[key] for key in METRIC_KEYS],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        reduced = {key: int(counts[index].item()) for index, key in enumerate(METRIC_KEYS)}
+        for name, value in rates(reduced).items():
+            if name in {"state_accuracy", "w_exact", "full_top_exact", "event_exact"}:
+                self.log(f"val_{name}", value, on_step=False, on_epoch=True, sync_dist=False)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(

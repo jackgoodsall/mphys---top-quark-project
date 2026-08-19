@@ -80,14 +80,19 @@ def decode_event(
         )
         for q in range(2)
     ]
+    # For each left hypothesis, the first compatible right hypothesis in score
+    # order is optimal. This keeps the exact global decoder from doing an
+    # O(number_of_candidates^2) scan for every event.
+    right_by_score = sorted(candidates[1], key=lambda item: item.score, reverse=True)
     best = None
     for left in candidates[0]:
-        for right in candidates[1]:
+        for right in right_by_score:
             if left.jets & right.jets:
                 continue
             score = left.score + right.score
             if best is None or score > best.score:
                 best = DecodedEvent((left, right), score)
+            break
     if best is None:  # absent/absent always makes this unreachable
         raise RuntimeError("no legal pair of chain hypotheses")
     return best
