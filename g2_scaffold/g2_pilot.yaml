@@ -1,0 +1,35 @@
+base_config: ../config/top_reconstruction_config.yaml
+
+# G2 pilot: train from scratch with the same contract-v3 data as G1.
+g2:
+  loss_mode: hard_min
+  loss_temperature: 1.0
+
+tasks:
+  chain_state:
+    enabled: true
+    cost_weight: 1.0  # keeps the state head in the forward graph; G2 owns its loss
+    layer_weight_strategy: final_only
+    loss_weight: 0.0  # the standalone G2 trainer owns this loss
+
+data_modules:
+  input_path: data/topquarkreconstruction/contract_v3/processed
+  input_prefix: ttbar_contract_processed_
+
+model_parameters:
+  transformer:
+    use_hungarian_matching: false
+    hierarchical_candidate_head:
+      enabled: true
+      hidden_size: 32
+
+model_training:
+  seed: 0
+  min_epochs: 2
+  max_epochs: 2
+  devices: 2
+  strategy: ddp
+  accelerator: gpu
+
+model_artefacts:
+  log_dir: g2_scaffold/runs/G2_pilot

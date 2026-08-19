@@ -1,0 +1,34 @@
+# Isolated G2 scaffold
+
+This directory is intentionally disconnected from the live G1 model and
+configuration. It contains the smallest CPU-testable pieces needed before a
+real G2 run:
+
+- three-state (`absent`, `W-only`, `full-top`) candidate scoring;
+- permutation-invariant hard-min and marginal losses;
+- exact two-chain decoding with distinct W jets, a distinct b jet, and global
+  chain disjointness.
+
+Run the checks from the repository root:
+
+```bash
+.transformer_env/bin/python -m unittest g2_scaffold.test_scaffold -v
+```
+
+No G1 file imports this package; the pilot submission below is the only training
+entrypoint and does not resume or share a G1 run directory.
+
+## Parallel pilot
+
+The from-scratch pilot reuses only the existing encoder/data loader and writes
+to `g2_scaffold/runs/G2_pilot`:
+
+```bash
+.transformer_env/bin/python g2_scaffold/train.py \
+  --config g2_scaffold/g2_pilot.yaml --cpu-smoke
+sbatch g2_scaffold/submit_g2.sbatch g2_scaffold/g2_pilot.yaml
+```
+
+The pilot is two epochs on the contract-v3 train/validation splits. Its gate is
+finite loss, decreasing train/validation loss, and legal target-free decoding;
+it does not depend on a G1 checkpoint.
