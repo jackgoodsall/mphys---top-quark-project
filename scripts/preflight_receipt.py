@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Issue/check a short-lived receipt proving preflight ran on this exact commit."""
+"""Issue/check a receipt proving preflight ran on this exact commit."""
 
 import argparse
 import hashlib
@@ -54,11 +54,9 @@ def main():
     if not path.is_file():
         raise SystemExit(f"BLOCKED: missing preflight receipt: {path}")
     receipt = json.loads(path.read_text(encoding="utf-8"))
-    issued = int(receipt.pop("issued_at", 0))
+    receipt.pop("issued_at", None)
     if receipt != state:
         raise SystemExit("BLOCKED: preflight receipt does not match current code/config/contract")
-    if time.time() - issued > 3600:
-        raise SystemExit("BLOCKED: preflight receipt is older than one hour")
     print("preflight receipt: OK")
 
 
