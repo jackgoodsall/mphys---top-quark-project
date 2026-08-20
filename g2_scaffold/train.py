@@ -32,6 +32,7 @@ from g2_scaffold.losses import hierarchical_loss  # noqa: E402
 from g2_scaffold.decoder import decode_batch  # noqa: E402
 from g2_scaffold.metrics import METRIC_KEYS, merge_counts, rates, score_batch  # noqa: E402
 from g2_scaffold.targets import targets_to_g2  # noqa: E402
+from g2_scaffold.data import G2DataModule  # noqa: E402
 
 
 def _candidate_outputs(raw_outputs):
@@ -63,7 +64,7 @@ class G2Trainer(pl.LightningModule):
 
     def _loss(self, batch):
         inputs, raw_targets = batch
-        targets = targets_to_g2(raw_targets)
+        targets = targets_to_g2(raw_targets, event_ids=inputs.get("event_id"))
         outputs = self(inputs)
         loss = hierarchical_loss(
             outputs,
@@ -84,7 +85,7 @@ class G2Trainer(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, outputs = self._loss(batch)
         if batch_idx < self.validation_metric_batches:
-            targets = targets_to_g2(batch[1])
+            targets = targets_to_g2(batch[1], event_ids=batch[0].get("event_id"))
             decoded = decode_batch(outputs, targets["valid_particles"])
             merge_counts(self._val_counts, score_batch(decoded, targets))
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -162,7 +163,15 @@ def train(config):
     if seed is not None:
         pl.seed_everything(seed, workers=True)
     model = build_model(config)
-    data_module = MaskedFormerTopsWsDataModule(config)
+    data_module = G2DataModule(config)
+    data_module.setup("fit")
+    checked = 0
+    for inputs, raw_targets in data_module.val_dataloader():
+        targets_to_g2(raw_targets, event_ids=inputs.get("event_id"))
+        checked += raw_targets["jet_mask_true"].shape[0]
+    if checked != len(data_module.val_dataset):
+        raise RuntimeError(f"G2 validation guard checked {checked} of {len(data_module.val_dataset)} selected events")
+    print(f"G2 validation target guard OK: {checked} selected events")
     train_cfg = config["model_training"]
     artefact_cfg = config["model_artefacts"]
     log_dir = artefact_cfg["log_dir"]

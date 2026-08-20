@@ -23,6 +23,15 @@ entrypoint and does not resume or share a G1 run directory.
 The from-scratch pilot reuses only the existing encoder/data loader and writes
 to `g2_scaffold/runs/G2_pilot`:
 
+Build the mandatory G2 eligibility view first. This writes compact row-index
+files and does not modify or copy the source HDF5 data:
+
+```bash
+.transformer_env/bin/python g2_scaffold/target_audit.py \
+  --output-dir data/topquarkreconstruction/contract_v3/g2_eligibility \
+  --stress-file data/topquarkreconstruction/contract_v3/processed_stress/ttbar_contract_processed_stress.h5
+```
+
 ```bash
 .transformer_env/bin/python g2_scaffold/train.py \
   --config g2_scaffold/g2_pilot.yaml --cpu-smoke

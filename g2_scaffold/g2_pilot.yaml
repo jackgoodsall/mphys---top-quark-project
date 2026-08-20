@@ -5,6 +5,7 @@ g2:
   loss_mode: hard_min
   loss_temperature: 1.0
   validation_metric_batches: 2
+  eligibility_manifest: data/topquarkreconstruction/contract_v3/g2_eligibility/target_audit_manifest.json
 
 tasks:
   chain_state:

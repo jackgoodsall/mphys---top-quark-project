@@ -22,6 +22,17 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MPLBACKEND=Agg
 
 source .transformer_env/bin/activate
+MANIFEST=$(.transformer_env/bin/python - "$CONFIG" <<'PY'
+import sys
+sys.path[:0] = ["/net/scratch/b58521jg/transformers"]
+from utils.utils import load_any_config
+path = load_any_config(sys.argv[1]).get("g2", {}).get("eligibility_manifest")
+if not path:
+    raise SystemExit("config must set g2.eligibility_manifest")
+print(path)
+PY
+)
+[[ -f "$MANIFEST" ]] || { echo "Missing G2 eligibility manifest: $MANIFEST" >&2; exit 2; }
 DEVICES=$(.transformer_env/bin/python - "$CONFIG" <<'PY'
 import sys
 sys.path[:0] = ["/net/scratch/b58521jg/transformers"]

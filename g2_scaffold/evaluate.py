@@ -17,13 +17,13 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
 
-from data.datamodule import MaskedFormerTopsWsDataModule
 from utils.utils import load_any_config
 
 from g2_scaffold.decoder import decode_batch
 from g2_scaffold.metrics import METRIC_KEYS, merge_counts, rates, score_batch
 from g2_scaffold.targets import targets_to_g2
 from g2_scaffold.train import G2Trainer, build_model
+from g2_scaffold.data import G2DataModule
 
 
 def _move(value, device):
@@ -52,7 +52,7 @@ def _load_module(config: dict, checkpoint: str, device: torch.device) -> G2Train
 
 
 def _loader(config: dict, split: str):
-    data = MaskedFormerTopsWsDataModule(config)
+    data = G2DataModule(config, test_split=split if split == "stress" else "test")
     if split == "calibration":
         data.setup("calibrate")
         return data.calibration_dataloader()
@@ -124,7 +124,7 @@ def evaluate_split(
 
             inputs = _move(inputs, device)
             raw_targets = _move(raw_targets, device)
-            targets = targets_to_g2(raw_targets)
+            targets = targets_to_g2(raw_targets, event_ids=inputs.get("event_id"))
             outputs = module(inputs)
             decoded = decode_batch(
                 outputs,
@@ -188,7 +188,7 @@ def fit_temperatures(
                 raw_targets = _take(raw_targets, remaining)
             inputs = _move(inputs, device)
             raw_targets = _move(raw_targets, device)
-            targets = targets_to_g2(raw_targets)
+            targets = targets_to_g2(raw_targets, event_ids=inputs.get("event_id"))
             outputs = {key: value.cpu() for key, value in module(inputs).items()}
             records.append(({key: value.cpu() for key, value in targets.items()}, outputs))
             seen += outputs["state_logits"].shape[0]
