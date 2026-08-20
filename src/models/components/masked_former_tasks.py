@@ -216,9 +216,22 @@ class TaskRegistry(nn.Module):
             else:
                 layer_weight = 1.0
 
-            # Gate stat updates to final decoder layer only (intermediate layers
-            # give misleading stats since matching is performed on the final layer)
-            task._stats_enabled = is_final_layer
+            # Gate stats at each task's own final supervised layer. In W-first
+            # chain mode, W ends at layer 2 while the global decoder ends at 5.
+            task_final_layer = None
+            if task.config.layer_weights is not None:
+                active_layers = [
+                    int(layer)
+                    for layer, weight in task.config.layer_weights.items()
+                    if float(weight) != 0.0
+                ]
+                if active_layers:
+                    task_final_layer = max(active_layers)
+            task._stats_enabled = (
+                layer_id == task_final_layer
+                if task_final_layer is not None
+                else is_final_layer
+            )
             task_loss = task.compute_loss(predictions, targets, valid_mask)
             task._stats_enabled = True  # reset to safe default
 

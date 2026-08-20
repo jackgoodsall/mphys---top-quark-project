@@ -38,10 +38,10 @@ def audit_file(path: str | Path, output_dir: str | Path, split: str,
                chunk_size: int = 8192) -> Dict[str, object]:
     """Audit one processed HDF5 file and write ``<split>_eligible_indices.npy``.
 
-    An event is eligible iff every valid W has two particles and every valid
-    full-top (valid top and valid W) contains its W pair plus one particle in
-    ``top - W``. Reasons are counted per event; an event can contribute to more
-    than one reason.
+    An event is eligible iff it has at least one reconstructable object, every
+    valid W has two particles, and every valid full-top (valid top and valid W)
+    contains its W pair plus one particle in ``top - W``. Reasons are counted
+    per event; an event can contribute to more than one reason.
     """
     path = Path(path)
     output_dir = Path(output_dir)
@@ -50,6 +50,7 @@ def audit_file(path: str | Path, output_dir: str | Path, split: str,
     counts = {
         "invalid_mask_values": 0,
         "invalid_validity_values": 0,
+        "no_reconstructable_object": 0,
         "w_cardinality": 0,
         "full_top_w_containment": 0,
         "full_top_b_cardinality": 0,
@@ -95,6 +96,7 @@ def audit_file(path: str | Path, output_dir: str | Path, split: str,
                 | ~np.isin(valid_ws_raw, (0, 1))
             ).any(axis=1)
 
+            no_reconstructable_object = ~(valid_tops | valid_ws).any(axis=1)
             w_bad = (valid_ws & (ws.sum(axis=-1) != 2)).any(axis=1)
             full_top = valid_tops & valid_ws
             full_top_w_bad = (full_top & (ws & ~tops).any(axis=-1)).any(axis=1)
@@ -102,7 +104,7 @@ def audit_file(path: str | Path, output_dir: str | Path, split: str,
             full_top_b_bad = (full_top & (b_counts != 1)).any(axis=1)
 
             bad = (
-                invalid_mask | invalid_validity | w_bad
+                invalid_mask | invalid_validity | no_reconstructable_object | w_bad
                 | full_top_w_bad | full_top_b_bad
             )
             eligible = ~bad
@@ -111,6 +113,7 @@ def audit_file(path: str | Path, output_dir: str | Path, split: str,
             )
             counts["invalid_mask_values"] += int(invalid_mask.sum())
             counts["invalid_validity_values"] += int(invalid_validity.sum())
+            counts["no_reconstructable_object"] += int(no_reconstructable_object.sum())
             counts["w_cardinality"] += int(w_bad.sum())
             counts["full_top_w_containment"] += int(full_top_w_bad.sum())
             counts["full_top_b_cardinality"] += int(full_top_b_bad.sum())
@@ -146,6 +149,7 @@ def audit_file(path: str | Path, output_dir: str | Path, split: str,
         "exclusion_reasons": counts,
         "provenance": provenance,
         "eligibility": {
+            "min_reconstructable_objects": 1,
             "valid_w_particles": 2,
             "valid_full_top_b_extension": 1,
             "policy": "exclude-invalid-or-ambiguous; never-truncate",

@@ -7,8 +7,8 @@ preprocessing:
   stream_size: 100000
   save_path: data/topquarkreconstruction/contract_v3/processed
   save_file_prefix: ttbar_contract_processed_
-  # Preserve every selected event, including the explicit zero-match stratum.
-  min_objects: 0
+  # Training/validation events must contain at least one reconstructable object.
+  min_objects: 1
   interaction_scaling: per_feature
   metadata_keys:
     - event_id

@@ -705,6 +705,7 @@ class TopReconstructionDatasetFromH5:
         manifest = {
             "scaler_hash": digest,
             "scaler_path": str(self.save_dir / "target_transforms.joblib"),
+            "min_objects": int(self.min_objects),
             "training_files": self._training_file_provenance,
             "reused_scalers": str(reuse_scalers) if reuse_scalers else None,
         }
@@ -844,9 +845,13 @@ class TopReconstructionDatasetFromH5:
                     self.raw_file_config.get("save_file_prefix", "raw_"),
                     self.preprocessing_config.get("save_file_prefix", "processed_"),
                 )
-                with h5py.File(stage_dir / name, "r") as handle:
+                with h5py.File(raw_file, "r") as source, h5py.File(stage_dir / name, "r") as handle:
+                    input_rows = int(source["jet"].shape[0])
+                    output_rows = int(handle["jet"].shape[0])
                     manifest["outputs"][name] = {
-                        "rows": int(handle["jet"].shape[0]),
+                        "input_rows": input_rows,
+                        "rows": output_rows,
+                        "filtered_rows": input_rows - output_rows,
                         "contract_hash": str(handle.attrs["contract_hash"]),
                         "schema_version": str(handle.attrs["schema_version"]),
                         "selection_hash": str(handle.attrs["selection_hash"]),

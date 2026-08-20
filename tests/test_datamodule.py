@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+import shutil
 
 import h5py
 import numpy as np
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from data.datamodule import (
     LazyHDF5Dataset,
     MemmapDataset,
+    MaskedFormerTopsWsDataModule,
     _dataloader_worker_kwargs,
 )
 
@@ -35,7 +37,7 @@ class DataModuleTest(unittest.TestCase):
 
     def test_lazy_and_memmap_keep_object_shapes_and_validity(self):
         with tempfile.TemporaryDirectory() as tmp:
-            h5_path = Path(tmp) / "split.h5"
+            h5_path = Path(tmp) / "splittrain.h5"
             with h5py.File(h5_path, "w") as f:
                 f["jet"] = np.zeros((2, 3, 4), dtype=np.float32)
                 f["src_mask"] = np.ones((2, 3), dtype=np.uint8)
@@ -65,6 +67,36 @@ class DataModuleTest(unittest.TestCase):
                 self.assertEqual(tuple(target["target_kinematics"].shape), (4, 5))
                 self.assertEqual(target["classes"].tolist(), [1, 2, 2, 2])
                 self.assertEqual(target["object_valid"].tolist(), expected_valid)
+
+    def test_train_filter_drops_zero_object_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h5_path = Path(tmp) / "splittrain.h5"
+            with h5py.File(h5_path, "w") as f:
+                f["jet"] = np.zeros((3, 2, 4), dtype=np.float32)
+                f["src_mask"] = np.ones((3, 2), dtype=np.uint8)
+                f["masks_tops"] = np.zeros((3, 1, 2), dtype=np.float32)
+                f["kinematics_tops"] = np.zeros((3, 1, 5), dtype=np.float32)
+                f["masks_Ws"] = np.zeros((3, 1, 2), dtype=np.float32)
+                f["kinematics_Ws"] = np.zeros((3, 1, 5), dtype=np.float32)
+                f["valid_tops"] = np.array([[0], [1], [0]], dtype=np.uint8)
+                f["valid_Ws"] = np.array([[0], [0], [1]], dtype=np.uint8)
+            shutil.copy2(h5_path, Path(tmp) / "splitval.h5")
+
+            config = {
+                "data_modules": {
+                    "input_path": tmp,
+                    "input_prefix": "split",
+                    "lazy": True,
+                    "load_interactions": False,
+                    "min_train_objects": 1,
+                    "train": {"batch_size": 1, "shuffle": False, "pin_memory": False, "num_workers": 0},
+                    "val": {"batch_size": 1, "shuffle": False, "pin_memory": False, "num_workers": 0},
+                    "test": {"batch_size": 1, "shuffle": False, "pin_memory": False, "num_workers": 0},
+                }
+            }
+            dm = MaskedFormerTopsWsDataModule(config)
+            dm.setup("fit")
+            self.assertEqual(len(dm.train_dataset), 2)
 
 
 if __name__ == "__main__":

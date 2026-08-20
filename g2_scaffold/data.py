@@ -100,10 +100,34 @@ class G2DataModule(MaskedFormerTopsWsDataModule):
             return
         super().setup(stage)
         if stage in (None, "fit", "validate"):
+            self.eligible_indices["train"] = self._nonempty_indices(
+                self.train_dataset, self.eligible_indices["train"], "train"
+            )
+            self.eligible_indices["val"] = self._nonempty_indices(
+                self.val_dataset, self.eligible_indices["val"], "val"
+            )
             self.train_dataset = G2FilteredDataset(self.train_dataset, self.eligible_indices["train"], "train")
             self.val_dataset = G2FilteredDataset(self.val_dataset, self.eligible_indices["val"], "val")
         if stage in (None, "test"):
+            self.eligible_indices[self.test_split] = self._nonempty_indices(
+                self.test_dataset, self.eligible_indices[self.test_split], self.test_split
+            )
             self.test_dataset = G2FilteredDataset(self.test_dataset, self.eligible_indices[self.test_split], self.test_split)
         if stage in (None, "calibrate"):
+            self.eligible_indices["calibration"] = self._nonempty_indices(
+                self.calibration_dataset, self.eligible_indices["calibration"], "calibration"
+            )
             self.calibration_dataset = G2FilteredDataset(self.calibration_dataset, self.eligible_indices["calibration"], "calibration")
         self._setup_stages.add(stage_key)
+
+    @staticmethod
+    def _nonempty_indices(dataset, indices: np.ndarray, split: str) -> np.ndarray:
+        """Defense in depth for stale eligibility manifests."""
+        object_valid = getattr(dataset, "object_valid", None)
+        if object_valid is None:
+            raise ValueError(f"G2 {split} requires valid_tops/valid_Ws in the dataset")
+        valid = np.asarray(object_valid, dtype=bool).any(axis=1)
+        indices = np.asarray(indices, dtype=np.int64)
+        if np.any(indices < 0) or np.any(indices >= len(valid)):
+            raise IndexError(f"G2 {split} eligibility index exceeds dataset length")
+        return indices[valid[indices]]

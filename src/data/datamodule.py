@@ -1,5 +1,5 @@
 from lightning import LightningDataModule
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from pathlib import Path
 import h5py
 import torch
@@ -798,6 +798,17 @@ class MaskedFormerTopsWsDataModule(LightningDataModule):
     def setup(self, stage):
         if stage in (None, "fit", "validate"):
             self.train_dataset = self._load_split("train", augmenter=self.train_augmenter)
+            min_train_objects = int(self.config.get("min_train_objects", 0))
+            if min_train_objects > 0:
+                object_valid = getattr(self.train_dataset, "object_valid", None)
+                if object_valid is None:
+                    raise ValueError(
+                        "min_train_objects requires valid_tops/valid_Ws in the training split"
+                    )
+                keep = np.asarray(object_valid, dtype=bool).sum(axis=1) >= min_train_objects
+                self.train_dataset = Subset(
+                    self.train_dataset, np.flatnonzero(keep).tolist()
+                )
             self.val_dataset = self._load_split("val")
             mode = {False: "in-memory", True: "lazy", "memmap": "memmap"}.get(self.lazy, str(self.lazy))
             print(f"[DM TopsWs] train len={len(self.train_dataset)}  val len={len(self.val_dataset)}  {mode}")

@@ -96,13 +96,14 @@ class TargetAuditTests(unittest.TestCase):
 
             result = target_audit.audit_file(source, root / "out", "train", chunk_size=2)
             self.assertEqual(result["counts"]["total"], 4)
-            self.assertEqual(result["counts"]["eligible"], 2)
-            self.assertEqual(result["counts"]["excluded"], 2)
+            self.assertEqual(result["counts"]["eligible"], 1)
+            self.assertEqual(result["counts"]["excluded"], 3)
+            self.assertEqual(result["exclusion_reasons"]["no_reconstructable_object"], 1)
             self.assertEqual(result["exclusion_reasons"]["w_cardinality"], 1)
             self.assertEqual(result["exclusion_reasons"]["full_top_b_cardinality"], 1)
             self.assertEqual(result["provenance"]["source_hash"], "source")
             np.testing.assert_array_equal(
-                np.load(root / "out" / "train_eligible_indices.npy"), [0, 3]
+                np.load(root / "out" / "train_eligible_indices.npy"), [0]
             )
 
     def test_reads_are_bounded_chunks(self):

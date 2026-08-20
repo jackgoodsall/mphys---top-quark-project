@@ -3,7 +3,11 @@ import unittest
 import torch
 
 from src.trainers.top_reconstruction_trainers import ReconstructionTrainer
-from src.models.components.masked_former_tasks import MaskReconstructionTask, TaskConfig
+from src.models.components.masked_former_tasks import (
+    MaskReconstructionTask,
+    TaskConfig,
+    TaskRegistry,
+)
 
 
 class ValidationMetricTest(unittest.TestCase):
@@ -58,6 +62,36 @@ class ValidationMetricTest(unittest.TestCase):
         # Only the complete slot contributes to chain efficiency.
         self.assertEqual([x.item() for x in trainer._val_exact_counts["chain_eff"]], [1.0, 1.0])
         self.assertEqual([x.item() for x in trainer._val_exact_counts["ttbar_eff"]], [0.0, 0.0])
+
+    def test_w_dice_stats_use_w_phase_final_layer(self):
+        registry = TaskRegistry()
+        task = MaskReconstructionTask(
+            TaskConfig(
+                name="mask_W",
+                output_names=["mask_W"],
+                output_dims={},
+                cost_weights={"mask": 1.0},
+                loss_weights={"dice": 1.0, "bce": 0.5},
+                max_objects=2,
+                layer_weights={1: 0.5, 2: 1.0, 5: 0.0},
+                validity_key="w_valid",
+            ),
+            pred_key="mask_W",
+            target_key="jet_mask_true_W",
+            validity_key="w_valid",
+        )
+        registry.register_task(task)
+        targets = {
+            "jet_mask_true_W": torch.tensor([[[1.0, 0.0]]]),
+            "jet_valid_mask": torch.ones(1, 2, dtype=torch.bool),
+            "w_valid": torch.ones(1, 1, dtype=torch.bool),
+            "obj_valid_mask": torch.ones(1, 1, dtype=torch.bool),
+        }
+        predictions = {"mask_W": torch.tensor([[[4.0, -4.0]]])}
+        registry.compute_total_loss(predictions, targets, layer_id=1, is_final_layer=False)
+        self.assertEqual(task._w_dice_count.item(), 0)
+        registry.compute_total_loss(predictions, targets, layer_id=2, is_final_layer=False)
+        self.assertEqual(task._w_dice_count.item(), 1)
 
 
 if __name__ == "__main__":

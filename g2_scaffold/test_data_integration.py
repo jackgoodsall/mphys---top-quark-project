@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 # Match the repository's src-on-PYTHONPATH execution model.
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from g2_scaffold.data import G2FilteredDataset, load_eligibility_manifest
+from g2_scaffold.data import G2DataModule, G2FilteredDataset, load_eligibility_manifest
 from g2_scaffold.targets import targets_to_g2
 
 
@@ -24,6 +24,12 @@ class _Rows(Dataset):
 
     def __getitem__(self, index):
         return self.rows[index]
+
+
+class _RowsWithValidity(_Rows):
+    def __init__(self):
+        super().__init__(3)
+        self.object_valid = np.array([[0, 0], [1, 0], [0, 1]], dtype=bool)
 
 
 class G2DataIntegrationTest(unittest.TestCase):
@@ -42,10 +48,20 @@ class G2DataIntegrationTest(unittest.TestCase):
                 filename = f"{split}_eligible.npy"
                 np.save(root / filename, np.array([0, 2], dtype=np.int64))
                 entries[split] = filename
-            (root / "manifest.json").write_text(json.dumps({"splits": entries}), encoding="utf-8")
+            (root / "manifest.json").write_text(json.dumps({
+                "splits": entries,
+                "eligibility": {"min_reconstructable_objects": 1},
+            }), encoding="utf-8")
             result = load_eligibility_manifest(root / "manifest.json")
             self.assertEqual(sorted(result), ["calibration", "stress", "test", "train", "val"])
             np.testing.assert_array_equal(result["stress"], [0, 2])
+
+    def test_stale_manifest_rows_drop_zero_object_events(self):
+        dataset = _RowsWithValidity()
+        result = G2DataModule._nonempty_indices(
+            dataset, np.array([0, 1, 2], dtype=np.int64), "train"
+        )
+        np.testing.assert_array_equal(result, [1, 2])
 
     def test_target_guard_reports_event_and_does_not_truncate_three_jet_w(self):
         masks = torch.zeros(1, 4, 6)

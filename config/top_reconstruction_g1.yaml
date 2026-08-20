@@ -23,6 +23,8 @@ tasks:
 data_modules:
   input_path: data/topquarkreconstruction/contract_v3/processed
   input_prefix: ttbar_contract_processed_
+  # Defense in depth for existing artifacts built before the min_objects fix.
+  min_train_objects: 1
 
 model_artefacts:
   log_dir: contract_v3/G1_repaired_mask
