@@ -260,6 +260,7 @@ class MaskReconstructionTask(BaseTask):
         rank_weight: Optional[float] = None,
         rank_margin: Optional[float] = None,
         rank_temperature: Optional[float] = None,
+        pad_suppress_weight: float = 0.0,
     ):
         super().__init__(config)
         self.pred_key = pred_key
@@ -303,6 +304,14 @@ class MaskReconstructionTask(BaseTask):
         # 0.0 = suppressed (during mask-only pretraining), 1.0 = full penalty.
         # Ramped from 0→1 during phase transition to avoid "predict nothing" snap-on.
         self.null_penalty_scale = 1.0
+        # Weight of a BCE term pushing every query's logits negative on PADDING
+        # slots. The main Dice/BCE losses are masked to valid particles, so padding
+        # logits receive no gradient and can drift positive (observed as masks
+        # bloating into the padded region). This term gives them an explicit
+        # "background" target. No effect when there is no padding or weight is 0.
+        if pad_suppress_weight < 0:
+            raise ValueError("pad_suppress_weight must be non-negative")
+        self.pad_suppress_weight = float(pad_suppress_weight)
 
         # Per-class Dice accumulators — GPU buffers, .item() deferred to getter
         self.register_buffer('_top_dice_sum', torch.zeros(1), persistent=False)
@@ -385,6 +394,24 @@ class MaskReconstructionTask(BaseTask):
         # Normalize each mask independently, then average masks. This avoids
         # large events dominating solely because they contain more valid slots.
         return (bce.sum(dim=-1) / denom).mean()
+
+    def _padding_suppression(
+        self,
+        pred_masks: torch.Tensor,
+        particle_valid: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Mean BCE toward empty predictions over PADDING slots only (all queries).
+
+        Only called when ``pad_suppress_weight > 0``.
+        """
+        pad = ~particle_valid.bool()                                   # [B, N]
+        if not pad.any().item():
+            return pred_masks.sum() * 0.0
+        bce = F.binary_cross_entropy_with_logits(
+            pred_masks.float(), torch.zeros_like(pred_masks.float()), reduction='none'
+        )                                                              # [B, Q, N]
+        pad_mask = pad.unsqueeze(1).expand_as(bce)
+        return (bce * pad_mask).sum() / pad_mask.sum().clamp(min=1)
 
     def _ranking_loss(
         self,
@@ -616,7 +643,10 @@ class MaskReconstructionTask(BaseTask):
             # Adaptive scaling: reduce penalty when most queries are null so the
             # "predict empty" signal doesn't overwhelm real-object learning.
             # Suppressed during mask-only pretraining to eliminate "predict nothing" signal.
-            if (self.validity_key is None and self.null_mask_penalty > 0 and self.null_penalty_scale > 0
+            # obj_valid already reflects this task's own validity key (top_valid /
+            # w_valid in chain mode, obj_valid_mask in legacy mode), so the penalty
+            # applies wherever a query slot has no real target of this type.
+            if (self.null_mask_penalty > 0 and self.null_penalty_scale > 0
                     and (~obj_valid).any().item()):
                 null_logits = pred_masks[~obj_valid]           # [N_null, N]
                 null_targets = torch.zeros_like(null_logits)
@@ -629,6 +659,11 @@ class MaskReconstructionTask(BaseTask):
                 n_total = obj_valid.numel()
                 adaptive_scale = (n_real / n_total).clamp(min=0.01)
                 total_loss = total_loss + self.null_mask_penalty * self.null_penalty_scale * adaptive_scale * null_loss
+
+            if self.pad_suppress_weight > 0:
+                total_loss = total_loss + self.pad_suppress_weight * self._padding_suppression(
+                    pred_masks, particle_valid
+                )
 
             return total_loss
         else:
@@ -679,6 +714,10 @@ class MaskReconstructionTask(BaseTask):
             total_loss = total_loss + self.rank_weight * self._ranking_loss(
                 pred_masks_flat, target_float_flat, valid_mask_flat
             )
+            if self.pad_suppress_weight > 0 and particle_valid is not None:
+                total_loss = total_loss + self.pad_suppress_weight * self._padding_suppression(
+                    pred_masks, particle_valid
+                )
             return total_loss
     
     def get_detection_stats(self) -> Dict[str, float]:

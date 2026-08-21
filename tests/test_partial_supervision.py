@@ -10,14 +10,14 @@ from src.models.components.masked_former_tasks import (
 )
 
 
-def mask_task(name, pred_key, target_key, validity):
+def mask_task(name, pred_key, target_key, validity, null_penalty=1.0):
     return MaskReconstructionTask(
         TaskConfig(
             name=name, output_names=[pred_key], output_dims={}, cost_weights={"mask": 1.0},
             loss_weights={"dice": 1.0, "bce": .5}, max_objects=2, validity_key=validity,
         ),
         pred_key=pred_key, target_key=target_key, validity_key=validity,
-        null_mask_penalty=1.0,
+        null_mask_penalty=null_penalty,
     )
 
 
@@ -33,17 +33,33 @@ class PartialSupervisionTest(unittest.TestCase):
         }
 
     def test_w_only_has_w_gradient_and_exactly_zero_top_gradient(self):
+        """With the null penalty disabled, a censored (W-only) chain yields zero
+        top-mask gradient — Dice/BCE never supervise unknowable targets."""
         top_logits = torch.randn(1, 2, 4, requires_grad=True)
         w_logits = torch.randn(1, 2, 4, requires_grad=True)
-        top_loss = mask_task("mask", "mask_predictions", "jet_mask_true", "top_valid").compute_loss(
+        top_loss = mask_task("mask", "mask_predictions", "jet_mask_true", "top_valid",
+                             null_penalty=0.0).compute_loss(
             {"mask_predictions": top_logits}, self.targets
         )
-        w_loss = mask_task("mask_W", "mask_W", "jet_mask_true_W", "w_valid").compute_loss(
+        w_loss = mask_task("mask_W", "mask_W", "jet_mask_true_W", "w_valid",
+                           null_penalty=0.0).compute_loss(
             {"mask_W": w_logits}, self.targets
         )
         (top_loss + w_loss).backward()
         self.assertEqual(torch.count_nonzero(top_logits.grad).item(), 0)
         self.assertGreater(torch.count_nonzero(w_logits.grad).item(), 0)
+
+    def test_null_penalty_reaches_censored_slots_in_chain_mode(self):
+        """The null penalty (restored July behaviour) trains unmatched queries
+        toward empty masks via the task's own validity key, in chain mode too."""
+        top_logits = torch.randn(1, 2, 4, requires_grad=True)
+        top_loss = mask_task("mask", "mask_predictions", "jet_mask_true", "top_valid",
+                             null_penalty=1.0).compute_loss(
+            {"mask_predictions": top_logits}, self.targets
+        )
+        top_loss.backward()
+        # Slot 1 is null (both types invalid): its logits must receive gradient.
+        self.assertGreater(torch.count_nonzero(top_logits.grad[:, 1, :]).item(), 0)
 
     def test_chain_state_vocab_and_loss(self):
         task = ChainStateTask(TaskConfig(

@@ -116,6 +116,7 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
         null_mask_penalty=mask_config.get('null_mask_penalty', 0.1),
         bce_pos_weight=mask_config.get('bce_pos_weight', False),
         cost_bce_weight=mask_config.get('cost_bce_weight', 0.0),
+        pad_suppress_weight=mask_config.get('pad_suppress_weight', 0.0),
     )
     task_registry.register_task(mask_task)
 
@@ -160,6 +161,9 @@ def create_default_task_registry(config: dict) -> TaskRegistry:
             null_mask_penalty=mask_W_config.get('null_mask_penalty', mask_config.get('null_mask_penalty', 0.1)),
             bce_pos_weight=mask_W_config.get('bce_pos_weight', mask_config.get('bce_pos_weight', False)),
             cost_bce_weight=mask_W_config.get('cost_bce_weight', mask_config.get('cost_bce_weight', 0.0)),
+            pad_suppress_weight=mask_W_config.get(
+                'pad_suppress_weight', mask_config.get('pad_suppress_weight', 0.0)
+            ),
             pred_key='mask_W',
             target_key='jet_mask_true_W',
         )
