@@ -134,8 +134,15 @@ def training_gate(contract_path, config_path):
         raise SystemExit("BLOCKED: invariant-mass training loss is prohibited")
     if not tasks.get("chain_state", {}).get("enabled", False):
         raise SystemExit("BLOCKED: three-state chain detection is not enabled")
+    # The null penalty trains unmatched queries toward empty masks. By default this
+    # is refused because censored (unknowable) components would be supervised.
+    # A config may consciously opt in via gate_overrides — the 21 Aug diagnosis
+    # found its removal contributed to query collapse (see G_TRACK_HANDOFF.md).
+    allow_null_penalty = bool(
+        cfg.get("gate_overrides", {}).get("allow_null_penalty_on_censored", False)
+    )
     for name in ("mask", "mask_W"):
-        if float(tasks.get(name, {}).get("null_mask_penalty", 0)) != 0:
+        if float(tasks.get(name, {}).get("null_mask_penalty", 0)) != 0 and not allow_null_penalty:
             raise SystemExit(f"BLOCKED: {name} null penalty would supervise censored components")
     data = cfg["data_modules"]
     prefix = Path(data["input_path"]) / data["input_prefix"]

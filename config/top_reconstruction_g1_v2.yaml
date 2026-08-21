@@ -17,6 +17,13 @@
 # pad_suppress_weight regulariser targeting the measured padding-logit bloat.
 base_config: top_reconstruction_config.yaml
 
+# Conscious, auditable opt-in: the restored July-era null penalty trains
+# unmatched queries toward empty masks, including on slots whose truth is only
+# partially known. Its silent removal (5f55d4f) contributed to the query collapse
+# diagnosed on 21 Aug — see G_TRACK_HANDOFF.md before flipping this back.
+gate_overrides:
+  allow_null_penalty_on_censored: true
+
 tasks:
   mask:
     cost_weight: 1.0
