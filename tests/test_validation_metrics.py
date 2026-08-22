@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -39,6 +40,7 @@ class ValidationMetricTest(unittest.TestCase):
     def test_exact_counts_use_per_type_validity(self):
         trainer = ReconstructionTrainer.__new__(ReconstructionTrainer)
         trainer._val_exact_counts = {}
+        trainer._val_collapse_counts = {}
 
         targets = {
             "jet_valid_mask": torch.ones(1, 4, dtype=torch.bool),
@@ -92,6 +94,49 @@ class ValidationMetricTest(unittest.TestCase):
         self.assertEqual(task._w_dice_count.item(), 0)
         registry.compute_total_loss(predictions, targets, layer_id=2, is_final_layer=False)
         self.assertEqual(task._w_dice_count.item(), 1)
+
+    def test_collapse_metrics_detect_identical_queries_and_padding_bloat(self):
+        trainer = ReconstructionTrainer.__new__(ReconstructionTrainer)
+        trainer._val_exact_counts = {}
+        trainer._val_collapse_counts = {}
+
+        # 3 jets per event; jet 3 is padding.
+        jet_valid = torch.tensor([[True, True, True, False]])
+        collapsed_top = torch.tensor([[[4.0, 5.0, -4.0, 9.0],
+                                       [4.0, 5.0, -4.0, -9.0]]])
+        distinct_w = torch.tensor([[[4.0, -4.0, -4.0, -4.0],
+                                    [-4.0, 4.0, -4.0, -4.0]]])
+        trainer._accumulate_collapse_metrics(collapsed_top, distinct_w, jet_valid)
+
+        identical = trainer._val_collapse_counts['query_identical_top']
+        # The two top queries agree on all valid jets (padding excluded).
+        self.assertEqual(identical[0].item(), 1.0)
+        self.assertEqual(identical[1].item(), 1.0)
+        w_identical = trainer._val_collapse_counts['query_identical_w']
+        self.assertEqual(w_identical[0].item(), 0.0)
+
+        pad_top = trainer._val_collapse_counts['pad_logit_top']
+        # Only the padding jet contributes: query 0 logit 9, query 1 -9 -> mean 0.
+        self.assertEqual(pad_top[1].item(), 2.0)
+        self.assertAlmostEqual(pad_top[0].item(), 0.0)
+
+    def test_log_collapse_metrics_skips_empty_counts(self):
+        trainer = ReconstructionTrainer.__new__(ReconstructionTrainer)
+        trainer._val_collapse_counts = {}
+        with mock.patch.object(ReconstructionTrainer, '_sync_dist',
+                               new_callable=mock.PropertyMock, return_value=False), \
+                mock.patch.object(ReconstructionTrainer, 'log') as log_mock:
+            trainer._log_collapse_metrics()
+            log_mock.assert_not_called()
+
+            trainer._val_collapse_counts = {
+                'query_identical_top': [torch.tensor(0.25), torch.tensor(4.0)],
+                'pad_logit_top': [torch.tensor(-21.0), torch.tensor(4.0)],
+            }
+            trainer._log_collapse_metrics()
+        logged = {call.args[0]: call.args[1].item() for call in log_mock.call_args_list}
+        self.assertAlmostEqual(logged['val_query_identical_top'], 0.0625)
+        self.assertAlmostEqual(logged['val_pad_logit_top'], -5.25)
 
 
 if __name__ == "__main__":

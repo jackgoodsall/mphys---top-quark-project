@@ -165,6 +165,7 @@ class ReconstructionTrainer(lightning.LightningModule):
 
     def on_validation_epoch_start(self):
         self._val_exact_counts = {}
+        self._val_collapse_counts = {}
 
     def _accumulate_validation_exact(self, outputs, matched_targets=None):
         """Accumulate exact raw-query counts under both S2 permutations."""
@@ -174,6 +175,10 @@ class ReconstructionTrainer(lightning.LightningModule):
             return
 
         jet_valid = matched.get('jet_valid_mask')
+        if jet_valid is not None:
+            self._accumulate_collapse_metrics(
+                final['mask_predictions'], final['mask_W'], jet_valid)
+
         top_valid = matched.get('top_valid', matched.get('obj_valid_mask'))
         w_valid = matched.get('w_valid', matched.get('obj_valid_mask'))
         if jet_valid is None or top_valid is None or w_valid is None:
@@ -256,6 +261,49 @@ class ReconstructionTrainer(lightning.LightningModule):
             else:
                 self._val_exact_counts[name][0] += num.detach()
                 self._val_exact_counts[name][1] += den.detach()
+
+    def _accumulate_collapse_metrics(self, top_pred, w_pred, jet_valid):
+        """Accumulate query-collapse diagnostics on raw (unmatched) predictions.
+
+        Healthy models keep the two chain queries distinct (<1% identical masks,
+        padding logits near -10); collapsed runs converge to one shared solution
+        (78-88% identical masks) with mask logits bloating into padding (+0.7).
+        """
+        jet_valid = jet_valid.bool()
+        batch_values = {}
+        for name, pred in (('top', top_pred), ('w', w_pred)):
+            if pred.dim() != 3 or pred.shape[1] != 2 or pred.shape[2] > jet_valid.shape[1]:
+                continue
+            valid = jet_valid[:, None, :pred.shape[2]]
+            identical = (((pred[:, 0] > 0) == (pred[:, 1] > 0)) | ~valid).all(dim=-1)
+            batch_values[f'query_identical_{name}'] = (
+                identical.sum().float(),
+                torch.full((), identical.numel(), device=identical.device,
+                           dtype=torch.float32))
+            padding = ~jet_valid[:, :pred.shape[2]]
+            pad_count = padding.sum().float() * pred.shape[1]
+            if pad_count > 0:
+                batch_values[f'pad_logit_{name}'] = (
+                    (pred * padding[:, None, :]).sum().float(), pad_count)
+
+        for key, (num, den) in batch_values.items():
+            if key not in self._val_collapse_counts:
+                self._val_collapse_counts[key] = [num.detach(), den.detach()]
+            else:
+                self._val_collapse_counts[key][0] += num.detach()
+                self._val_collapse_counts[key][1] += den.detach()
+
+    def _log_collapse_metrics(self):
+        for key, (num, den) in self._val_collapse_counts.items():
+            pair = torch.stack([num, den])
+            if self._sync_dist:
+                pair = self.all_gather(pair).reshape(-1, 2).sum(dim=0)
+            if pair[1] <= 0:
+                continue
+            value = pair[0] / pair[1]
+            self.log(f'val_{key}', value, on_step=False, on_epoch=True,
+                     prog_bar=False, sync_dist=False)
+        self._val_collapse_counts = {}
 
     def test_step(self, batch, batch_idx):
         """Task-agnostic test step"""
@@ -571,6 +619,7 @@ class ReconstructionTrainer(lightning.LightningModule):
             self.log(f'val_{name}', rate, on_step=False, on_epoch=True,
                      prog_bar=name == 'ttbar_eff', sync_dist=False)
         self._val_exact_counts = {}
+        self._log_collapse_metrics()
 
         cm = self.trainer.callback_metrics
         val_loss = self._grab_metric(cm, ["val_loss", "val_loss_epoch"])
